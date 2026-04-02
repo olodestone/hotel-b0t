@@ -424,12 +424,10 @@ async def cmd_removestaff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, "❌ user_id must be a number.")
         return
 
-    rows = db.read_all("users")
-    new_rows = [r for r in rows if int(r["user_id"]) != uid]
-    if len(new_rows) == len(rows):
+    removed = db.remove_user(uid)
+    if not removed:
         await _reply(update, f"❌ User `{uid}` not found.")
         return
-    db.write_all("users", new_rows)
     await _reply(update, f"✅ User `{uid}` removed.")
 
 

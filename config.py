@@ -1,9 +1,8 @@
 """
 Configuration — loaded from environment variables.
-Copy .env.example to .env for local dev, or set vars in Railway dashboard.
+Copy .env.example to .env for local dev, or set vars in Railway/Heroku dashboard.
 """
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,6 +10,11 @@ load_dotenv()
 # ── Bot ──────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 HOTEL_NAME: str = os.getenv("HOTEL_NAME", "Hotel 85")
+
+# ── Database ─────────────────────────────────────────────────────────
+# On Heroku: heroku addons:create heroku-postgresql
+# On Railway: add a PostgreSQL plugin — DATABASE_URL is set automatically
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 # ── Access control ───────────────────────────────────────────────────
 _raw_admins = os.getenv("ADMIN_IDS", "")
@@ -26,6 +30,3 @@ TIMEZONE: str = os.getenv("TIMEZONE", "Africa/Lagos")
 
 # ── Inventory ────────────────────────────────────────────────────────
 LOW_STOCK_DEFAULT: int = int(os.getenv("LOW_STOCK_DEFAULT", "5"))
-
-# ── Storage ──────────────────────────────────────────────────────────
-DATA_DIR: Path = Path(os.getenv("DATA_DIR", "data"))

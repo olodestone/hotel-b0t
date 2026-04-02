@@ -9,4 +9,3 @@ restartPolicyMaxRetries = 5
 [environments.production]
 [environments.production.variables]
 PYTHONUNBUFFERED = "1"
-DATA_DIR = "/data"
