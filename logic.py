@@ -130,6 +130,42 @@ def process_restock(drink: str, qty: int, cost_price: float) -> tuple[bool, str]
     return result.ok, result.message
 
 
+# ── Entry deletion ───────────────────────────────────────────────────
+
+_VALID_ENTRY_TYPES = ("sale", "room", "expense")
+
+
+def process_delete(entry_type: str, entry_id: int) -> tuple[bool, str]:
+    if entry_type not in _VALID_ENTRY_TYPES:
+        return False, f"❌ Type must be *sale*, *room*, or *expense*. Got: `{entry_type}`"
+
+    if entry_type == "sale":
+        row = db.delete_sale(entry_id)
+        if row is None:
+            return False, f"❌ Sale entry `#{entry_id}` not found."
+        drink = row["drink_name"].title()
+        qty = int(row["quantity"])
+        total = float(row["total_revenue"])
+        inv.restore_bar_stock(row["drink_name"], qty)
+        return True, (
+            f"✅ Sale `#{entry_id}` deleted.\n"
+            f"{drink} ×{qty} — ₦{total:,.2f} removed from revenue.\n"
+            f"Bar stock restored +{qty}."
+        )
+
+    if entry_type == "room":
+        found = db.delete_room(entry_id)
+        if not found:
+            return False, f"❌ Room entry `#{entry_id}` not found."
+        return True, f"✅ Room entry `#{entry_id}` deleted."
+
+    # expense
+    found = db.delete_expense(entry_id)
+    if not found:
+        return False, f"❌ Expense entry `#{entry_id}` not found."
+    return True, f"✅ Expense entry `#{entry_id}` deleted."
+
+
 # ── Store → Bar transfer ──────────────────────────────────────────────
 
 def process_transfer(drink: str, qty: int) -> tuple[bool, str]:

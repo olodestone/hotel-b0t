@@ -98,6 +98,11 @@ def transfer_to_bar(drink: str, qty: int) -> StockResult:
     )
 
 
+def restore_bar_stock(drink: str, qty: int) -> None:
+    """Add qty back to bar stock after a sale is deleted."""
+    db.upsert_drink(drink, qty_to_bar=qty)
+
+
 def set_threshold(drink: str, threshold: int) -> StockResult:
     """Update low-stock alert threshold for a drink."""
     existing = db.get_drink(drink)

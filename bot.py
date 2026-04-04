@@ -186,12 +186,15 @@ def _help_text() -> str:
         "`/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
         "`/pay_debtor <room|bar> <name>`\n"
         "`/debtors` or `/debtors bar` or `/debtors rooms`\n"
+        "`/history` or `/history 2025-04-03` — view entries for a date\n"
         "`/report` — current month\n"
         "`/report today` — today only\n"
+        "`/report 2025-04-01` — specific date\n"
         "`/report 2025-03` — specific month\n"
         "`/report all` — all-time\n"
         "`/stock`\n\n"
         "*Admin only:*\n"
+        "`/delete <sale|room|expense> <id>` — remove an entry\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>`\n"
@@ -391,14 +394,95 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif arg == "all":
         text = reports.generate_full_report(all_time=True)
     else:
+        # Try YYYY-MM-DD first, then YYYY-MM
         try:
-            dt = datetime.strptime(arg, "%Y-%m")
-            text = reports.generate_full_report(for_month=(dt.year, dt.month))
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_full_report(for_date=dt.date())
         except ValueError:
-            await _reply(update, "Usage: `/report` | `/report today` | `/report 2025-03` | `/report all`")
-            return
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_full_report(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/report` | `/report today` | `/report 2025-04-01` | `/report 2025-03` | `/report all`")
+                return
 
     await _reply(update, text)
+
+
+# ── /history ─────────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime, timedelta
+    args = _parse_args(ctx)
+    if args and _DATE_RE.match(args[0]):
+        date_str = args[0]
+    else:
+        # Default: yesterday (entries are typically entered the next morning)
+        date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    entries = db.get_entries_by_date(date_str)
+    label = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d %b %Y")
+
+    if not entries:
+        await _reply(update, f"📋 No entries found for *{label}*.")
+        return
+
+    sales = [e for e in entries if e["entry_type"] == "sale"]
+    rooms = [e for e in entries if e["entry_type"] == "room"]
+    expenses = [e for e in entries if e["entry_type"] == "expense"]
+
+    lines = [f"📋 *Entries for {label}*", "─" * 30]
+
+    if sales:
+        lines.append("🍺 *Sales*")
+        for e in sales:
+            lines.append(
+                f"  `[{e['id']}]` {e['drink_name'].title()} ×{e['quantity']} "
+                f"@ ₦{float(e['selling_price']):,.2f} = ₦{float(e['total_revenue']):,.2f}"
+            )
+
+    if rooms:
+        lines.append("🛏 *Rooms*")
+        for e in rooms:
+            lines.append(
+                f"  `[{e['id']}]` {e['room_type'].title()} ×{e['quantity']} "
+                f"@ ₦{float(e['price_per_night']):,.2f} ×{e['nights']} nights "
+                f"= ₦{float(e['total_revenue']):,.2f}"
+            )
+
+    if expenses:
+        lines.append("💸 *Expenses*")
+        for e in expenses:
+            note = f" — {e['description']}" if e.get("description") else ""
+            lines.append(
+                f"  `[{e['id']}]` {e['account'].title()} › {e['category'].title()} "
+                f"₦{float(e['amount']):,.2f}{note}"
+            )
+
+    lines.append("")
+    lines.append("_Use_ `/delete <sale|room|expense> <id>` _to remove an entry._")
+    await _reply(update, "\n".join(lines))
+
+
+# ── /delete ───────────────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(update, "Usage: `/delete <sale|room|expense> <id>`\nExample: `/delete sale 12`")
+        return
+
+    entry_type = args[0].lower()
+    try:
+        entry_id = int(args[1])
+    except ValueError:
+        await _reply(update, "❌ ID must be a number.")
+        return
+
+    ok, msg = logic.process_delete(entry_type, entry_id)
+    await _reply(update, msg)
 
 
 # ── /stock ────────────────────────────────────────────────────────────
@@ -575,6 +659,8 @@ def main() -> None:
     app.add_handler(CommandHandler("debtors", cmd_debtors))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("transfer", cmd_transfer))
     app.add_handler(CommandHandler("setthreshold", cmd_setthreshold))
     app.add_handler(CommandHandler("addstaff", cmd_addstaff))

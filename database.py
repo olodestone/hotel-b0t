@@ -61,6 +61,7 @@ def init_db() -> None:
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sales (
+                id              SERIAL PRIMARY KEY,
                 timestamp       TEXT,
                 drink_name      TEXT,
                 quantity        INTEGER,
@@ -70,6 +71,7 @@ def init_db() -> None:
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS rooms (
+                id              SERIAL PRIMARY KEY,
                 timestamp       TEXT,
                 room_type       TEXT,
                 quantity        INTEGER,
@@ -80,6 +82,7 @@ def init_db() -> None:
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS expenses (
+                id          SERIAL PRIMARY KEY,
                 timestamp   TEXT,
                 account     TEXT,
                 category    TEXT,
@@ -87,6 +90,10 @@ def init_db() -> None:
                 description TEXT
             )
         """))
+        # Migrations: add id column to existing databases that predate this column
+        conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS id SERIAL"))
+        conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS id SERIAL"))
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS id SERIAL"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS debtors (
                 id          SERIAL PRIMARY KEY,
@@ -302,6 +309,61 @@ def transfer_drink(drink: str, qty: int) -> dict[str, Any]:
         """), {"qty": qty, "name": name})
         conn.commit()
     return get_drink(name) or {}
+
+
+# ── Entry history & deletion ─────────────────────────────────────────
+
+def get_entries_by_date(date_str: str) -> list[dict[str, Any]]:
+    """Return all sales, rooms, and expenses for a given YYYY-MM-DD, tagged by entry_type."""
+    engine = get_engine()
+    entries: list[dict[str, Any]] = []
+
+    for table, tag in (("sales", "sale"), ("rooms", "room"), ("expenses", "expense")):
+        df = pd.read_sql(
+            f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s ORDER BY timestamp",
+            engine, params={"prefix": date_str + "%"},
+        )
+        for row in df.to_dict(orient="records"):
+            row["entry_type"] = tag
+            entries.append(row)
+
+    entries.sort(key=lambda r: r.get("timestamp", ""))
+    return entries
+
+
+def delete_sale(entry_id: int) -> dict[str, Any] | None:
+    """Delete a sale row by id. Returns the deleted row (for stock restoration) or None."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("DELETE FROM sales WHERE id = :id RETURNING *"),
+            {"id": entry_id},
+        )
+        conn.commit()
+        row = result.fetchone()
+        return dict(row._mapping) if row else None
+
+
+def delete_room(entry_id: int) -> bool:
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("DELETE FROM rooms WHERE id = :id"),
+            {"id": entry_id},
+        )
+        conn.commit()
+        return result.rowcount > 0
+
+
+def delete_expense(entry_id: int) -> bool:
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("DELETE FROM expenses WHERE id = :id"),
+            {"id": entry_id},
+        )
+        conn.commit()
+        return result.rowcount > 0
 
 
 # ── User management ───────────────────────────────────────────────────
