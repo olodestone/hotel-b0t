@@ -37,6 +37,18 @@ def _filter_by_date(rows: list[dict], target: date) -> list[dict]:
     return result
 
 
+def _filter_by_month(rows: list[dict], year: int, month: int) -> list[dict]:
+    result = []
+    for r in rows:
+        try:
+            dt = datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
+            if dt.year == year and dt.month == month:
+                result.append(r)
+        except (ValueError, KeyError):
+            pass
+    return result
+
+
 def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
     """
     Match each sale to its current cost price from inventory.
@@ -54,23 +66,39 @@ def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
 
 # ── Full report ───────────────────────────────────────────────────────
 
-def generate_full_report(for_date: date | None = None) -> str:
+def generate_full_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
     """
     Build the Telegram-formatted financial report with separate
     Bar and Rooms P&L sections, plus outstanding debtors.
-    If for_date is given, filter to that day; otherwise all-time.
+
+    Priority: for_date > for_month > all_time > default (current month).
+    Debtors always show all outstanding regardless of filter.
     """
     sales_rows = db.read_all("sales")
     room_rows = db.read_all("rooms")
     expense_rows = db.read_all("expenses")
     debtor_rows = db.read_all("debtors")
 
-    label = "ALL-TIME"
+    now = datetime.now()
+
     if for_date:
         sales_rows = _filter_by_date(sales_rows, for_date)
         room_rows = _filter_by_date(room_rows, for_date)
         expense_rows = _filter_by_date(expense_rows, for_date)
         label = for_date.strftime("%d %b %Y")
+    elif all_time:
+        label = "ALL-TIME"
+    else:
+        year, month = for_month if for_month else (now.year, now.month)
+        sales_rows = _filter_by_month(sales_rows, year, month)
+        room_rows = _filter_by_month(room_rows, year, month)
+        expense_rows = _filter_by_month(expense_rows, year, month)
+        month_label = datetime(year, month, 1).strftime("%B %Y")
+        label = f"{month_label} (current month)" if (year, month) == (now.year, now.month) else month_label
 
     bar_expenses = [r for r in expense_rows if r.get("account", "bar") == "bar"]
     room_expenses = [r for r in expense_rows if r.get("account", "rooms") == "rooms"]

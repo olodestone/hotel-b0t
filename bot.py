@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import time as dtime
 
 import pytz
@@ -107,6 +108,16 @@ def _parse_args(ctx: ContextTypes.DEFAULT_TYPE) -> list[str]:
     return ctx.args or []
 
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _extract_date(args: list[str]) -> tuple[list[str], str | None]:
+    """If the last arg is YYYY-MM-DD, pop it off and return (remaining_args, date_str)."""
+    if args and _DATE_RE.match(args[-1]):
+        return args[:-1], args[-1]
+    return args, None
+
+
 def _to_int(value: str, label: str) -> tuple[int | None, str]:
     try:
         v = int(value)
@@ -168,14 +179,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def _help_text() -> str:
     return (
         "*Commands:*\n"
-        "`/sell_drink <drink> <qty> <price>`\n"
+        "`/sell_drink <drink> <qty> <price> [YYYY-MM-DD]`\n"
         "`/restock <drink> <qty> <cost_price>`\n"
-        "`/room <type> <qty> <price> <nights>`\n"
-        "`/expense <room|bar> <category> <amount> [note]`\n"
-        "`/add_debtor <room|bar> <name> <amount> [note]`\n"
+        "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
+        "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
+        "`/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
         "`/pay_debtor <room|bar> <name>`\n"
         "`/debtors` or `/debtors bar` or `/debtors rooms`\n"
-        "`/report` or `/report today`\n"
+        "`/report` — current month\n"
+        "`/report today` — today only\n"
+        "`/report 2025-03` — specific month\n"
+        "`/report all` — all-time\n"
         "`/stock`\n\n"
         "*Admin only:*\n"
         "`/setthreshold <drink> <amount>`\n"
@@ -189,9 +203,9 @@ def _help_text() -> str:
 
 @_require_auth
 async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(ctx)
+    args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 3:
-        await _reply(update, "Usage: `/sell_drink <drink> <qty> <price>`\nExample: `/sell_drink heineken 6 500`")
+        await _reply(update, "Usage: `/sell_drink <drink> <qty> <price> [YYYY-MM-DD]`\nExample: `/sell_drink heineken 6 500`\nBackdate: `/sell_drink heineken 6 500 2025-03-15`")
         return
 
     drink = args[0]
@@ -204,7 +218,9 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, err)
         return
 
-    ok, msg = logic.process_drink_sale(drink, qty, price)
+    ok, msg = logic.process_drink_sale(drink, qty, price, timestamp=ts)
+    if ts and ok:
+        msg += f"\n_(recorded for {ts})_"
     await _reply(update, msg)
 
 
@@ -235,12 +251,13 @@ async def cmd_restock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_auth
 async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(ctx)
+    args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 4:
         await _reply(
             update,
-            "Usage: `/room <type> <qty> <price> <nights>`\n"
-            "Example: `/room standard 2 15000 3`",
+            "Usage: `/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
+            "Example: `/room standard 2 15000 3`\n"
+            "Backdate: `/room standard 2 15000 3 2025-03-10`",
         )
         return
 
@@ -258,7 +275,7 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, err)
         return
 
-    ok, msg = logic.process_room_sale(room_type, qty, price, nights)
+    ok, msg = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts)
     await _reply(update, msg)
 
 
@@ -266,13 +283,14 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_auth
 async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(ctx)
+    args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 3:
         await _reply(
             update,
-            "Usage: `/expense <room|bar> <category> <amount> [note]`\n"
+            "Usage: `/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
             "Example: `/expense bar cleaning 5000`\n"
-            "Example: `/expense rooms maintenance 12000 generator repair`",
+            "Example: `/expense rooms maintenance 12000 generator repair`\n"
+            "Backdate: `/expense bar cleaning 5000 2025-03-20`",
         )
         return
 
@@ -284,7 +302,7 @@ async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     description = " ".join(args[3:]) if len(args) > 3 else ""
 
-    ok, msg = logic.process_expense(account, category, amount, description)
+    ok, msg = logic.process_expense(account, category, amount, description, timestamp=ts)
     await _reply(update, msg)
 
 
@@ -292,13 +310,14 @@ async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_auth
 async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(ctx)
+    args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 3:
         await _reply(
             update,
-            "Usage: `/add_debtor <room|bar> <name> <amount> [note]`\n"
+            "Usage: `/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
             "Example: `/add_debtor bar john 2500`\n"
-            "Example: `/add_debtor rooms emeka 45000 room 12 unpaid`",
+            "Example: `/add_debtor rooms emeka 45000 room 12 unpaid`\n"
+            "Backdate: `/add_debtor bar john 2500 2025-03-15`",
         )
         return
 
@@ -310,7 +329,7 @@ async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
     description = " ".join(args[3:]) if len(args) > 3 else ""
 
-    ok, msg = logic.process_add_debtor(account, name, amount, description)
+    ok, msg = logic.process_add_debtor(account, name, amount, description, timestamp=ts)
     await _reply(update, msg)
 
 
@@ -352,13 +371,25 @@ async def cmd_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_auth
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(ctx)
     from datetime import datetime
-    for_date = None
-    if args and args[0].lower() == "today":
-        for_date = datetime.now().date()
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
 
-    text = reports.generate_full_report(for_date=for_date)
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_full_report(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_full_report(for_date=datetime.now().date())
+    elif arg == "all":
+        text = reports.generate_full_report(all_time=True)
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m")
+            text = reports.generate_full_report(for_month=(dt.year, dt.month))
+        except ValueError:
+            await _reply(update, "Usage: `/report` | `/report today` | `/report 2025-03` | `/report all`")
+            return
+
     await _reply(update, text)
 
 

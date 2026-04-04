@@ -21,7 +21,7 @@ class StockResult:
     current_stock: int = 0
 
 
-def sell_drink(drink: str, qty: int, price: float) -> StockResult:
+def sell_drink(drink: str, qty: int, price: float, timestamp: str | None = None) -> StockResult:
     """
     Deduct `qty` from inventory and record the sale.
     Returns StockResult indicating success/failure and any alert.
@@ -40,7 +40,7 @@ def sell_drink(drink: str, qty: int, price: float) -> StockResult:
         )
 
     updated = db.upsert_drink(drink, qty_sold=qty)
-    db.record_sale(drink, qty, price)
+    db.record_sale(drink, qty, price, timestamp=timestamp)
 
     new_stock = int(updated["current_stock"])
     threshold = int(updated["low_stock_threshold"])

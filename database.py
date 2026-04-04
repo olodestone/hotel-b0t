@@ -31,6 +31,13 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _ts(custom: str | None = None) -> str:
+    """Return a timestamp string: custom date (YYYY-MM-DD) → 'YYYY-MM-DD 00:00:00', else now."""
+    if custom:
+        return custom + " 00:00:00"
+    return now_str()
+
+
 # ── Init ─────────────────────────────────────────────────────────────
 
 def init_db() -> None:
@@ -109,14 +116,14 @@ def read_all(table: str) -> list[dict[str, Any]]:
 
 # ── Drink-sale record ─────────────────────────────────────────────────
 
-def record_sale(drink: str, qty: int, price: float) -> None:
+def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None) -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO sales (timestamp, drink_name, quantity, selling_price, total_revenue)
             VALUES (:ts, :drink, :qty, :price, :total)
         """), {
-            "ts": now_str(), "drink": drink.lower(),
+            "ts": _ts(timestamp), "drink": drink.lower(),
             "qty": qty, "price": price,
             "total": round(qty * price, 2),
         })
@@ -125,14 +132,14 @@ def record_sale(drink: str, qty: int, price: float) -> None:
 
 # ── Room-booking record ───────────────────────────────────────────────
 
-def record_room(room_type: str, qty: int, price: float, nights: int) -> None:
+def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None) -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO rooms (timestamp, room_type, quantity, price_per_night, nights, total_revenue)
             VALUES (:ts, :rtype, :qty, :price, :nights, :total)
         """), {
-            "ts": now_str(), "rtype": room_type.lower(),
+            "ts": _ts(timestamp), "rtype": room_type.lower(),
             "qty": qty, "price": price, "nights": nights,
             "total": round(qty * price * nights, 2),
         })
@@ -141,14 +148,14 @@ def record_room(room_type: str, qty: int, price: float, nights: int) -> None:
 
 # ── Expense record ────────────────────────────────────────────────────
 
-def record_expense(account: str, category: str, amount: float, description: str = "") -> None:
+def record_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None) -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO expenses (timestamp, account, category, amount, description)
             VALUES (:ts, :account, :category, :amount, :desc)
         """), {
-            "ts": now_str(), "account": account.lower(),
+            "ts": _ts(timestamp), "account": account.lower(),
             "category": category.lower(),
             "amount": round(amount, 2), "desc": description,
         })
@@ -157,14 +164,14 @@ def record_expense(account: str, category: str, amount: float, description: str 
 
 # ── Debtor records ────────────────────────────────────────────────────
 
-def record_debtor(account: str, name: str, amount: float, description: str = "") -> None:
+def record_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None) -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO debtors (timestamp, account, name, amount, description, status, paid_at)
             VALUES (:ts, :account, :name, :amount, :desc, 'outstanding', '')
         """), {
-            "ts": now_str(), "account": account.lower(),
+            "ts": _ts(timestamp), "account": account.lower(),
             "name": name.strip(),
             "amount": round(amount, 2), "desc": description,
         })

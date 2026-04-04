@@ -6,21 +6,30 @@ They validate inputs before touching the database.
 """
 from __future__ import annotations
 
+import re
+
 import database as db
 import inventory as inv
 from inventory import StockResult
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_date(s: str) -> str | None:
+    """Return s if it looks like YYYY-MM-DD, else None."""
+    return s if _DATE_RE.match(s) else None
+
 
 # ── Drink sale ────────────────────────────────────────────────────────
 
-def process_drink_sale(drink: str, qty: int, price: float) -> tuple[bool, str]:
+def process_drink_sale(drink: str, qty: int, price: float, timestamp: str | None = None) -> tuple[bool, str]:
     """Validate inputs and delegate to inventory.sell_drink."""
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
     if price <= 0:
         return False, "❌ Price must be a positive number."
 
-    result: StockResult = inv.sell_drink(drink.strip(), qty, price)
+    result: StockResult = inv.sell_drink(drink.strip(), qty, price, timestamp=timestamp)
     msg = result.message
     if result.low_stock_alert:
         msg += f"\n\n{result.low_stock_alert}"
@@ -29,7 +38,7 @@ def process_drink_sale(drink: str, qty: int, price: float) -> tuple[bool, str]:
 
 # ── Room sale ─────────────────────────────────────────────────────────
 
-def process_room_sale(room_type: str, qty: int, price: float, nights: int) -> tuple[bool, str]:
+def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None) -> tuple[bool, str]:
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
     if price <= 0:
@@ -37,10 +46,11 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int) -> tu
     if nights <= 0:
         return False, "❌ Number of nights must be a positive integer."
 
-    db.record_room(room_type.strip(), qty, price, nights)
+    db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp)
     total = qty * price * nights
+    date_note = f" _(recorded for {timestamp})_" if timestamp else ""
     return True, (
-        f"✅ Room booking recorded.\n"
+        f"✅ Room booking recorded.{date_note}\n"
         f"Type: *{room_type.title()}* | Qty: {qty} | "
         f"₦{price:,.2f}/night × {nights} night(s)\n"
         f"Total Revenue: *₦{total:,.2f}*"
@@ -52,23 +62,25 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int) -> tu
 VALID_ACCOUNTS = ("rooms", "bar")
 
 
-def process_expense(account: str, category: str, amount: float, description: str = "") -> tuple[bool, str]:
+def process_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None) -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
 
-    db.record_expense(account.strip(), category.strip(), amount, description.strip())
+    db.record_expense(account.strip(), category.strip(), amount, description.strip(), timestamp=timestamp)
+    date_note = f"\nDate: {timestamp}" if timestamp else ""
     return True, (
         f"✅ Expense recorded.\n"
         f"Account: *{account.title()}* | Category: *{category.title()}* | Amount: ₦{amount:,.2f}"
         + (f"\nNote: {description}" if description else "")
+        + date_note
     )
 
 
 # ── Debtors ───────────────────────────────────────────────────────────
 
-def process_add_debtor(account: str, name: str, amount: float, description: str = "") -> tuple[bool, str]:
+def process_add_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None) -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if not name.strip():
@@ -76,11 +88,13 @@ def process_add_debtor(account: str, name: str, amount: float, description: str 
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
 
-    db.record_debtor(account.strip(), name.strip(), amount, description.strip())
+    db.record_debtor(account.strip(), name.strip(), amount, description.strip(), timestamp=timestamp)
+    date_note = f"\nDate: {timestamp}" if timestamp else ""
     return True, (
         f"✅ Debtor recorded.\n"
         f"Account: *{account.title()}* | Name: *{name.title()}* | Owes: ₦{amount:,.2f}"
         + (f"\nNote: {description}" if description else "")
+        + date_note
     )
 
 
