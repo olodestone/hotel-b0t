@@ -199,6 +199,13 @@ def _help_text() -> str:
     )
 
 
+# ── /help ────────────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reply(update, _help_text())
+
+
 # ── /sell_drink ───────────────────────────────────────────────────────
 
 @_require_auth
@@ -533,6 +540,7 @@ def main() -> None:
 
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))
     app.add_handler(CommandHandler("restock", cmd_restock))
     app.add_handler(CommandHandler("room", cmd_room))
