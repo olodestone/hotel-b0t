@@ -119,4 +119,25 @@ def process_restock(drink: str, qty: int, cost_price: float) -> tuple[bool, str]
         return False, "❌ Cost price must be a positive number."
 
     result: StockResult = inv.restock_drink(drink.strip(), qty, cost_price)
+    if result.ok:
+        total_cost = round(qty * cost_price, 2)
+        db.record_expense(
+            account="bar",
+            category="restock",
+            amount=total_cost,
+            description=f"Restock: {drink.strip().title()} ×{qty} @ ₦{cost_price:,.2f}",
+        )
     return result.ok, result.message
+
+
+# ── Store → Bar transfer ──────────────────────────────────────────────
+
+def process_transfer(drink: str, qty: int) -> tuple[bool, str]:
+    if qty <= 0:
+        return False, "❌ Quantity must be a positive integer."
+
+    result: StockResult = inv.transfer_to_bar(drink.strip(), qty)
+    msg = result.message
+    if result.low_stock_alert:
+        msg += f"\n\n{result.low_stock_alert}"
+    return result.ok, msg

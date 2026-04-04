@@ -233,34 +233,44 @@ def generate_stock_report() -> str:
     lines = [
         f"🏨 *{HOTEL_NAME} — Inventory*",
         _SEP,
-        f"{'Drink':<18} {'Stock':>6} {'Cost':>10} {'Value':>12}",
+        f"{'Drink':<16} {'Store':>6} {'Bar':>6} {'Cost':>10} {'Value':>11}",
         _SEP,
     ]
 
     total_value = 0.0
-    low_stock_items = []
+    low_bar_items = []
+    empty_store_items = []
 
     for item in items:
-        flag = " ⚠️" if item["is_low"] else ""
+        bar_flag = " ⚠️" if item["is_low"] else ""
         line = (
-            f"{item['drink'][:17]:<18} "
-            f"{item['closing_stock']:>6} "
+            f"{item['drink'][:15]:<16} "
+            f"{item['store_stock']:>6} "
+            f"{item['bar_stock']:>6} "
             f"{_fmt(item['cost_price']):>10} "
-            f"{_fmt(item['stock_value']):>12}"
-            f"{flag}"
+            f"{_fmt(item['stock_value']):>11}"
+            f"{bar_flag}"
         )
         lines.append(f"`{line}`")
         total_value += item["stock_value"]
         if item["is_low"]:
-            low_stock_items.append(item["drink"])
+            low_bar_items.append(item["drink"])
+        if item["store_stock"] == 0:
+            empty_store_items.append(item["drink"])
 
     lines.append(_SEP)
     lines.append(f"*Total Stock Value: {_fmt(total_value)}*")
 
-    if low_stock_items:
+    if low_bar_items:
         lines.append("")
-        lines.append("⚠️ *Low Stock Alerts:*")
-        for name in low_stock_items:
+        lines.append("⚠️ *Low Bar Stock — request transfer from store:*")
+        for name in low_bar_items:
+            lines.append(f"  • {name}")
+
+    if empty_store_items:
+        lines.append("")
+        lines.append("🔴 *Store Empty — needs restocking:*")
+        for name in empty_store_items:
             lines.append(f"  • {name}")
 
     lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")

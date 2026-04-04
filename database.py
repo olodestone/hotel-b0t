@@ -48,11 +48,16 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS inventory (
                 drink_name          TEXT PRIMARY KEY,
                 current_stock       INTEGER NOT NULL DEFAULT 0,
+                store_stock         INTEGER NOT NULL DEFAULT 0,
                 total_purchased     INTEGER NOT NULL DEFAULT 0,
                 total_sold          INTEGER NOT NULL DEFAULT 0,
                 cost_price          FLOAT   NOT NULL DEFAULT 0,
                 low_stock_threshold INTEGER NOT NULL DEFAULT 5
             )
+        """))
+        # Migration: add store_stock to existing databases that predate this column
+        conn.execute(text("""
+            ALTER TABLE inventory ADD COLUMN IF NOT EXISTS store_stock INTEGER NOT NULL DEFAULT 0
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sales (
@@ -228,12 +233,18 @@ def get_drink(drink: str) -> dict[str, Any] | None:
 
 def upsert_drink(
     drink: str,
-    qty_purchased: int = 0,
+    qty_to_store: int = 0,
+    qty_to_bar: int = 0,
     qty_sold: int = 0,
     cost_price: float | None = None,
     threshold: int | None = None,
 ) -> dict[str, Any]:
-    """Create or update an inventory row atomically. Returns the updated row."""
+    """Create or update an inventory row atomically. Returns the updated row.
+
+    qty_to_store — units arriving in the store (restock)
+    qty_to_bar   — units moving from store to bar (transfer, handled separately)
+    qty_sold     — units sold from bar
+    """
     from config import LOW_STOCK_DEFAULT
     name = drink.lower()
     cp = round(cost_price, 2) if cost_price is not None else 0.0
@@ -243,11 +254,12 @@ def upsert_drink(
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO inventory
-                (drink_name, current_stock, total_purchased, total_sold, cost_price, low_stock_threshold)
+                (drink_name, current_stock, store_stock, total_purchased, total_sold, cost_price, low_stock_threshold)
             VALUES
-                (:name, :net, :bought, :sold, :cp, :th)
+                (:name, :bar_net, :store_net, :bought, :sold, :cp, :th)
             ON CONFLICT (drink_name) DO UPDATE SET
-                current_stock       = inventory.current_stock + :net,
+                current_stock       = inventory.current_stock + :bar_net,
+                store_stock         = inventory.store_stock + :store_net,
                 total_purchased     = inventory.total_purchased + :bought,
                 total_sold          = inventory.total_sold + :sold,
                 cost_price          = CASE WHEN :has_cp THEN :cp
@@ -256,14 +268,38 @@ def upsert_drink(
                                           ELSE inventory.low_stock_threshold END
         """), {
             "name": name,
-            "net": qty_purchased - qty_sold,
-            "bought": qty_purchased,
+            "bar_net": qty_to_bar - qty_sold,
+            "store_net": qty_to_store,
+            "bought": qty_to_store + qty_to_bar,
             "sold": qty_sold,
             "cp": cp,
             "has_cp": cost_price is not None,
             "th": th,
             "has_th": threshold is not None,
         })
+        conn.commit()
+    return get_drink(name) or {}
+
+
+def transfer_drink(drink: str, qty: int) -> dict[str, Any]:
+    """Move qty from store to bar. Raises ValueError if store stock is insufficient."""
+    name = drink.lower()
+    row = get_drink(name)
+    if row is None:
+        raise ValueError(f"'{drink}' not found in inventory.")
+    if int(row["store_stock"]) < qty:
+        raise ValueError(
+            f"Not enough store stock for *{drink.title()}*. "
+            f"Store has {int(row['store_stock'])}, requested {qty}."
+        )
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE inventory
+               SET store_stock   = store_stock - :qty,
+                   current_stock = current_stock + :qty
+             WHERE lower(drink_name) = lower(:name)
+        """), {"qty": qty, "name": name})
         conn.commit()
     return get_drink(name) or {}
 

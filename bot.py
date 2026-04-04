@@ -192,6 +192,7 @@ def _help_text() -> str:
         "`/report all` — all-time\n"
         "`/stock`\n\n"
         "*Admin only:*\n"
+        "`/transfer <drink> <qty>` — move store → bar\n"
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>`\n"
         "`/removestaff <user_id>`\n"
@@ -408,6 +409,30 @@ async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, text)
 
 
+# ── /transfer (admin) ────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/transfer <drink> <qty>`\n"
+            "Moves stock from store to bar/freezer.\n"
+            "Example: `/transfer heineken 12`",
+        )
+        return
+
+    drink = args[0]
+    qty, err = _to_int(args[1], "qty")
+    if err:
+        await _reply(update, err)
+        return
+
+    ok, msg = logic.process_transfer(drink, qty)
+    await _reply(update, msg)
+
+
 # ── /setthreshold (admin) ─────────────────────────────────────────────
 
 @_require_admin
@@ -550,6 +575,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debtors", cmd_debtors))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("transfer", cmd_transfer))
     app.add_handler(CommandHandler("setthreshold", cmd_setthreshold))
     app.add_handler(CommandHandler("addstaff", cmd_addstaff))
     app.add_handler(CommandHandler("removestaff", cmd_removestaff))

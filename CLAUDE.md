@@ -39,7 +39,7 @@ config.py  (imported by all layers)
 
 **`logic.py`** — Business logic and validation layer. All public functions return `(ok: bool, message: str)`. Validates inputs before calling `inventory.py` or `database.py`.
 
-**`inventory.py`** — Drink stock operations only. Returns `StockResult` dataclass. Enforces no-negative-stock rule on sales, generates low-stock alerts, tracks cost prices.
+**`inventory.py`** — Drink stock operations only. Returns `StockResult` dataclass. Enforces no-negative-stock rule on bar sales, generates low-stock alerts, tracks cost prices. Exposes `transfer_to_bar()` for store→bar movements.
 
 **`database.py`** — PostgreSQL persistence via SQLAlchemy + pandas. All queries use parameterised statements. `read_all(table)` returns `list[dict]` using `pd.read_sql`. The `upsert_drink()` function does an atomic `INSERT ... ON CONFLICT DO UPDATE`.
 
@@ -59,6 +59,21 @@ config.py  (imported by all layers)
 | `/report all` | All-time |
 
 Implemented via `_filter_by_month(rows, year, month)` in `reports.py`. `generate_full_report()` accepts `for_date`, `for_month`, or `all_time=True`. Outstanding debtors always show all-time regardless of the period filter.
+
+## Two-Location Inventory (Store + Bar/Freezer)
+
+The `inventory` table tracks two separate stock locations:
+- **`store_stock`** — drinks purchased and held in the store
+- **`current_stock`** — drinks in the bar/freezer available for sale
+
+**Workflow:**
+1. `/restock heineken 24 300` → adds 24 to `store_stock`
+2. `/transfer heineken 12` (admin only) → moves 12 from `store_stock` to `current_stock`
+3. `/sell_drink heineken 3 500` → deducts from `current_stock`
+
+`/stock` shows both columns side by side with separate alerts: ⚠️ for low bar stock (prompts a transfer), 🔴 for empty store (prompts a restock).
+
+`database.transfer_drink()` does the store→bar move atomically and rejects if store stock is insufficient. The `init_db()` migration adds `store_stock` via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases are upgraded safely on next startup.
 
 ## Backdated Entries
 
