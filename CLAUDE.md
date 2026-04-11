@@ -131,11 +131,12 @@ Configured via `/setallocation <key> <percent>`. Percentages stored in the `sett
 ### Set-aside keys (% of gross revenue — taken first, before anything else)
 | Key | Default | Goes to |
 |---|---|---|
-| `tax` | 15% | Savings Account |
 | `buffer` | 10% | Savings Account |
 | `restock` | 0% | Bar Account (fund from working capital by default) |
 
-**Total default set-aside: 25%.** Increase to 35% (`/setallocation restock 10`) when revenue is consistent.
+**Total default set-aside: 10%.** Nigerian corporate tax is not applicable unless annual revenue exceeds ₦50M. Personal income tax (PIT) on the owner's draw is shown as an informational estimate in the allocation report.
+
+**Total default set-aside: 10%.** Increase to 20% (`/setallocation restock 10`) when revenue is consistent.
 
 ### Profit distribution keys (% of leftover after expenses + set-asides)
 | Key | Default | Goes to |

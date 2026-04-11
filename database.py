@@ -78,9 +78,11 @@ def init_db() -> None:
                 quantity        INTEGER,
                 price_per_night FLOAT,
                 nights          INTEGER,
-                total_revenue   FLOAT
+                total_revenue   FLOAT,
+                recorded_by     TEXT DEFAULT ''
             )
         """))
+        conn.execute(text("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id          SERIAL PRIMARY KEY,
@@ -153,16 +155,17 @@ def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None
 
 # ── Room-booking record ───────────────────────────────────────────────
 
-def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None) -> None:
+def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO rooms (timestamp, room_type, quantity, price_per_night, nights, total_revenue)
-            VALUES (:ts, :rtype, :qty, :price, :nights, :total)
+            INSERT INTO rooms (timestamp, room_type, quantity, price_per_night, nights, total_revenue, recorded_by)
+            VALUES (:ts, :rtype, :qty, :price, :nights, :total, :recorded_by)
         """), {
             "ts": _ts(timestamp), "rtype": room_type.lower(),
             "qty": qty, "price": price, "nights": nights,
             "total": round(qty * price * nights, 2),
+            "recorded_by": recorded_by,
         })
         conn.commit()
 
@@ -373,6 +376,62 @@ def delete_expense(entry_id: int) -> bool:
         )
         conn.commit()
         return result.rowcount > 0
+
+
+# ── Price list ───────────────────────────────────────────────────────
+
+def get_last_selling_prices() -> list[dict[str, Any]]:
+    """Return the most recent selling price per drink from sales history."""
+    engine = get_engine()
+    df = pd.read_sql("""
+        SELECT DISTINCT ON (drink_name) drink_name, selling_price
+        FROM sales
+        ORDER BY drink_name, timestamp DESC
+    """, engine)
+    return df.to_dict(orient="records")
+
+
+# ── Undo (last staff entry within window) ────────────────────────────
+
+def get_last_staff_entry(username: str, window_minutes: int = 5) -> dict[str, Any] | None:
+    """
+    Return the most recent sale or room entry recorded by `username`
+    within the last `window_minutes` minutes, or None if outside the window.
+    """
+    engine = get_engine()
+    cutoff = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    sale_df = pd.read_sql(
+        "SELECT *, 'sale' AS entry_type FROM sales "
+        "WHERE recorded_by = %(u)s ORDER BY timestamp DESC LIMIT 1",
+        engine, params={"u": username},
+    )
+    room_df = pd.read_sql(
+        "SELECT *, 'room' AS entry_type FROM rooms "
+        "WHERE recorded_by = %(u)s ORDER BY timestamp DESC LIMIT 1",
+        engine, params={"u": username},
+    )
+
+    candidates = []
+    for df in (sale_df, room_df):
+        if not df.empty:
+            candidates.append(df.iloc[0].to_dict())
+
+    if not candidates:
+        return None
+
+    # Pick the most recent
+    def _ts(r: dict) -> datetime:
+        try:
+            return datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, KeyError):
+            return datetime.min
+
+    best = max(candidates, key=_ts)
+    age_seconds = (datetime.now() - _ts(best)).total_seconds()
+    if age_seconds > window_minutes * 60:
+        return None
+    return best
 
 
 # ── Settings ─────────────────────────────────────────────────────────

@@ -190,12 +190,13 @@ def _help_text(is_admin: bool = False) -> str:
         "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
         "`/debtors` | `/debtors bar` | `/debtors rooms`\n"
         "`/history` | `/history YYYY-MM-DD`\n"
-        "`/report` — current month\n"
+        "`/report` — current month revenue summary\n"
         "`/report today` | `/report YYYY-MM-DD` | `/report YYYY-MM` | `/report all`\n"
-        "`/sales_report` — sales breakdown by drink\n"
-        "`/expense_report` — expense breakdown by category\n"
+        "`/sales_report` — drinks sold per item\n"
         "`/summary` | `/summary YYYY-MM-DD` — daily overview\n"
-        "`/stock` — inventory status"
+        "`/stock` — bar stock levels\n"
+        "`/prices` — current drink price list\n"
+        "`/undo` — undo your last entry (within 5 minutes)"
     )
     if not is_admin:
         return staff_cmds
@@ -207,9 +208,11 @@ def _help_text(is_admin: bool = False) -> str:
         "`/restock <drink> <qty> <cost_price>`\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
         "`/delete <sale|room|expense> <id>`\n"
+        "`/sales_report` — full sales breakdown with cost & profit\n"
+        "`/expense_report` — expense breakdown by category\n"
         "`/staff_report` | `/staff_report today` | `/staff_report YYYY-MM`\n"
         "`/allocation` | `/allocation today` | `/allocation YYYY-MM` | `/allocation all`\n"
-        "`/setallocation <tax|buffer|restock|draw|reinvest|float> <percent>`\n"
+        "`/setallocation <buffer|restock|draw|reinvest|float> <percent>`\n"
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>`\n"
         "`/removestaff <user_id>`\n"
@@ -246,9 +249,40 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_drink_sale(drink, qty, price, timestamp=ts, recorded_by=recorded_by)
+    ok, msg, alert = logic.process_drink_sale(drink, qty, price, timestamp=ts, recorded_by=recorded_by)
     if ts and ok:
         msg += f"\n_(recorded for {ts})_"
+    await _reply(update, msg)
+
+    # Proactive low-stock alert — push to all admins separately
+    if ok and alert:
+        for admin_id in ADMIN_IDS:
+            if admin_id != user.id:
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"⚠️ *Low Stock Alert*\n_{recorded_by} just sold {qty}× {drink}_\n\n{alert}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+
+# ── /prices ──────────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = reports.generate_price_list()
+    await _reply(update, text)
+
+
+# ── /undo ─────────────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_undo(recorded_by)
     await _reply(update, msg)
 
 
@@ -303,7 +337,9 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, err)
         return
 
-    ok, msg = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts, recorded_by=recorded_by)
     await _reply(update, msg)
 
 
@@ -402,23 +438,24 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from datetime import datetime
     args = _parse_args(ctx)
     arg = args[0].lower() if args else ""
+    staff_view = not _is_admin(update.effective_user.id)
 
     if not arg:
         now = datetime.now()
-        text = reports.generate_full_report(for_month=(now.year, now.month))
+        text = reports.generate_full_report(for_month=(now.year, now.month), staff_view=staff_view)
     elif arg == "today":
-        text = reports.generate_full_report(for_date=datetime.now().date())
+        text = reports.generate_full_report(for_date=datetime.now().date(), staff_view=staff_view)
     elif arg == "all":
-        text = reports.generate_full_report(all_time=True)
+        text = reports.generate_full_report(all_time=True, staff_view=staff_view)
     else:
         # Try YYYY-MM-DD first, then YYYY-MM
         try:
             dt = datetime.strptime(arg, "%Y-%m-%d")
-            text = reports.generate_full_report(for_date=dt.date())
+            text = reports.generate_full_report(for_date=dt.date(), staff_view=staff_view)
         except ValueError:
             try:
                 dt = datetime.strptime(arg, "%Y-%m")
-                text = reports.generate_full_report(for_month=(dt.year, dt.month))
+                text = reports.generate_full_report(for_month=(dt.year, dt.month), staff_view=staff_view)
             except ValueError:
                 await _reply(update, "Usage: `/report` | `/report today` | `/report 2025-04-01` | `/report 2025-03` | `/report all`")
                 return
@@ -445,6 +482,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, f"📋 No entries found for *{label}*.")
         return
 
+    is_admin = _is_admin(update.effective_user.id)
     sales = [e for e in entries if e["entry_type"] == "sale"]
     rooms = [e for e in entries if e["entry_type"] == "room"]
     expenses = [e for e in entries if e["entry_type"] == "expense"]
@@ -468,7 +506,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 f"= ₦{float(e['total_revenue']):,.2f}"
             )
 
-    if expenses:
+    if expenses and is_admin:
         lines.append("💸 *Expenses*")
         for e in expenses:
             note = f" — {e['description']}" if e.get("description") else ""
@@ -477,8 +515,9 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 f"₦{float(e['amount']):,.2f}{note}"
             )
 
-    lines.append("")
-    lines.append("_Use_ `/delete <sale|room|expense> <id>` _to remove an entry._")
+    if is_admin:
+        lines.append("")
+        lines.append("_Use_ `/delete <sale|room|expense> <id>` _to remove an entry._")
     await _reply(update, "\n".join(lines))
 
 
@@ -506,7 +545,8 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_auth
 async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = reports.generate_stock_report()
+    is_admin = _is_admin(update.effective_user.id)
+    text = reports.generate_stock_report(staff_view=not is_admin)
     await _reply(update, text)
 
 
@@ -517,22 +557,23 @@ async def cmd_sales_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     from datetime import datetime
     args = _parse_args(ctx)
     arg = args[0].lower() if args else ""
+    staff_view = not _is_admin(update.effective_user.id)
 
     if not arg:
         now = datetime.now()
-        text = reports.generate_sales_report(for_month=(now.year, now.month))
+        text = reports.generate_sales_report(for_month=(now.year, now.month), staff_view=staff_view)
     elif arg == "today":
-        text = reports.generate_sales_report(for_date=datetime.now().date())
+        text = reports.generate_sales_report(for_date=datetime.now().date(), staff_view=staff_view)
     elif arg == "all":
-        text = reports.generate_sales_report(all_time=True)
+        text = reports.generate_sales_report(all_time=True, staff_view=staff_view)
     else:
         try:
             dt = datetime.strptime(arg, "%Y-%m-%d")
-            text = reports.generate_sales_report(for_date=dt.date())
+            text = reports.generate_sales_report(for_date=dt.date(), staff_view=staff_view)
         except ValueError:
             try:
                 dt = datetime.strptime(arg, "%Y-%m")
-                text = reports.generate_sales_report(for_month=(dt.year, dt.month))
+                text = reports.generate_sales_report(for_month=(dt.year, dt.month), staff_view=staff_view)
             except ValueError:
                 await _reply(update, "Usage: `/sales_report` | `/sales_report today` | `/sales_report YYYY-MM-DD` | `/sales_report YYYY-MM` | `/sales_report all`")
                 return
@@ -541,7 +582,7 @@ async def cmd_sales_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── /expense_report ───────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_expense_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from datetime import datetime
     args = _parse_args(ctx)
@@ -605,7 +646,8 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target = datetime.strptime(args[0], "%Y-%m-%d").date()
     else:
         target = None
-    text = reports.generate_daily_summary(target=target)
+    staff_view = not _is_admin(update.effective_user.id)
+    text = reports.generate_daily_summary(target=target, staff_view=staff_view)
     await _reply(update, text)
 
 
@@ -640,7 +682,7 @@ async def cmd_allocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── /setallocation (admin) ────────────────────────────────────────────
 
-_ALLOC_KEYS = ("tax", "buffer", "restock", "draw", "reinvest", "float")
+_ALLOC_KEYS = ("buffer", "restock", "draw", "reinvest", "float")
 
 @_require_admin
 async def cmd_setallocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -650,14 +692,13 @@ async def cmd_setallocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             update,
             "Usage: `/setallocation <key> <percent>`\n\n"
             "*Set-aside keys* (% of gross revenue):\n"
-            "  `tax` — tax reserve (default 15%)\n"
             "  `buffer` — emergency buffer (default 10%)\n"
             "  `restock` — restock budget (default 0%)\n\n"
             "*Profit distribution keys* (% of leftover profit):\n"
             "  `draw` — owner's draw (default 50%)\n"
             "  `reinvest` — business reinvestment (default 30%)\n"
             "  `float` — cash reserve (default 20%)\n\n"
-            "Example: `/setallocation tax 15`\n"
+            "Example: `/setallocation buffer 10`\n"
             "Example: `/setallocation draw 50`"
         )
         return
@@ -678,10 +719,9 @@ async def cmd_setallocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     db.set_setting(f"alloc_{key}", str(pct))
 
     from config import (
-        ALLOC_TAX_DEFAULT, ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
+        ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
         ALLOC_DRAW_DEFAULT, ALLOC_REINVEST_DEFAULT, ALLOC_FLOAT_DEFAULT,
     )
-    tax      = int(db.get_setting("alloc_tax",      str(ALLOC_TAX_DEFAULT)))
     buffer_  = int(db.get_setting("alloc_buffer",   str(ALLOC_BUFFER_DEFAULT)))
     restock  = int(db.get_setting("alloc_restock",  str(ALLOC_RESTOCK_DEFAULT)))
     draw     = int(db.get_setting("alloc_draw",     str(ALLOC_DRAW_DEFAULT)))
@@ -692,8 +732,8 @@ async def cmd_setallocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         update,
         f"✅ *{key.title()}* set to *{pct}%*\n\n"
         f"*Set-asides* (of gross revenue):\n"
-        f"  Tax: {tax}%  |  Buffer: {buffer_}%  |  Restock: {restock}%\n"
-        f"  Total: *{tax + buffer_ + restock}%*\n\n"
+        f"  Buffer: {buffer_}%  |  Restock: {restock}%\n"
+        f"  Total: *{buffer_ + restock}%*\n\n"
         f"*Profit distribution* (of leftover):\n"
         f"  Draw: {draw}%  |  Reinvest: {reinvest}%  |  Float: {float_}%\n"
         f"  Total: *{draw + reinvest + float_}%*"
@@ -858,6 +898,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))
+    app.add_handler(CommandHandler("prices", cmd_prices))
+    app.add_handler(CommandHandler("undo", cmd_undo))
     app.add_handler(CommandHandler("restock", cmd_restock))
     app.add_handler(CommandHandler("room", cmd_room))
     app.add_handler(CommandHandler("expense", cmd_expense))

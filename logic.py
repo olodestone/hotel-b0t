@@ -22,23 +22,21 @@ def parse_date(s: str) -> str | None:
 
 # ── Drink sale ────────────────────────────────────────────────────────
 
-def process_drink_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
-    """Validate inputs and delegate to inventory.sell_drink."""
+def process_drink_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, str | None]:
+    """Validate inputs and delegate to inventory.sell_drink.
+    Returns (ok, message, low_stock_alert) — alert is None if no alert."""
     if qty <= 0:
-        return False, "❌ Quantity must be a positive integer."
+        return False, "❌ Quantity must be a positive integer.", None
     if price <= 0:
-        return False, "❌ Price must be a positive number."
+        return False, "❌ Price must be a positive number.", None
 
     result: StockResult = inv.sell_drink(drink.strip(), qty, price, timestamp=timestamp, recorded_by=recorded_by)
-    msg = result.message
-    if result.low_stock_alert:
-        msg += f"\n\n{result.low_stock_alert}"
-    return result.ok, msg
+    return result.ok, result.message, result.low_stock_alert
 
 
 # ── Room sale ─────────────────────────────────────────────────────────
 
-def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None) -> tuple[bool, str]:
+def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
     if price <= 0:
@@ -46,7 +44,7 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
     if nights <= 0:
         return False, "❌ Number of nights must be a positive integer."
 
-    db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp)
+    db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
     total = qty * price * nights
     date_note = f" _(recorded for {timestamp})_" if timestamp else ""
     return True, (
@@ -164,6 +162,43 @@ def process_delete(entry_type: str, entry_id: int) -> tuple[bool, str]:
     if not found:
         return False, f"❌ Expense entry `#{entry_id}` not found."
     return True, f"✅ Expense entry `#{entry_id}` deleted."
+
+
+# ── Undo last entry ──────────────────────────────────────────────────
+
+def process_undo(username: str) -> tuple[bool, str]:
+    """Delete the last sale or room entry by this user if within the 5-min window."""
+    entry = db.get_last_staff_entry(username)
+    if entry is None:
+        return False, (
+            "❌ Nothing to undo.\n"
+            "Either you have no recent entries, or the 5-minute window has passed."
+        )
+
+    entry_type = entry["entry_type"]
+
+    if entry_type == "sale":
+        row = db.delete_sale(int(entry["id"]))
+        if row is None:
+            return False, "❌ Could not find the entry to undo."
+        drink = row["drink_name"].title()
+        qty = int(row["quantity"])
+        total = float(row["total_revenue"])
+        inv.restore_bar_stock(row["drink_name"], qty)
+        return True, (
+            f"↩️ Undone: Sale of {qty}× *{drink}* — ₦{total:,.2f}\n"
+            f"Bar stock restored +{qty}."
+        )
+
+    if entry_type == "room":
+        found = db.delete_room(int(entry["id"]))
+        if not found:
+            return False, "❌ Could not find the entry to undo."
+        room_type = entry["room_type"].title()
+        total = float(entry["total_revenue"])
+        return True, f"↩️ Undone: *{room_type}* room booking — ₦{total:,.2f} removed."
+
+    return False, "❌ Unknown entry type."
 
 
 # ── Store → Bar transfer ──────────────────────────────────────────────

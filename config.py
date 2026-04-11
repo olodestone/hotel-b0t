@@ -32,8 +32,6 @@ TIMEZONE: str = os.getenv("TIMEZONE", "Africa/Lagos")
 LOW_STOCK_DEFAULT: int = int(os.getenv("LOW_STOCK_DEFAULT", "5"))
 
 # ── Allocation defaults (overridden by DB settings via /setallocation) ─
-# Start at 25% — build the habit before pushing to 35%
-ALLOC_TAX_DEFAULT: int = 15       # % of gross revenue → tax reserve
 ALLOC_BUFFER_DEFAULT: int = 10    # % of gross revenue → emergency buffer
 ALLOC_RESTOCK_DEFAULT: int = 0    # % of gross revenue → restock budget (funded from working capital by default)
 
@@ -41,3 +39,8 @@ ALLOC_RESTOCK_DEFAULT: int = 0    # % of gross revenue → restock budget (funde
 ALLOC_DRAW_DEFAULT: int = 50      # % of profit → owner's draw
 ALLOC_REINVEST_DEFAULT: int = 30  # % of profit → reinvestment
 ALLOC_FLOAT_DEFAULT: int = 20     # % of profit → cash float / reserve
+
+# Personal income tax estimate shown on owner's draw (informational only)
+# Nigerian PIT: only applies to individuals, not businesses. Progressive bracket.
+PIT_LOW_RATE: int = 15   # lower-end estimate %
+PIT_HIGH_RATE: int = 24  # upper-end estimate %
