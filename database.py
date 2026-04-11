@@ -393,7 +393,7 @@ def get_last_selling_prices() -> list[dict[str, Any]]:
 
 # ── Undo (last staff entry within window) ────────────────────────────
 
-def get_last_staff_entry(username: str, window_minutes: int = 5) -> dict[str, Any] | None:
+def get_last_staff_entry(username: str, window_minutes: int = 2) -> dict[str, Any] | None:
     """
     Return the most recent sale or room entry recorded by `username`
     within the last `window_minutes` minutes, or None if outside the window.

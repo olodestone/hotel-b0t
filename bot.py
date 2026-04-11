@@ -196,7 +196,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/summary` | `/summary YYYY-MM-DD` — daily overview\n"
         "`/stock` — bar stock levels\n"
         "`/prices` — current drink price list\n"
-        "`/undo` — undo your last entry (within 5 minutes)"
+        "`/undo` — undo your last entry (within 2 minutes, admin is notified)"
     )
     if not is_admin:
         return staff_cmds
@@ -284,6 +284,19 @@ async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     recorded_by = user.username or user.first_name or str(user.id)
     ok, msg = logic.process_undo(recorded_by)
     await _reply(update, msg)
+
+    # Notify all admins of every undo — full audit trail
+    if ok:
+        for admin_id in ADMIN_IDS:
+            if admin_id != user.id:
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"↩️ *Undo Alert*\n@{recorded_by} reversed an entry:\n_{msg}_",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
 
 
 # ── /restock ──────────────────────────────────────────────────────────
