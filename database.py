@@ -66,7 +66,8 @@ def init_db() -> None:
                 drink_name      TEXT,
                 quantity        INTEGER,
                 selling_price   FLOAT,
-                total_revenue   FLOAT
+                total_revenue   FLOAT,
+                recorded_by     TEXT DEFAULT ''
             )
         """))
         conn.execute(text("""
@@ -90,10 +91,11 @@ def init_db() -> None:
                 description TEXT
             )
         """))
-        # Migrations: add id column to existing databases that predate this column
+        # Migrations: add columns to existing databases that predate them
         conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS id SERIAL"))
         conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS id SERIAL"))
         conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS id SERIAL"))
+        conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS debtors (
                 id          SERIAL PRIMARY KEY,
@@ -128,16 +130,17 @@ def read_all(table: str) -> list[dict[str, Any]]:
 
 # ── Drink-sale record ─────────────────────────────────────────────────
 
-def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None) -> None:
+def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO sales (timestamp, drink_name, quantity, selling_price, total_revenue)
-            VALUES (:ts, :drink, :qty, :price, :total)
+            INSERT INTO sales (timestamp, drink_name, quantity, selling_price, total_revenue, recorded_by)
+            VALUES (:ts, :drink, :qty, :price, :total, :recorded_by)
         """), {
             "ts": _ts(timestamp), "drink": drink.lower(),
             "qty": qty, "price": price,
             "total": round(qty * price, 2),
+            "recorded_by": recorded_by,
         })
         conn.commit()
 

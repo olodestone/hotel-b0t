@@ -6,23 +6,30 @@ role-based access control, and daily report scheduling.
 
 Commands
 --------
-Public (any registered user):
+Staff (any registered user):
   /start                                     — Initialize / register
   /sell_drink <drink> <qty> <price>          — Record drink sale
-  /restock <drink> <qty> <cost>              — Add inventory
   /room <type> <qty> <price> <nights>        — Record room booking
-  /expense <room|bar> <category> <amt> [note]— Record expense under Bar or Rooms account
-  /add_debtor <room|bar> <name> <amt> [note] — Log a debtor for Bar or Rooms
-  /pay_debtor <room|bar> <name>              — Mark debtor as paid
   /debtors [bar|rooms]                       — List outstanding debtors
-  /report [today]                            — Financial report (split Bar / Rooms)
+  /report [today|YYYY-MM-DD|YYYY-MM|all]     — Financial report
+  /sales_report [today|YYYY-MM-DD|YYYY-MM|all] — Sales breakdown by drink
+  /expense_report [today|YYYY-MM-DD|YYYY-MM|all] — Expense breakdown
   /stock                                     — Inventory status
-  
+  /summary [YYYY-MM-DD]                      — Today's key numbers
+  /history [YYYY-MM-DD]                      — View entries for a date
+
 Admin only:
-  /setthreshold <drink> <amount>      — Set low-stock alert threshold
-  /addstaff <user_id> <username>      — Grant staff access
-  /removestaff <user_id>              — Revoke access
-  /dailyreport on|off                 — Toggle scheduled reports
+  /expense <room|bar> <category> <amt> [note]— Record expense
+  /add_debtor <room|bar> <name> <amt> [note] — Log a debtor
+  /pay_debtor <room|bar> <name>              — Mark debtor as paid
+  /restock <drink> <qty> <cost>              — Add inventory
+  /transfer <drink> <qty>                    — Move store → bar
+  /delete <sale|room|expense> <id>           — Remove an entry
+  /staff_report [today|YYYY-MM-DD|YYYY-MM]   — Sales per staff member
+  /setthreshold <drink> <amount>             — Set low-stock alert threshold
+  /addstaff <user_id> <username>             — Grant staff access
+  /removestaff <user_id>                     — Revoke access
+  /dailyreport on|off                        — Toggle scheduled reports
 """
 from __future__ import annotations
 
@@ -163,7 +170,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"🏨 *{HOTEL_NAME}* Bot\n\n"
             f"Welcome, *{username}*! You've been registered as *admin* "
             f"(first user, no ADMIN_IDS set).\n\n"
-            + _help_text(),
+            + _help_text(is_admin=True),
         )
     elif _is_admin(uid):
         db.upsert_user(uid, username, role="admin")
@@ -176,38 +183,44 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-def _help_text() -> str:
-    return (
-        "*Commands:*\n"
+def _help_text(is_admin: bool = False) -> str:
+    staff_cmds = (
+        "*Staff Commands:*\n"
         "`/sell_drink <drink> <qty> <price> [YYYY-MM-DD]`\n"
-        "`/restock <drink> <qty> <cost_price>`\n"
         "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
+        "`/debtors` | `/debtors bar` | `/debtors rooms`\n"
+        "`/history` | `/history YYYY-MM-DD`\n"
+        "`/report` — current month\n"
+        "`/report today` | `/report YYYY-MM-DD` | `/report YYYY-MM` | `/report all`\n"
+        "`/sales_report` — sales breakdown by drink\n"
+        "`/expense_report` — expense breakdown by category\n"
+        "`/summary` | `/summary YYYY-MM-DD` — daily overview\n"
+        "`/stock` — inventory status"
+    )
+    if not is_admin:
+        return staff_cmds
+    admin_cmds = (
+        "\n\n*Admin Commands:*\n"
         "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
         "`/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
         "`/pay_debtor <room|bar> <name>`\n"
-        "`/debtors` or `/debtors bar` or `/debtors rooms`\n"
-        "`/history` or `/history 2025-04-03` — view entries for a date\n"
-        "`/report` — current month\n"
-        "`/report today` — today only\n"
-        "`/report 2025-04-01` — specific date\n"
-        "`/report 2025-03` — specific month\n"
-        "`/report all` — all-time\n"
-        "`/stock`\n\n"
-        "*Admin only:*\n"
-        "`/delete <sale|room|expense> <id>` — remove an entry\n"
+        "`/restock <drink> <qty> <cost_price>`\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
+        "`/delete <sale|room|expense> <id>`\n"
+        "`/staff_report` | `/staff_report today` | `/staff_report YYYY-MM`\n"
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>`\n"
         "`/removestaff <user_id>`\n"
         "`/dailyreport on|off`"
     )
+    return staff_cmds + admin_cmds
 
 
 # ── /help ────────────────────────────────────────────────────────────
 
 @_require_auth
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _reply(update, _help_text())
+    await _reply(update, _help_text(is_admin=_is_admin(update.effective_user.id)))
 
 
 # ── /sell_drink ───────────────────────────────────────────────────────
@@ -229,7 +242,9 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, err)
         return
 
-    ok, msg = logic.process_drink_sale(drink, qty, price, timestamp=ts)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_drink_sale(drink, qty, price, timestamp=ts, recorded_by=recorded_by)
     if ts and ok:
         msg += f"\n_(recorded for {ts})_"
     await _reply(update, msg)
@@ -237,7 +252,7 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── /restock ──────────────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_restock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     if len(args) < 3:
@@ -292,7 +307,7 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /expense ──────────────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 3:
@@ -319,7 +334,7 @@ async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /add_debtor ───────────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 3:
@@ -346,7 +361,7 @@ async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── /pay_debtor ───────────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_pay_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     if len(args) < 2:
@@ -490,6 +505,105 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_require_auth
 async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = reports.generate_stock_report()
+    await _reply(update, text)
+
+
+# ── /sales_report ─────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_sales_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
+
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_sales_report(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_sales_report(for_date=datetime.now().date())
+    elif arg == "all":
+        text = reports.generate_sales_report(all_time=True)
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_sales_report(for_date=dt.date())
+        except ValueError:
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_sales_report(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/sales_report` | `/sales_report today` | `/sales_report YYYY-MM-DD` | `/sales_report YYYY-MM` | `/sales_report all`")
+                return
+    await _reply(update, text)
+
+
+# ── /expense_report ───────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_expense_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
+
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_expense_report(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_expense_report(for_date=datetime.now().date())
+    elif arg == "all":
+        text = reports.generate_expense_report(all_time=True)
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_expense_report(for_date=dt.date())
+        except ValueError:
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_expense_report(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/expense_report` | `/expense_report today` | `/expense_report YYYY-MM-DD` | `/expense_report YYYY-MM` | `/expense_report all`")
+                return
+    await _reply(update, text)
+
+
+# ── /staff_report (admin) ─────────────────────────────────────────────
+
+@_require_admin
+async def cmd_staff_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
+
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_staff_report(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_staff_report(for_date=datetime.now().date())
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_staff_report(for_date=dt.date())
+        except ValueError:
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_staff_report(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/staff_report` | `/staff_report today` | `/staff_report YYYY-MM-DD` | `/staff_report YYYY-MM`")
+                return
+    await _reply(update, text)
+
+
+# ── /summary ──────────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    if args and _DATE_RE.match(args[0]):
+        target = datetime.strptime(args[0], "%Y-%m-%d").date()
+    else:
+        target = None
+    text = reports.generate_daily_summary(target=target)
     await _reply(update, text)
 
 
@@ -658,6 +772,10 @@ def main() -> None:
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
     app.add_handler(CommandHandler("debtors", cmd_debtors))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("sales_report", cmd_sales_report))
+    app.add_handler(CommandHandler("expense_report", cmd_expense_report))
+    app.add_handler(CommandHandler("staff_report", cmd_staff_report))
+    app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("delete", cmd_delete))

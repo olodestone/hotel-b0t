@@ -16,7 +16,7 @@ _SEP = "─" * 30
 
 
 def _fmt(amount: float) -> str:
-    return f"₦{amount:,.2f}"
+    return f"₦{amount:,.0f}"
 
 
 # ── Core aggregations ─────────────────────────────────────────────────
@@ -49,11 +49,29 @@ def _filter_by_month(rows: list[dict], year: int, month: int) -> list[dict]:
     return result
 
 
+def _period_label(for_date: date | None, for_month: tuple[int, int] | None, all_time: bool) -> str:
+    now = datetime.now()
+    if for_date:
+        return for_date.strftime("%d %b %Y")
+    if all_time:
+        return "ALL-TIME"
+    year, month = for_month if for_month else (now.year, now.month)
+    label = datetime(year, month, 1).strftime("%B %Y")
+    return f"{label} (current month)" if (year, month) == (now.year, now.month) else label
+
+
+def _apply_filter(rows: list[dict], for_date: date | None, for_month: tuple[int, int] | None, all_time: bool) -> list[dict]:
+    now = datetime.now()
+    if for_date:
+        return _filter_by_date(rows, for_date)
+    if all_time:
+        return rows
+    year, month = for_month if for_month else (now.year, now.month)
+    return _filter_by_month(rows, year, month)
+
+
 def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
-    """
-    Match each sale to its current cost price from inventory.
-    Note: uses current cost_price, not historical — acceptable for daily ops.
-    """
+    """Match each sale to its current cost price from inventory."""
     total = 0.0
     inventory_rows = {r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")}
     for row in sales_rows:
@@ -64,41 +82,22 @@ def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
     return round(total, 2)
 
 
-# ── Full report ───────────────────────────────────────────────────────
+# ── Full financial report ─────────────────────────────────────────────
 
 def generate_full_report(
     for_date: date | None = None,
     for_month: tuple[int, int] | None = None,
     all_time: bool = False,
 ) -> str:
-    """
-    Build the Telegram-formatted financial report with separate
-    Bar and Rooms P&L sections, plus outstanding debtors.
-
-    Priority: for_date > for_month > all_time > default (current month).
-    Debtors always show all outstanding regardless of filter.
-    """
     sales_rows = db.read_all("sales")
     room_rows = db.read_all("rooms")
     expense_rows = db.read_all("expenses")
     debtor_rows = db.read_all("debtors")
 
-    now = datetime.now()
-
-    if for_date:
-        sales_rows = _filter_by_date(sales_rows, for_date)
-        room_rows = _filter_by_date(room_rows, for_date)
-        expense_rows = _filter_by_date(expense_rows, for_date)
-        label = for_date.strftime("%d %b %Y")
-    elif all_time:
-        label = "ALL-TIME"
-    else:
-        year, month = for_month if for_month else (now.year, now.month)
-        sales_rows = _filter_by_month(sales_rows, year, month)
-        room_rows = _filter_by_month(room_rows, year, month)
-        expense_rows = _filter_by_month(expense_rows, year, month)
-        month_label = datetime(year, month, 1).strftime("%B %Y")
-        label = f"{month_label} (current month)" if (year, month) == (now.year, now.month) else month_label
+    sales_rows = _apply_filter(sales_rows, for_date, for_month, all_time)
+    room_rows = _apply_filter(room_rows, for_date, for_month, all_time)
+    expense_rows = _apply_filter(expense_rows, for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
 
     bar_expenses = [r for r in expense_rows if r.get("account", "bar") == "bar"]
     room_expenses = [r for r in expense_rows if r.get("account", "rooms") == "rooms"]
@@ -124,7 +123,7 @@ def generate_full_report(
         f"🏨 *{HOTEL_NAME} — Financial Report*",
         f"📅 Period: {label}",
         _SEP,
-        f"🍺 *BAR ACCOUNT*",
+        "🍺 *BAR ACCOUNT*",
         f"  Revenue:       {_fmt(drink_revenue)}",
         f"  Cost of Stock: {_fmt(cost_of_drinks)}",
         f"  Expenses:      {_fmt(bar_expense_total)}",
@@ -142,7 +141,7 @@ def generate_full_report(
 
     lines += [
         _SEP,
-        f"🛏 *ROOMS ACCOUNT*",
+        "🛏 *ROOMS ACCOUNT*",
         f"  Revenue:       {_fmt(room_revenue)}",
         f"  Expenses:      {_fmt(room_expense_total)}",
         f"  {room_emoji} Profit:      *{_fmt(room_profit)}*",
@@ -159,21 +158,20 @@ def generate_full_report(
 
     lines += [
         _SEP,
-        f"📊 *COMBINED*",
+        "📊 *COMBINED*",
         f"  Total Revenue:   {_fmt(total_revenue)}",
         f"  Total Outgoings: {_fmt(total_outgoings)}",
         f"  {net_emoji} *Net Profit:    {_fmt(net_profit)}*",
         _SEP,
     ]
 
-    # Debtors summary (all-time outstanding, not date-filtered)
     outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
     if outstanding:
         bar_debtors = [r for r in outstanding if r["account"] == "bar"]
         room_debtors = [r for r in outstanding if r["account"] == "rooms"]
         bar_owed = sum(float(r["amount"]) for r in bar_debtors)
         room_owed = sum(float(r["amount"]) for r in room_debtors)
-        lines.append(f"💳 *OUTSTANDING DEBTORS*")
+        lines.append("💳 *OUTSTANDING DEBTORS*")
         if bar_debtors:
             lines.append(f"  🍺 Bar ({len(bar_debtors)}):    {_fmt(bar_owed)}")
         if room_debtors:
@@ -182,6 +180,278 @@ def generate_full_report(
         lines.append(_SEP)
 
     lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    return "\n".join(lines)
+
+
+# ── Sales report ──────────────────────────────────────────────────────
+
+def generate_sales_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """Drink-level sales breakdown: qty, revenue, cost, gross profit per drink."""
+    sales_rows = db.read_all("sales")
+    sales_rows = _apply_filter(sales_rows, for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+
+    inventory_costs = {r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")}
+
+    if not sales_rows:
+        return f"🍺 *Sales Report — {label}*\n\nNo sales recorded for this period."
+
+    # Aggregate by drink
+    totals: dict[str, dict] = {}
+    for r in sales_rows:
+        name = r["drink_name"].lower()
+        qty = int(r["quantity"])
+        rev = float(r["total_revenue"])
+        cost = inventory_costs.get(name, 0.0) * qty
+        if name not in totals:
+            totals[name] = {"qty": 0, "revenue": 0.0, "cost": 0.0}
+        totals[name]["qty"] += qty
+        totals[name]["revenue"] += rev
+        totals[name]["cost"] += cost
+
+    # Column widths
+    col_drink = max(len(n.title()) for n in totals) + 1
+    col_drink = max(col_drink, 10)
+
+    header = f"{'Drink':<{col_drink}} {'Qty':>5}  {'Revenue':>12}  {'Cost':>12}  {'Profit':>12}"
+    divider = "-" * len(header)
+
+    rows_out = []
+    t_qty, t_rev, t_cost = 0, 0.0, 0.0
+    for name in sorted(totals):
+        d = totals[name]
+        profit = d["revenue"] - d["cost"]
+        rows_out.append(
+            f"{name.title():<{col_drink}} {d['qty']:>5}  {_fmt(d['revenue']):>12}  {_fmt(d['cost']):>12}  {_fmt(profit):>12}"
+        )
+        t_qty += d["qty"]
+        t_rev += d["revenue"]
+        t_cost += d["cost"]
+
+    t_profit = t_rev - t_cost
+    total_line = f"{'TOTAL':<{col_drink}} {t_qty:>5}  {_fmt(t_rev):>12}  {_fmt(t_cost):>12}  {_fmt(t_profit):>12}"
+
+    lines = [
+        f"🍺 *Sales Report — {label}*",
+        f"Transactions: {len(sales_rows)}",
+        "```",
+        header,
+        divider,
+        *rows_out,
+        divider,
+        total_line,
+        "```",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Expense report ────────────────────────────────────────────────────
+
+def generate_expense_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """Expense breakdown by account and category."""
+    expense_rows = db.read_all("expenses")
+    expense_rows = _apply_filter(expense_rows, for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+
+    if not expense_rows:
+        return f"💸 *Expense Report — {label}*\n\nNo expenses recorded for this period."
+
+    bar_expenses = [r for r in expense_rows if r.get("account") == "bar"]
+    room_expenses = [r for r in expense_rows if r.get("account") == "rooms"]
+
+    def _section(rows: list[dict], title: str) -> list[str]:
+        if not rows:
+            return []
+        cat_rows: dict[str, list[dict]] = {}
+        for r in rows:
+            cat = r["category"].title()
+            cat_rows.setdefault(cat, []).append(r)
+
+        out = [title]
+        cat_total = 0.0
+        for cat in sorted(cat_rows):
+            entries = cat_rows[cat]
+            cat_sum = sum(float(e["amount"]) for e in entries)
+            cat_total += cat_sum
+            out.append(f"  *{cat}* — {_fmt(cat_sum)}")
+            for e in entries:
+                note = f" _{e['description']}_" if e.get("description") else ""
+                ts = e.get("timestamp", "")[:10]
+                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
+        out.append(f"  *Subtotal: {_fmt(cat_total)}*")
+        return out
+
+    bar_section = _section(bar_expenses, "🍺 *BAR EXPENSES*")
+    room_section = _section(room_expenses, "🛏 *ROOMS EXPENSES*")
+    grand_total = sum(float(r["amount"]) for r in expense_rows)
+
+    lines = [
+        f"💸 *Expense Report — {label}*",
+        _SEP,
+        *bar_section,
+    ]
+    if bar_section and room_section:
+        lines.append(_SEP)
+    lines += [
+        *room_section,
+        _SEP,
+        f"*Grand Total: {_fmt(grand_total)}*",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Staff report ──────────────────────────────────────────────────────
+
+def generate_staff_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+) -> str:
+    """Sales breakdown by staff member who recorded the entry."""
+    sales_rows = db.read_all("sales")
+    room_rows = db.read_all("rooms")
+    sales_rows = _apply_filter(sales_rows, for_date, for_month, False)
+    room_rows = _apply_filter(room_rows, for_date, for_month, False)
+    label = _period_label(for_date, for_month, False)
+
+    # Aggregate drink sales by recorder
+    staff: dict[str, dict] = {}
+    for r in sales_rows:
+        name = (r.get("recorded_by") or "Unknown").strip() or "Unknown"
+        if name not in staff:
+            staff[name] = {"drink_txns": 0, "drink_revenue": 0.0, "room_txns": 0, "room_revenue": 0.0}
+        staff[name]["drink_txns"] += 1
+        staff[name]["drink_revenue"] += float(r["total_revenue"])
+
+    for r in room_rows:
+        # rooms don't track recorded_by yet — group under hotel total
+        name = "Hotel"
+        if name not in staff:
+            staff[name] = {"drink_txns": 0, "drink_revenue": 0.0, "room_txns": 0, "room_revenue": 0.0}
+        staff[name]["room_txns"] += 1
+        staff[name]["room_revenue"] += float(r["total_revenue"])
+
+    if not staff:
+        return f"👥 *Staff Report — {label}*\n\nNo activity recorded for this period."
+
+    col_name = max(len(n) for n in staff) + 1
+    col_name = max(col_name, 10)
+    header = f"{'Staff':<{col_name}} {'DrinkTxn':>9}  {'DrinkRev':>13}  {'RoomTxn':>8}  {'RoomRev':>13}"
+    divider = "-" * len(header)
+
+    rows_out = []
+    t_dtxn, t_drev, t_rtxn, t_rrev = 0, 0.0, 0, 0.0
+    for name in sorted(staff):
+        d = staff[name]
+        rows_out.append(
+            f"{name:<{col_name}} {d['drink_txns']:>9}  {_fmt(d['drink_revenue']):>13}  "
+            f"{d['room_txns']:>8}  {_fmt(d['room_revenue']):>13}"
+        )
+        t_dtxn += d["drink_txns"]
+        t_drev += d["drink_revenue"]
+        t_rtxn += d["room_txns"]
+        t_rrev += d["room_revenue"]
+
+    total_line = (
+        f"{'TOTAL':<{col_name}} {t_dtxn:>9}  {_fmt(t_drev):>13}  "
+        f"{t_rtxn:>8}  {_fmt(t_rrev):>13}"
+    )
+
+    lines = [
+        f"👥 *Staff Report — {label}*",
+        "```",
+        header,
+        divider,
+        *rows_out,
+        divider,
+        total_line,
+        "```",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Daily summary ─────────────────────────────────────────────────────
+
+def generate_daily_summary(target: date | None = None) -> str:
+    """Compact one-screen overview of a single day's activity."""
+    today = target or datetime.now().date()
+    label = today.strftime("%A, %d %b %Y")
+
+    sales_rows = _filter_by_date(db.read_all("sales"), today)
+    room_rows = _filter_by_date(db.read_all("rooms"), today)
+    expense_rows = _filter_by_date(db.read_all("expenses"), today)
+    outstanding = [r for r in db.read_all("debtors") if r["status"] == "outstanding"]
+
+    bar_rev = _sum_revenue(sales_rows)
+    room_rev = _sum_revenue(room_rows)
+    total_rev = bar_rev + room_rev
+
+    bar_exp = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "bar")
+    room_exp = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "rooms")
+    cost_drinks = _cost_of_drinks_sold(sales_rows)
+    total_out = bar_exp + room_exp + cost_drinks
+    net = total_rev - total_out
+
+    net_emoji = "📈" if net >= 0 else "📉"
+
+    # Top selling drinks today
+    drink_qty: dict[str, int] = {}
+    for r in sales_rows:
+        name = r["drink_name"].title()
+        drink_qty[name] = drink_qty.get(name, 0) + int(r["quantity"])
+    top_drinks = sorted(drink_qty.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    # Stock alerts
+    items = inv.get_inventory_summary()
+    low_bar = [i["drink"] for i in items if i["is_low"]]
+    empty_store = [i["drink"] for i in items if i["store_stock"] == 0]
+
+    lines = [
+        f"📋 *Daily Summary — {label}*",
+        _SEP,
+        "💰 *Revenue*",
+        f"  🍺 Bar Sales:   {_fmt(bar_rev)}  ({len(sales_rows)} txns)",
+        f"  🛏 Room Sales:  {_fmt(room_rev)}  ({len(room_rows)} bookings)",
+        f"  *Total:        {_fmt(total_rev)}*",
+        _SEP,
+        "💸 *Outgoings*",
+        f"  Drink Cost:    {_fmt(cost_drinks)}",
+        f"  Bar Expenses:  {_fmt(bar_exp)}",
+        f"  Room Expenses: {_fmt(room_exp)}",
+        f"  *Total:        {_fmt(total_out)}*",
+        _SEP,
+        f"{net_emoji} *Net for Today:  {_fmt(net)}*",
+    ]
+
+    if top_drinks:
+        lines.append(_SEP)
+        lines.append("🏆 *Top Sellers*")
+        for drink, qty in top_drinks:
+            lines.append(f"  • {drink}: {qty} units")
+
+    if outstanding:
+        owed = sum(float(r["amount"]) for r in outstanding)
+        lines.append(_SEP)
+        lines.append(f"💳 Outstanding Debtors: {len(outstanding)} ({_fmt(owed)} owed)")
+
+    if low_bar or empty_store:
+        lines.append(_SEP)
+        if low_bar:
+            lines.append(f"⚠️ Low Bar Stock: {', '.join(low_bar)}")
+        if empty_store:
+            lines.append(f"🔴 Empty Store: {', '.join(empty_store)}")
+
+    lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -230,46 +500,55 @@ def generate_stock_report() -> str:
     if not items:
         return "📦 Inventory is empty. Use /restock to add drinks."
 
-    lines = [
-        f"🏨 *{HOTEL_NAME} — Inventory*",
-        _SEP,
-        f"{'Drink':<16} {'Store':>6} {'Bar':>6} {'Cost':>10} {'Value':>11}",
-        _SEP,
-    ]
+    # Dynamic column width for drink name
+    col = max(len(i["drink"]) for i in items) + 1
+    col = max(col, 10)
 
+    header  = f"{'Drink':<{col}} {'Store':>6} {'Bar':>6} {'Cost':>10} {'Value':>12}"
+    divider = "-" * len(header)
+
+    rows_out = []
     total_value = 0.0
     low_bar_items = []
     empty_store_items = []
 
     for item in items:
-        bar_flag = " ⚠️" if item["is_low"] else ""
+        flag = " !" if item["is_low"] else "  "
         line = (
-            f"{item['drink'][:15]:<16} "
+            f"{item['drink'][:col]:<{col}} "
             f"{item['store_stock']:>6} "
             f"{item['bar_stock']:>6} "
             f"{_fmt(item['cost_price']):>10} "
-            f"{_fmt(item['stock_value']):>11}"
-            f"{bar_flag}"
+            f"{_fmt(item['stock_value']):>12}"
+            f"{flag}"
         )
-        lines.append(f"`{line}`")
+        rows_out.append(line)
         total_value += item["stock_value"]
         if item["is_low"]:
             low_bar_items.append(item["drink"])
         if item["store_stock"] == 0:
             empty_store_items.append(item["drink"])
 
-    lines.append(_SEP)
-    lines.append(f"*Total Stock Value: {_fmt(total_value)}*")
+    total_line = f"{'TOTAL VALUE':<{col}} {'':>6} {'':>6} {'':>10} {_fmt(total_value):>12}"
+
+    lines = [
+        f"🏨 *{HOTEL_NAME} — Stock Report*",
+        "```",
+        header,
+        divider,
+        *rows_out,
+        divider,
+        total_line,
+        "```",
+    ]
 
     if low_bar_items:
-        lines.append("")
-        lines.append("⚠️ *Low Bar Stock — request transfer from store:*")
+        lines.append("⚠️ *Low Bar Stock* (transfer from store):")
         for name in low_bar_items:
             lines.append(f"  • {name}")
 
     if empty_store_items:
-        lines.append("")
-        lines.append("🔴 *Store Empty — needs restocking:*")
+        lines.append("🔴 *Store Empty* (needs restock):")
         for name in empty_store_items:
             lines.append(f"  • {name}")
 
@@ -280,5 +559,4 @@ def generate_stock_report() -> str:
 # ── Daily report (for scheduler) ─────────────────────────────────────
 
 def generate_daily_report() -> str:
-    today = datetime.now().date()
-    return generate_full_report(for_date=today)
+    return generate_daily_summary()

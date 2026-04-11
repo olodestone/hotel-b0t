@@ -22,14 +22,14 @@ def parse_date(s: str) -> str | None:
 
 # ── Drink sale ────────────────────────────────────────────────────────
 
-def process_drink_sale(drink: str, qty: int, price: float, timestamp: str | None = None) -> tuple[bool, str]:
+def process_drink_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
     """Validate inputs and delegate to inventory.sell_drink."""
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
     if price <= 0:
         return False, "❌ Price must be a positive number."
 
-    result: StockResult = inv.sell_drink(drink.strip(), qty, price, timestamp=timestamp)
+    result: StockResult = inv.sell_drink(drink.strip(), qty, price, timestamp=timestamp, recorded_by=recorded_by)
     msg = result.message
     if result.low_stock_alert:
         msg += f"\n\n{result.low_stock_alert}"
