@@ -830,8 +830,8 @@ def generate_stock_report(staff_view: bool = False) -> str:
         lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
 
-    # Admin view — full table
-    header  = f"{'Drink':<{col}} {'Store':>6} {'Bar':>6} {'Cost':>10} {'Value':>12}"
+    # Admin view — full table with margin
+    header  = f"{'Drink':<{col}} {'Store':>6} {'Bar':>6} {'Cost':>10} {'Price':>10} {'Margin':>10}"
     divider = "-" * len(header)
 
     rows_out = []
@@ -841,12 +841,17 @@ def generate_stock_report(staff_view: bool = False) -> str:
 
     for item in items:
         flag = " !" if item["is_low"] else "  "
+        margin = item.get("margin", 0.0)
+        price = item.get("selling_price", 0.0)
+        price_str = _fmt(price) if price > 0 else "—"
+        margin_str = _fmt(margin) if price > 0 else "—"
         line = (
             f"{item['drink'][:col]:<{col}} "
             f"{item['store_stock']:>6} "
             f"{item['bar_stock']:>6} "
             f"{_fmt(item['cost_price']):>10} "
-            f"{_fmt(item['stock_value']):>12}"
+            f"{price_str:>10} "
+            f"{margin_str:>10}"
             f"{flag}"
         )
         rows_out.append(line)
@@ -856,7 +861,7 @@ def generate_stock_report(staff_view: bool = False) -> str:
         if item["store_stock"] == 0:
             empty_store_items.append(item["drink"])
 
-    total_line = f"{'TOTAL VALUE':<{col}} {'':>6} {'':>6} {'':>10} {_fmt(total_value):>12}"
+    total_line = f"{'TOTAL VALUE':<{col}} {'':>6} {'':>6} {'':>10} {'':>10} {_fmt(total_value):>10}"
 
     lines = [
         f"🏨 *{HOTEL_NAME} — Stock Report*",
@@ -886,24 +891,28 @@ def generate_stock_report(staff_view: bool = False) -> str:
 # ── Price list ────────────────────────────────────────────────────────
 
 def generate_price_list() -> str:
-    """Show all drinks with their last recorded selling price."""
-    inventory = {r["drink_name"].lower(): r for r in db.read_all("inventory")}
-    last_prices = {r["drink_name"].lower(): float(r["selling_price"]) for r in db.get_last_selling_prices()}
+    """Show all drinks with their canonical selling price set by admin."""
+    price_rows = db.get_drink_selling_prices()
 
-    if not inventory:
+    if not price_rows:
         return "📦 No drinks in inventory yet."
 
-    col = max(len(n.title()) for n in inventory) + 1
+    col = max(len(r["drink_name"].title()) for r in price_rows) + 1
     col = max(col, 10)
 
     header  = f"{'Drink':<{col}} {'Price':>12}"
     divider = "-" * len(header)
     rows_out = []
+    unpriced = []
 
-    for name in sorted(inventory):
-        price = last_prices.get(name)
-        price_str = f"₦{price:,.0f}" if price else "—"
-        rows_out.append(f"{name.title():<{col}} {price_str:>12}")
+    for r in price_rows:
+        name = r["drink_name"].title()
+        price = float(r["selling_price"])
+        if price > 0:
+            rows_out.append(f"{name:<{col}} {_fmt(price):>12}")
+        else:
+            rows_out.append(f"{name:<{col}} {'—':>12}")
+            unpriced.append(name)
 
     lines = [
         f"🍺 *{HOTEL_NAME} — Drink Prices*",
@@ -912,9 +921,11 @@ def generate_price_list() -> str:
         divider,
         *rows_out,
         "```",
-        "_Prices shown are last recorded selling prices._",
-        f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_",
     ]
+    if unpriced:
+        lines.append(f"⚠️ No price set for: {', '.join(unpriced)}")
+        lines.append("_Admin: use /setprice <drink> <amount> to set._")
+    lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 

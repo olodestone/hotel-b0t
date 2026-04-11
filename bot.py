@@ -8,7 +8,7 @@ Commands
 --------
 Staff (any registered user):
   /start                                     — Initialize / register
-  /sell_drink <drink> <qty> <price>          — Record drink sale
+  /sell_drink <drink> <qty>                  — Record drink sale (price from /setprice)
   /room <type> <qty> <price> <nights>        — Record room booking
   /debtors [bar|rooms]                       — List outstanding debtors
   /report [today|YYYY-MM-DD|YYYY-MM|all]     — Financial report
@@ -186,7 +186,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def _help_text(is_admin: bool = False) -> str:
     staff_cmds = (
         "*Staff Commands:*\n"
-        "`/sell_drink <drink> <qty> <price> [YYYY-MM-DD]`\n"
+        "`/sell_drink <drink> <qty> [YYYY-MM-DD]`\n"
         "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
         "`/debtors` | `/debtors bar` | `/debtors rooms`\n"
         "`/history` | `/history YYYY-MM-DD`\n"
@@ -208,6 +208,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/restock <drink> <qty> <cost_price>`\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
         "`/delete <sale|room|expense> <id>`\n"
+        "`/setprice <drink> <price>` — set canonical selling price\n"
         "`/sales_report` — full sales breakdown with cost & profit\n"
         "`/expense_report` — expense breakdown by category\n"
         "`/staff_report` | `/staff_report today` | `/staff_report YYYY-MM`\n"
@@ -233,8 +234,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_require_auth
 async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args, ts = _extract_date(_parse_args(ctx))
-    if len(args) < 3:
-        await _reply(update, "Usage: `/sell_drink <drink> <qty> <price> [YYYY-MM-DD]`\nExample: `/sell_drink heineken 6 500`\nBackdate: `/sell_drink heineken 6 500 2025-03-15`")
+    if len(args) < 2:
+        await _reply(update, "Usage: `/sell_drink <drink> <qty> [YYYY-MM-DD]`\nExample: `/sell_drink heineken 6`\nBackdate: `/sell_drink heineken 6 2025-03-15`")
         return
 
     drink = args[0]
@@ -242,14 +243,10 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if err:
         await _reply(update, err)
         return
-    price, err = _to_float(args[2], "price")
-    if err:
-        await _reply(update, err)
-        return
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg, alert = logic.process_drink_sale(drink, qty, price, timestamp=ts, recorded_by=recorded_by)
+    ok, msg, alert = logic.process_drink_sale(drink, qty, timestamp=ts, recorded_by=recorded_by)
     if ts and ok:
         msg += f"\n_(recorded for {ts})_"
     await _reply(update, msg)
@@ -266,6 +263,29 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                     )
                 except Exception:
                     pass
+
+
+# ── /setprice (admin) ────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_setprice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/setprice <drink> <price>`\n"
+            "Example: `/setprice heineken 500`\n"
+            "Multi-word: `/setprice club soda 300`",
+        )
+        return
+    # Last arg is price; everything before is the drink name (supports multi-word)
+    price, err = _to_float(args[-1], "price")
+    if err:
+        await _reply(update, err)
+        return
+    drink = " ".join(args[:-1])
+    ok, msg = logic.process_set_price(drink, price)
+    await _reply(update, msg)
 
 
 # ── /prices ──────────────────────────────────────────────────────────
@@ -911,6 +931,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))
+    app.add_handler(CommandHandler("setprice", cmd_setprice))
     app.add_handler(CommandHandler("prices", cmd_prices))
     app.add_handler(CommandHandler("undo", cmd_undo))
     app.add_handler(CommandHandler("restock", cmd_restock))

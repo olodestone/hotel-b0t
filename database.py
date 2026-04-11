@@ -55,9 +55,24 @@ def init_db() -> None:
                 low_stock_threshold INTEGER NOT NULL DEFAULT 5
             )
         """))
-        # Migration: add store_stock to existing databases that predate this column
+        # Migrations: add columns to existing inventory rows
+        conn.execute(text(
+            "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS store_stock INTEGER NOT NULL DEFAULT 0"
+        ))
+        conn.execute(text(
+            "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS selling_price FLOAT NOT NULL DEFAULT 0"
+        ))
+        # Back-fill selling_price from the most recent sale per drink (one-time, safe to re-run)
         conn.execute(text("""
-            ALTER TABLE inventory ADD COLUMN IF NOT EXISTS store_stock INTEGER NOT NULL DEFAULT 0
+            UPDATE inventory
+            SET selling_price = s.selling_price
+            FROM (
+                SELECT DISTINCT ON (lower(drink_name)) lower(drink_name) AS drink_key, selling_price
+                FROM sales
+                ORDER BY lower(drink_name), timestamp DESC
+            ) s
+            WHERE lower(inventory.drink_name) = s.drink_key
+            AND inventory.selling_price = 0
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sales (
@@ -257,25 +272,29 @@ def upsert_drink(
     qty_sold: int = 0,
     cost_price: float | None = None,
     threshold: int | None = None,
+    selling_price: float | None = None,
 ) -> dict[str, Any]:
     """Create or update an inventory row atomically. Returns the updated row.
 
-    qty_to_store — units arriving in the store (restock)
-    qty_to_bar   — units moving from store to bar (transfer, handled separately)
-    qty_sold     — units sold from bar
+    qty_to_store  — units arriving in the store (restock)
+    qty_to_bar    — units moving from store to bar (transfer, handled separately)
+    qty_sold      — units sold from bar
+    selling_price — canonical selling price set by admin (None = leave unchanged)
     """
     from config import LOW_STOCK_DEFAULT
     name = drink.lower()
     cp = round(cost_price, 2) if cost_price is not None else 0.0
     th = threshold if threshold is not None else LOW_STOCK_DEFAULT
+    sp = round(selling_price, 2) if selling_price is not None else 0.0
 
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO inventory
-                (drink_name, current_stock, store_stock, total_purchased, total_sold, cost_price, low_stock_threshold)
+                (drink_name, current_stock, store_stock, total_purchased, total_sold,
+                 cost_price, low_stock_threshold, selling_price)
             VALUES
-                (:name, :bar_net, :store_net, :bought, :sold, :cp, :th)
+                (:name, :bar_net, :store_net, :bought, :sold, :cp, :th, :sp)
             ON CONFLICT (drink_name) DO UPDATE SET
                 current_stock       = inventory.current_stock + :bar_net,
                 store_stock         = inventory.store_stock + :store_net,
@@ -284,7 +303,9 @@ def upsert_drink(
                 cost_price          = CASE WHEN :has_cp THEN :cp
                                           ELSE inventory.cost_price END,
                 low_stock_threshold = CASE WHEN :has_th THEN :th
-                                          ELSE inventory.low_stock_threshold END
+                                          ELSE inventory.low_stock_threshold END,
+                selling_price       = CASE WHEN :has_sp THEN :sp
+                                          ELSE inventory.selling_price END
         """), {
             "name": name,
             "bar_net": qty_to_bar - qty_sold,
@@ -295,6 +316,8 @@ def upsert_drink(
             "has_cp": cost_price is not None,
             "th": th,
             "has_th": threshold is not None,
+            "sp": sp,
+            "has_sp": selling_price is not None,
         })
         conn.commit()
     return get_drink(name) or {}
@@ -380,14 +403,10 @@ def delete_expense(entry_id: int) -> bool:
 
 # ── Price list ───────────────────────────────────────────────────────
 
-def get_last_selling_prices() -> list[dict[str, Any]]:
-    """Return the most recent selling price per drink from sales history."""
+def get_drink_selling_prices() -> list[dict[str, Any]]:
+    """Return drink_name and selling_price for all inventory rows."""
     engine = get_engine()
-    df = pd.read_sql("""
-        SELECT DISTINCT ON (drink_name) drink_name, selling_price
-        FROM sales
-        ORDER BY drink_name, timestamp DESC
-    """, engine)
+    df = pd.read_sql("SELECT drink_name, selling_price FROM inventory ORDER BY drink_name", engine)
     return df.to_dict(orient="records")
 
 

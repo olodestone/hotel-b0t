@@ -21,14 +21,24 @@ class StockResult:
     current_stock: int = 0
 
 
-def sell_drink(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> StockResult:
+def sell_drink(drink: str, qty: int, timestamp: str | None = None, recorded_by: str = "") -> StockResult:
     """
-    Deduct `qty` from inventory and record the sale.
-    Returns StockResult indicating success/failure and any alert.
+    Deduct `qty` from bar stock and record the sale at the canonical selling price.
+    Blocks if no selling price has been set by admin.
     """
     existing = db.get_drink(drink)
     if existing is None:
         return StockResult(ok=False, message=f"❌ '{drink}' not found in inventory. Restock it first with /restock.")
+
+    price = float(existing.get("selling_price", 0))
+    if price <= 0:
+        return StockResult(
+            ok=False,
+            message=(
+                f"❌ No selling price set for *{drink.title()}*.\n"
+                f"Ask admin to run: `/setprice {drink.lower()} <amount>`"
+            ),
+        )
 
     cur_stock = int(existing["current_stock"])
     if cur_stock < qty:
@@ -57,6 +67,11 @@ def sell_drink(drink: str, qty: int, price: float, timestamp: str | None = None,
         low_stock_alert=alert,
         current_stock=new_stock,
     )
+
+
+def set_drink_price(drink: str, price: float) -> None:
+    """Set the canonical selling price for a drink."""
+    db.upsert_drink(drink, selling_price=price)
 
 
 def restock_drink(drink: str, qty: int, cost_price: float, threshold: int | None = None) -> StockResult:
@@ -125,11 +140,14 @@ def get_inventory_summary() -> list[dict]:
         cost = float(row["cost_price"])
         threshold = int(row["low_stock_threshold"])
         total = bar + store
+        selling = float(row.get("selling_price", 0))
         result.append({
             "drink": row["drink_name"].title(),
             "bar_stock": bar,
             "store_stock": store,
             "cost_price": cost,
+            "selling_price": selling,
+            "margin": round(selling - cost, 2),
             "stock_value": round(total * cost, 2),
             "is_low": bar <= threshold,
             "threshold": threshold,

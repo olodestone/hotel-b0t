@@ -22,16 +22,35 @@ def parse_date(s: str) -> str | None:
 
 # ── Drink sale ────────────────────────────────────────────────────────
 
-def process_drink_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, str | None]:
+def process_drink_sale(drink: str, qty: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, str | None]:
     """Validate inputs and delegate to inventory.sell_drink.
+    Price is read from inventory (set by admin via /setprice).
     Returns (ok, message, low_stock_alert) — alert is None if no alert."""
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer.", None
-    if price <= 0:
-        return False, "❌ Price must be a positive number.", None
 
-    result: StockResult = inv.sell_drink(drink.strip(), qty, price, timestamp=timestamp, recorded_by=recorded_by)
+    result: StockResult = inv.sell_drink(drink.strip(), qty, timestamp=timestamp, recorded_by=recorded_by)
     return result.ok, result.message, result.low_stock_alert
+
+
+# ── Set drink price (admin) ───────────────────────────────────────────
+
+def process_set_price(drink: str, price: float) -> tuple[bool, str]:
+    if price <= 0:
+        return False, "❌ Price must be a positive number."
+    name = drink.strip().lower()
+    existing = db.get_drink(name)
+    if existing is None:
+        return False, f"❌ *{drink.title()}* not found in inventory. Run `/restock` first."
+    old_price = float(existing.get("selling_price", 0))
+    inv.set_drink_price(name, price)
+    if old_price > 0:
+        return True, (
+            f"✅ Price updated for *{drink.title()}*\n"
+            f"  Old price: ₦{old_price:,.2f}\n"
+            f"  New price: ₦{price:,.2f}"
+        )
+    return True, f"✅ Selling price for *{drink.title()}* set to *₦{price:,.2f}*."
 
 
 # ── Room sale ─────────────────────────────────────────────────────────
