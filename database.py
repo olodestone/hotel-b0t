@@ -116,6 +116,12 @@ def init_db() -> None:
                 added_at    TEXT
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            )
+        """))
         conn.commit()
 
 
@@ -367,6 +373,31 @@ def delete_expense(entry_id: int) -> bool:
         )
         conn.commit()
         return result.rowcount > 0
+
+
+# ── Settings ─────────────────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    """Return a setting value by key, or default if not set."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT value FROM settings WHERE key = %(key)s",
+        engine, params={"key": key},
+    )
+    if df.empty:
+        return default
+    return str(df.iloc[0]["value"])
+
+
+def set_setting(key: str, value: str) -> None:
+    """Upsert a setting value."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO settings (key, value) VALUES (:key, :value)
+            ON CONFLICT (key) DO UPDATE SET value = :value
+        """), {"key": key, "value": value})
+        conn.commit()
 
 
 # ── User management ───────────────────────────────────────────────────

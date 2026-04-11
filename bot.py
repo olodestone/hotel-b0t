@@ -208,6 +208,8 @@ def _help_text(is_admin: bool = False) -> str:
         "`/transfer <drink> <qty>` — move store → bar\n"
         "`/delete <sale|room|expense> <id>`\n"
         "`/staff_report` | `/staff_report today` | `/staff_report YYYY-MM`\n"
+        "`/allocation` | `/allocation today` | `/allocation YYYY-MM` | `/allocation all`\n"
+        "`/setallocation <tax|buffer|restock|draw|reinvest|float> <percent>`\n"
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>`\n"
         "`/removestaff <user_id>`\n"
@@ -607,6 +609,97 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, text)
 
 
+# ── /allocation (admin) ──────────────────────────────────────────────
+
+@_require_admin
+async def cmd_allocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
+
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_allocation_report(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_allocation_report(for_date=datetime.now().date())
+    elif arg == "all":
+        text = reports.generate_allocation_report(all_time=True)
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_allocation_report(for_date=dt.date())
+        except ValueError:
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_allocation_report(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/allocation` | `/allocation today` | `/allocation YYYY-MM-DD` | `/allocation YYYY-MM` | `/allocation all`")
+                return
+    await _reply(update, text)
+
+
+# ── /setallocation (admin) ────────────────────────────────────────────
+
+_ALLOC_KEYS = ("tax", "buffer", "restock", "draw", "reinvest", "float")
+
+@_require_admin
+async def cmd_setallocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/setallocation <key> <percent>`\n\n"
+            "*Set-aside keys* (% of gross revenue):\n"
+            "  `tax` — tax reserve (default 15%)\n"
+            "  `buffer` — emergency buffer (default 10%)\n"
+            "  `restock` — restock budget (default 0%)\n\n"
+            "*Profit distribution keys* (% of leftover profit):\n"
+            "  `draw` — owner's draw (default 50%)\n"
+            "  `reinvest` — business reinvestment (default 30%)\n"
+            "  `float` — cash reserve (default 20%)\n\n"
+            "Example: `/setallocation tax 15`\n"
+            "Example: `/setallocation draw 50`"
+        )
+        return
+
+    key = args[0].lower()
+    if key not in _ALLOC_KEYS:
+        await _reply(update, f"❌ Key must be one of: {', '.join(f'`{k}`' for k in _ALLOC_KEYS)}")
+        return
+
+    try:
+        pct = int(args[1])
+        if not (0 <= pct <= 100):
+            raise ValueError
+    except ValueError:
+        await _reply(update, "❌ Percent must be a whole number between 0 and 100.")
+        return
+
+    db.set_setting(f"alloc_{key}", str(pct))
+
+    from config import (
+        ALLOC_TAX_DEFAULT, ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
+        ALLOC_DRAW_DEFAULT, ALLOC_REINVEST_DEFAULT, ALLOC_FLOAT_DEFAULT,
+    )
+    tax      = int(db.get_setting("alloc_tax",      str(ALLOC_TAX_DEFAULT)))
+    buffer_  = int(db.get_setting("alloc_buffer",   str(ALLOC_BUFFER_DEFAULT)))
+    restock  = int(db.get_setting("alloc_restock",  str(ALLOC_RESTOCK_DEFAULT)))
+    draw     = int(db.get_setting("alloc_draw",     str(ALLOC_DRAW_DEFAULT)))
+    reinvest = int(db.get_setting("alloc_reinvest", str(ALLOC_REINVEST_DEFAULT)))
+    float_   = int(db.get_setting("alloc_float",    str(ALLOC_FLOAT_DEFAULT)))
+
+    await _reply(
+        update,
+        f"✅ *{key.title()}* set to *{pct}%*\n\n"
+        f"*Set-asides* (of gross revenue):\n"
+        f"  Tax: {tax}%  |  Buffer: {buffer_}%  |  Restock: {restock}%\n"
+        f"  Total: *{tax + buffer_ + restock}%*\n\n"
+        f"*Profit distribution* (of leftover):\n"
+        f"  Draw: {draw}%  |  Reinvest: {reinvest}%  |  Float: {float_}%\n"
+        f"  Total: *{draw + reinvest + float_}%*"
+    )
+
+
 # ── /transfer (admin) ────────────────────────────────────────────────
 
 @_require_admin
@@ -776,6 +869,8 @@ def main() -> None:
     app.add_handler(CommandHandler("expense_report", cmd_expense_report))
     app.add_handler(CommandHandler("staff_report", cmd_staff_report))
     app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("allocation", cmd_allocation))
+    app.add_handler(CommandHandler("setallocation", cmd_setallocation))
     app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("delete", cmd_delete))

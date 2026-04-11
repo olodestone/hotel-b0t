@@ -10,7 +10,11 @@ from typing import Any
 
 import database as db
 import inventory as inv
-from config import HOTEL_NAME
+from config import (
+    HOTEL_NAME,
+    ALLOC_TAX_DEFAULT, ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
+    ALLOC_DRAW_DEFAULT, ALLOC_REINVEST_DEFAULT, ALLOC_FLOAT_DEFAULT,
+)
 
 _SEP = "─" * 30
 
@@ -70,6 +74,13 @@ def _apply_filter(rows: list[dict], for_date: date | None, for_month: tuple[int,
     return _filter_by_month(rows, year, month)
 
 
+def _split_salary(expense_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split expense rows into (salary_rows, other_rows)."""
+    salary = [r for r in expense_rows if r.get("category", "").lower() == "salary"]
+    other  = [r for r in expense_rows if r.get("category", "").lower() != "salary"]
+    return salary, other
+
+
 def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
     """Match each sale to its current cost price from inventory."""
     total = 0.0
@@ -119,6 +130,11 @@ def generate_full_report(
     room_emoji = "📈" if room_profit >= 0 else "📉"
     net_emoji = "📈" if net_profit >= 0 else "📉"
 
+    bar_salary, bar_other = _split_salary(bar_expenses)
+    room_salary, room_other = _split_salary(room_expenses)
+    bar_salary_total  = sum(float(r["amount"]) for r in bar_salary)
+    room_salary_total = sum(float(r["amount"]) for r in room_salary)
+
     lines = [
         f"🏨 *{HOTEL_NAME} — Financial Report*",
         f"📅 Period: {label}",
@@ -126,16 +142,17 @@ def generate_full_report(
         "🍺 *BAR ACCOUNT*",
         f"  Revenue:       {_fmt(drink_revenue)}",
         f"  Cost of Stock: {_fmt(cost_of_drinks)}",
-        f"  Expenses:      {_fmt(bar_expense_total)}",
+        f"  Salaries:      {_fmt(bar_salary_total)}",
+        f"  Other Expenses:{_fmt(_sum_revenue(bar_other, key='amount'))}",
         f"  {bar_emoji} Profit:      *{_fmt(bar_profit)}*",
     ]
 
-    if bar_expenses:
+    if bar_other:
         cat_totals: dict[str, float] = {}
-        for r in bar_expenses:
+        for r in bar_other:
             cat = r["category"].title()
             cat_totals[cat] = cat_totals.get(cat, 0.0) + float(r["amount"])
-        lines.append("  _Expense breakdown:_")
+        lines.append("  _Other breakdown:_")
         for cat, amt in sorted(cat_totals.items()):
             lines.append(f"    • {cat}: {_fmt(amt)}")
 
@@ -143,16 +160,17 @@ def generate_full_report(
         _SEP,
         "🛏 *ROOMS ACCOUNT*",
         f"  Revenue:       {_fmt(room_revenue)}",
-        f"  Expenses:      {_fmt(room_expense_total)}",
+        f"  Salaries:      {_fmt(room_salary_total)}",
+        f"  Other Expenses:{_fmt(_sum_revenue(room_other, key='amount'))}",
         f"  {room_emoji} Profit:      *{_fmt(room_profit)}*",
     ]
 
-    if room_expenses:
+    if room_other:
         cat_totals = {}
-        for r in room_expenses:
+        for r in room_other:
             cat = r["category"].title()
             cat_totals[cat] = cat_totals.get(cat, 0.0) + float(r["amount"])
-        lines.append("  _Expense breakdown:_")
+        lines.append("  _Other breakdown:_")
         for cat, amt in sorted(cat_totals.items()):
             lines.append(f"    • {cat}: {_fmt(amt)}")
 
@@ -271,13 +289,25 @@ def generate_expense_report(
     def _section(rows: list[dict], title: str) -> list[str]:
         if not rows:
             return []
-        cat_rows: dict[str, list[dict]] = {}
-        for r in rows:
-            cat = r["category"].title()
-            cat_rows.setdefault(cat, []).append(r)
-
+        salary_rows, other_rows = _split_salary(rows)
+        salary_total = sum(float(r["amount"]) for r in salary_rows)
         out = [title]
         cat_total = 0.0
+
+        # Salary block first
+        if salary_rows:
+            out.append(f"  👤 *Salary* — {_fmt(salary_total)}")
+            for e in salary_rows:
+                note = f" _{e['description']}_" if e.get("description") else ""
+                ts = e.get("timestamp", "")[:10]
+                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
+            cat_total += salary_total
+
+        # Other expenses grouped by category
+        cat_rows: dict[str, list[dict]] = {}
+        for r in other_rows:
+            cat = r["category"].title()
+            cat_rows.setdefault(cat, []).append(r)
         for cat in sorted(cat_rows):
             entries = cat_rows[cat]
             cat_sum = sum(float(e["amount"]) for e in entries)
@@ -287,6 +317,7 @@ def generate_expense_report(
                 note = f" _{e['description']}_" if e.get("description") else ""
                 ts = e.get("timestamp", "")[:10]
                 out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
+
         out.append(f"  *Subtotal: {_fmt(cat_total)}*")
         return out
 
@@ -451,7 +482,168 @@ def generate_daily_summary(target: date | None = None) -> str:
         if empty_store:
             lines.append(f"🔴 Empty Store: {', '.join(empty_store)}")
 
+    # Allocation nudge
+    if total_rev > 0:
+        tax_pct, buffer_pct, restock_pct = _get_alloc_pcts()
+        total_pct = tax_pct + buffer_pct + restock_pct
+        save_amt = round(total_rev * total_pct / 100, 2)
+        lines.append(_SEP)
+        lines.append(f"🏦 Set aside today: *{_fmt(save_amt)}* ({total_pct}% of {_fmt(total_rev)})")
+        lines.append(f"_Run /allocation for full breakdown_")
+
     lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    return "\n".join(lines)
+
+
+# ── Allocation helpers ────────────────────────────────────────────────
+
+def _get_alloc_pcts() -> tuple[int, int, int]:
+    """Return (tax%, buffer%, restock%) from DB settings, falling back to config defaults."""
+    tax     = int(db.get_setting("alloc_tax",     str(ALLOC_TAX_DEFAULT)))
+    buffer_ = int(db.get_setting("alloc_buffer",  str(ALLOC_BUFFER_DEFAULT)))
+    restock = int(db.get_setting("alloc_restock", str(ALLOC_RESTOCK_DEFAULT)))
+    return tax, buffer_, restock
+
+
+def _get_profit_dist_pcts() -> tuple[int, int, int]:
+    """Return (draw%, reinvest%, float%) from DB settings, falling back to config defaults."""
+    draw     = int(db.get_setting("alloc_draw",     str(ALLOC_DRAW_DEFAULT)))
+    reinvest = int(db.get_setting("alloc_reinvest", str(ALLOC_REINVEST_DEFAULT)))
+    float_   = int(db.get_setting("alloc_float",    str(ALLOC_FLOAT_DEFAULT)))
+    return draw, reinvest, float_
+
+
+def _burn_rate_label(rate: float) -> str:
+    if rate <= 40:
+        return f"✅ Healthy ({rate:.1f}%)"
+    if rate <= 60:
+        return f"⚠️ Watch closely ({rate:.1f}%)"
+    return f"🔴 Danger — expenses eating revenue ({rate:.1f}%)"
+
+
+# ── Allocation report ─────────────────────────────────────────────────
+
+def generate_allocation_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """
+    Show recommended set-asides (tax, buffer, restock) calculated on gross revenue,
+    actual expenses, net working capital, and burn rate.
+    """
+    sales_rows  = _apply_filter(db.read_all("sales"),    for_date, for_month, all_time)
+    room_rows   = _apply_filter(db.read_all("rooms"),    for_date, for_month, all_time)
+    expense_rows = _apply_filter(db.read_all("expenses"), for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+
+    bar_rev  = _sum_revenue(sales_rows)
+    room_rev = _sum_revenue(room_rows)
+    total_rev = bar_rev + room_rev
+
+    bar_salary_rows,  bar_other_rows  = _split_salary([r for r in expense_rows if r.get("account") == "bar"])
+    room_salary_rows, room_other_rows = _split_salary([r for r in expense_rows if r.get("account") == "rooms"])
+
+    bar_salary_amt  = sum(float(r["amount"]) for r in bar_salary_rows)
+    room_salary_amt = sum(float(r["amount"]) for r in room_salary_rows)
+    total_salary    = bar_salary_amt + room_salary_amt
+
+    bar_exp  = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "bar")
+    room_exp = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "rooms")
+    total_exp = bar_exp + room_exp
+
+    tax_pct, buffer_pct, restock_pct = _get_alloc_pcts()
+    total_pct = tax_pct + buffer_pct + restock_pct
+
+    tax_amt     = round(total_rev * tax_pct / 100, 2)
+    buffer_amt  = round(total_rev * buffer_pct / 100, 2)
+    restock_amt = round(total_rev * restock_pct / 100, 2)
+    total_save  = tax_amt + buffer_amt + restock_amt
+
+    # Bar and Rooms share of set-aside (proportional to their revenue)
+    bar_share  = round(total_save * (bar_rev / total_rev), 2) if total_rev else 0.0
+    room_share = round(total_save * (room_rev / total_rev), 2) if total_rev else 0.0
+
+    other_exp     = total_exp - total_salary
+    working_capital = total_rev - total_exp
+    after_setaside  = working_capital - total_save
+    burn_rate = (total_exp / total_rev * 100) if total_rev else 0.0
+
+    lines = [
+        f"📊 *{HOTEL_NAME} — Allocation Report*",
+        f"📅 Period: {label}",
+        _SEP,
+        "💰 *REVENUE*",
+        f"  🍺 Bar:            {_fmt(bar_rev)}",
+        f"  🛏 Rooms:          {_fmt(room_rev)}",
+        f"  *Total:           {_fmt(total_rev)}*",
+        _SEP,
+        f"🏦 *RECOMMENDED SET-ASIDES* _{total_pct}% of gross revenue_",
+        f"  Tax ({tax_pct}%):       {_fmt(tax_amt)}  → Savings Account",
+        f"  Buffer ({buffer_pct}%):    {_fmt(buffer_amt)}  → Savings Account",
+    ]
+
+    if restock_pct > 0:
+        lines.append(f"  Restock ({restock_pct}%):  {_fmt(restock_amt)}  → Bar Account")
+
+    lines += [
+        f"  *Total to save:   {_fmt(total_save)}*",
+        "",
+        "  _How to split it:_",
+        f"  From Bar Account:   {_fmt(bar_share)}",
+        f"  From Rooms Account: {_fmt(room_share)}",
+        _SEP,
+        "💸 *ACTUAL EXPENSES*",
+        f"  👤 Salaries:       {_fmt(total_salary)}",
+        f"    🍺 Bar staff:    {_fmt(bar_salary_amt)}",
+        f"    🛏 Rooms staff:  {_fmt(room_salary_amt)}",
+        f"  🔧 Other:          {_fmt(other_exp)}",
+        f"  *Total:           {_fmt(total_exp)}*",
+        _SEP,
+        "📈 *NET POSITION*",
+        f"  After expenses:   {_fmt(working_capital)}",
+        f"  After set-asides: *{_fmt(after_setaside)}*  ← safe to use",
+        f"  Burn rate:        {_burn_rate_label(burn_rate)}",
+    ]
+
+    if total_salary > after_setaside:
+        lines.append(f"  ⚠️ Salary bill ({_fmt(total_salary)}) exceeds safe amount — review set-aside %")
+
+    # Profit distribution
+    draw_pct, reinvest_pct, float_pct = _get_profit_dist_pcts()
+    dist_total_pct = draw_pct + reinvest_pct + float_pct
+
+    if after_setaside > 0 and dist_total_pct > 0:
+        draw_amt     = round(after_setaside * draw_pct / 100, 2)
+        reinvest_amt = round(after_setaside * reinvest_pct / 100, 2)
+        float_amt    = round(after_setaside * float_pct / 100, 2)
+        unallocated  = round(after_setaside - draw_amt - reinvest_amt - float_amt, 2)
+
+        lines += [
+            _SEP,
+            f"💼 *PROFIT DISTRIBUTION* _of {_fmt(after_setaside)} safe profit_",
+            f"  👤 Owner's Draw ({draw_pct}%):   {_fmt(draw_amt)}  → Personal Account",
+            f"  📈 Reinvestment ({reinvest_pct}%): {_fmt(reinvest_amt)}  → Business Growth",
+            f"  🏦 Cash Float ({float_pct}%):    {_fmt(float_amt)}  → Current Account Reserve",
+        ]
+        if unallocated:
+            lines.append(f"  Unallocated:          {_fmt(unallocated)}")
+    elif after_setaside <= 0:
+        lines += [
+            _SEP,
+            "💼 *PROFIT DISTRIBUTION*",
+            "  Nothing to distribute — expenses + set-asides exceed revenue.",
+        ]
+
+    lines += [
+        _SEP,
+        "_Use /setallocation to adjust percentages_",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+
+    if not total_rev:
+        return f"📊 *Allocation Report — {label}*\n\nNo revenue recorded for this period."
+
     return "\n".join(lines)
 
 
