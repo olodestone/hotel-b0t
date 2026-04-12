@@ -12,7 +12,6 @@ Staff (any registered user):
   /room <type> <qty> <price> <nights>        — Record room booking
   /debtors [bar|rooms]                       — List outstanding debtors
   /report [today|YYYY-MM-DD|YYYY-MM|all]     — Financial report
-  /sales_report [today|YYYY-MM-DD|YYYY-MM|all] — Sales breakdown by drink
   /expense_report [today|YYYY-MM-DD|YYYY-MM|all] — Expense breakdown
   /stock                                     — Inventory status
   /summary [YYYY-MM-DD]                      — Today's key numbers
@@ -213,7 +212,6 @@ def _help_text(is_admin: bool = False) -> str:
         "`/history` | `/history YYYY-MM-DD`\n"
         "`/report` — current month revenue summary\n"
         "`/report today` | `/report YYYY-MM-DD` | `/report YYYY-MM` | `/report all`\n"
-        "`/sales_report` — drinks sold per item\n"
         "`/summary` | `/summary YYYY-MM-DD` — daily overview\n"
         "`/stock` — bar stock levels\n"
         "`/prices` — current drink price list\n"
@@ -617,28 +615,27 @@ async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /sales_report ─────────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_sales_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from datetime import datetime
     args = _parse_args(ctx)
     arg = args[0].lower() if args else ""
-    staff_view = not _is_admin(update.effective_user.id)
 
     if not arg:
         now = datetime.now()
-        text = reports.generate_sales_report(for_month=(now.year, now.month), staff_view=staff_view)
+        text = reports.generate_sales_report(for_month=(now.year, now.month))
     elif arg == "today":
-        text = reports.generate_sales_report(for_date=datetime.now().date(), staff_view=staff_view)
+        text = reports.generate_sales_report(for_date=datetime.now().date())
     elif arg == "all":
-        text = reports.generate_sales_report(all_time=True, staff_view=staff_view)
+        text = reports.generate_sales_report(all_time=True)
     else:
         try:
             dt = datetime.strptime(arg, "%Y-%m-%d")
-            text = reports.generate_sales_report(for_date=dt.date(), staff_view=staff_view)
+            text = reports.generate_sales_report(for_date=dt.date())
         except ValueError:
             try:
                 dt = datetime.strptime(arg, "%Y-%m")
-                text = reports.generate_sales_report(for_month=(dt.year, dt.month), staff_view=staff_view)
+                text = reports.generate_sales_report(for_month=(dt.year, dt.month))
             except ValueError:
                 await _reply(update, "Usage: `/sales_report` | `/sales_report today` | `/sales_report YYYY-MM-DD` | `/sales_report YYYY-MM` | `/sales_report all`")
                 return

@@ -228,9 +228,8 @@ def generate_sales_report(
     for_date: date | None = None,
     for_month: tuple[int, int] | None = None,
     all_time: bool = False,
-    staff_view: bool = False,
 ) -> str:
-    """Drink-level sales breakdown. staff_view shows qty only — no cost/profit."""
+    """Drink-level sales breakdown with cost and profit (admin-only)."""
     sales_rows = _active(db.read_all("sales"))
     sales_rows = _apply_filter(sales_rows, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
@@ -240,7 +239,7 @@ def generate_sales_report(
 
     # Aggregate by drink
     totals: dict[str, dict] = {}
-    inventory_costs = {} if staff_view else {
+    inventory_costs = {
         r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")
     }
     for r in sales_rows:
@@ -256,29 +255,6 @@ def generate_sales_report(
 
     col_drink = max(len(n.title()) for n in totals) + 1
     col_drink = max(col_drink, 10)
-
-    if staff_view:
-        header = f"{'Drink':<{col_drink}} {'Qty':>5}"
-        divider = "-" * len(header)
-        rows_out = []
-        t_qty = 0
-        for name in sorted(totals):
-            rows_out.append(f"{name.title():<{col_drink}} {totals[name]['qty']:>5}")
-            t_qty += totals[name]["qty"]
-        total_line = f"{'TOTAL':<{col_drink}} {t_qty:>5}"
-        lines = [
-            f"🍺 *Sales Report — {label}*",
-            f"Transactions: {len(sales_rows)}",
-            "```",
-            header,
-            divider,
-            *rows_out,
-            divider,
-            total_line,
-            "```",
-            f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
-        ]
-        return "\n".join(lines)
 
     header = f"{'Drink':<{col_drink}} {'Qty':>5}  {'Revenue':>12}  {'Cost':>12}  {'Profit':>12}"
     divider = "-" * len(header)

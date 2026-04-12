@@ -71,7 +71,6 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/sell_drink <drink> <qty> <price> [YYYY-MM-DD]` | Record drink sale |
 | `/room <type> <qty> <price> <nights> [YYYY-MM-DD]` | Record room booking |
 | `/report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Full financial report |
-| `/sales_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Drink-level sales breakdown |
 | `/expense_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Expense breakdown by category |
 | `/summary [YYYY-MM-DD]` | Daily overview with set-aside nudge |
 | `/stock` | Inventory table (store + bar columns) |
@@ -81,6 +80,7 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 ### Admin-only commands
 | Command | Description |
 |---|---|
+| `/sales_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Drink-level sales breakdown with cost & profit |
 | `/expense <room\|bar> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages |
 | `/add_debtor <room\|bar> <name> <amount> [note] [YYYY-MM-DD]` | Log debtor |
 | `/pay_debtor <room\|bar> <name>` | Mark debtor paid |
