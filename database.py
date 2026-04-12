@@ -125,6 +125,27 @@ def init_db() -> None:
                 paid_at     TEXT DEFAULT ''
             )
         """))
+        # Migrations: track who recorded expenses/debtors and who marked debts paid
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS paid_by     TEXT DEFAULT ''"))
+        # Migrations: soft-delete support (void instead of hard delete)
+        conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
+        # Transfers log table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS transfers (
+                id          SERIAL PRIMARY KEY,
+                timestamp   TEXT,
+                drink_name  TEXT,
+                quantity    INTEGER,
+                recorded_by TEXT DEFAULT ''
+            )
+        """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id     BIGINT PRIMARY KEY,
@@ -187,32 +208,34 @@ def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: 
 
 # ── Expense record ────────────────────────────────────────────────────
 
-def record_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None) -> None:
+def record_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO expenses (timestamp, account, category, amount, description)
-            VALUES (:ts, :account, :category, :amount, :desc)
+            INSERT INTO expenses (timestamp, account, category, amount, description, recorded_by)
+            VALUES (:ts, :account, :category, :amount, :desc, :recorded_by)
         """), {
             "ts": _ts(timestamp), "account": account.lower(),
             "category": category.lower(),
             "amount": round(amount, 2), "desc": description,
+            "recorded_by": recorded_by,
         })
         conn.commit()
 
 
 # ── Debtor records ────────────────────────────────────────────────────
 
-def record_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None) -> None:
+def record_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO debtors (timestamp, account, name, amount, description, status, paid_at)
-            VALUES (:ts, :account, :name, :amount, :desc, 'outstanding', '')
+            INSERT INTO debtors (timestamp, account, name, amount, description, status, paid_at, recorded_by)
+            VALUES (:ts, :account, :name, :amount, :desc, 'outstanding', '', :recorded_by)
         """), {
             "ts": _ts(timestamp), "account": account.lower(),
             "name": name.strip(),
             "amount": round(amount, 2), "desc": description,
+            "recorded_by": recorded_by,
         })
         conn.commit()
 
@@ -230,7 +253,7 @@ def get_debtors(account: str | None = None) -> list[dict[str, Any]]:
     return df.to_dict(orient="records")
 
 
-def mark_debtor_paid(name: str, account: str) -> bool:
+def mark_debtor_paid(name: str, account: str, paid_by: str = "") -> bool:
     """
     Mark the oldest outstanding debt for this name + account as paid.
     Returns True if a row was updated, False if not found.
@@ -238,7 +261,7 @@ def mark_debtor_paid(name: str, account: str) -> bool:
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(text("""
-            UPDATE debtors SET status = 'paid', paid_at = :paid_at
+            UPDATE debtors SET status = 'paid', paid_at = :paid_at, paid_by = :paid_by
             WHERE id = (
                 SELECT id FROM debtors
                 WHERE lower(name) = lower(:name)
@@ -247,7 +270,7 @@ def mark_debtor_paid(name: str, account: str) -> bool:
                 ORDER BY timestamp ASC
                 LIMIT 1
             )
-        """), {"paid_at": now_str(), "name": name.strip(), "account": account.lower()})
+        """), {"paid_at": now_str(), "paid_by": paid_by, "name": name.strip(), "account": account.lower()})
         conn.commit()
         return result.rowcount > 0
 
@@ -349,13 +372,14 @@ def transfer_drink(drink: str, qty: int) -> dict[str, Any]:
 # ── Entry history & deletion ─────────────────────────────────────────
 
 def get_entries_by_date(date_str: str) -> list[dict[str, Any]]:
-    """Return all sales, rooms, and expenses for a given YYYY-MM-DD, tagged by entry_type."""
+    """Return active (non-voided) sales, rooms, and expenses for a given YYYY-MM-DD."""
     engine = get_engine()
     entries: list[dict[str, Any]] = []
 
     for table, tag in (("sales", "sale"), ("rooms", "room"), ("expenses", "expense")):
         df = pd.read_sql(
-            f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s ORDER BY timestamp",
+            f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s"
+            f" AND (deleted_at = '' OR deleted_at IS NULL) ORDER BY timestamp",
             engine, params={"prefix": date_str + "%"},
         )
         for row in df.to_dict(orient="records"):
@@ -366,39 +390,131 @@ def get_entries_by_date(date_str: str) -> list[dict[str, Any]]:
     return entries
 
 
-def delete_sale(entry_id: int) -> dict[str, Any] | None:
-    """Delete a sale row by id. Returns the deleted row (for stock restoration) or None."""
+def void_sale(entry_id: int, actor: str = "") -> dict[str, Any] | None:
+    """Soft-void a sale row. Returns the row (for stock restoration) or None if not found/already voided."""
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(
-            text("DELETE FROM sales WHERE id = :id RETURNING *"),
-            {"id": entry_id},
+            text("""
+                UPDATE sales SET deleted_by = :actor, deleted_at = :ts
+                WHERE id = :id AND (deleted_at = '' OR deleted_at IS NULL)
+                RETURNING *
+            """),
+            {"id": entry_id, "actor": actor, "ts": now_str()},
         )
         conn.commit()
         row = result.fetchone()
         return dict(row._mapping) if row else None
 
 
-def delete_room(entry_id: int) -> bool:
+def void_room(entry_id: int, actor: str = "") -> bool:
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(
-            text("DELETE FROM rooms WHERE id = :id"),
-            {"id": entry_id},
+            text("""
+                UPDATE rooms SET deleted_by = :actor, deleted_at = :ts
+                WHERE id = :id AND (deleted_at = '' OR deleted_at IS NULL)
+            """),
+            {"id": entry_id, "actor": actor, "ts": now_str()},
         )
         conn.commit()
         return result.rowcount > 0
 
 
-def delete_expense(entry_id: int) -> bool:
+def void_expense(entry_id: int, actor: str = "") -> bool:
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(
-            text("DELETE FROM expenses WHERE id = :id"),
-            {"id": entry_id},
+            text("""
+                UPDATE expenses SET deleted_by = :actor, deleted_at = :ts
+                WHERE id = :id AND (deleted_at = '' OR deleted_at IS NULL)
+            """),
+            {"id": entry_id, "actor": actor, "ts": now_str()},
         )
         conn.commit()
         return result.rowcount > 0
+
+
+# ── Transfer log ─────────────────────────────────────────────────────
+
+def record_transfer(drink: str, qty: int, recorded_by: str = "") -> None:
+    """Log a store→bar stock transfer for audit purposes."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO transfers (timestamp, drink_name, quantity, recorded_by)
+            VALUES (:ts, :drink, :qty, :recorded_by)
+        """), {"ts": now_str(), "drink": drink.lower(), "qty": qty, "recorded_by": recorded_by})
+        conn.commit()
+
+
+# ── Activity log ────────────────────────────────────────────────────
+
+def get_activity_log(date_str: str, username: str | None = None) -> list[dict[str, Any]]:
+    """
+    Return all activity for YYYY-MM-DD, tagged by entry_type.
+    Includes voided/deleted entries (flagged via deleted_at).
+    Optionally filter to a single actor (recorded_by / paid_by).
+    """
+    engine = get_engine()
+    entries: list[dict[str, Any]] = []
+    prefix = date_str + "%"
+    u_filter = username
+
+    # Sales, rooms, expenses — include voided rows (no deleted_at filter here)
+    for table, tag in (
+        ("sales",    "sale"),
+        ("rooms",    "room"),
+        ("expenses", "expense"),
+        ("debtors",  "debtor_add"),
+    ):
+        if u_filter:
+            df = pd.read_sql(
+                f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s AND recorded_by = %(u)s ORDER BY timestamp",
+                engine, params={"prefix": prefix, "u": u_filter},
+            )
+        else:
+            df = pd.read_sql(
+                f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s ORDER BY timestamp",
+                engine, params={"prefix": prefix},
+            )
+        for row in df.to_dict(orient="records"):
+            row["entry_type"] = tag
+            entries.append(row)
+
+    # Debts marked paid on this date
+    if u_filter:
+        paid_df = pd.read_sql(
+            "SELECT * FROM debtors WHERE paid_at LIKE %(prefix)s AND status = 'paid' AND paid_by = %(u)s ORDER BY paid_at",
+            engine, params={"prefix": prefix, "u": u_filter},
+        )
+    else:
+        paid_df = pd.read_sql(
+            "SELECT * FROM debtors WHERE paid_at LIKE %(prefix)s AND status = 'paid' ORDER BY paid_at",
+            engine, params={"prefix": prefix},
+        )
+    for row in paid_df.to_dict(orient="records"):
+        row["entry_type"] = "debtor_pay"
+        row["timestamp"] = row.get("paid_at", "")
+        entries.append(row)
+
+    # Store→bar transfers
+    if u_filter:
+        tf_df = pd.read_sql(
+            "SELECT * FROM transfers WHERE timestamp LIKE %(prefix)s AND recorded_by = %(u)s ORDER BY timestamp",
+            engine, params={"prefix": prefix, "u": u_filter},
+        )
+    else:
+        tf_df = pd.read_sql(
+            "SELECT * FROM transfers WHERE timestamp LIKE %(prefix)s ORDER BY timestamp",
+            engine, params={"prefix": prefix},
+        )
+    for row in tf_df.to_dict(orient="records"):
+        row["entry_type"] = "transfer"
+        entries.append(row)
+
+    entries.sort(key=lambda r: r.get("timestamp", ""))
+    return entries
 
 
 # ── Price list ───────────────────────────────────────────────────────
@@ -422,12 +538,14 @@ def get_last_staff_entry(username: str, window_minutes: int = 2) -> dict[str, An
 
     sale_df = pd.read_sql(
         "SELECT *, 'sale' AS entry_type FROM sales "
-        "WHERE recorded_by = %(u)s ORDER BY timestamp DESC LIMIT 1",
+        "WHERE recorded_by = %(u)s AND (deleted_at = '' OR deleted_at IS NULL)"
+        " ORDER BY timestamp DESC LIMIT 1",
         engine, params={"u": username},
     )
     room_df = pd.read_sql(
         "SELECT *, 'room' AS entry_type FROM rooms "
-        "WHERE recorded_by = %(u)s ORDER BY timestamp DESC LIMIT 1",
+        "WHERE recorded_by = %(u)s AND (deleted_at = '' OR deleted_at IS NULL)"
+        " ORDER BY timestamp DESC LIMIT 1",
         engine, params={"u": username},
     )
 

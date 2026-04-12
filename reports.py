@@ -82,6 +82,11 @@ def _split_salary(expense_rows: list[dict]) -> tuple[list[dict], list[dict]]:
     return salary, other
 
 
+def _active(rows: list[dict]) -> list[dict]:
+    """Exclude soft-voided/deleted rows from financial aggregations."""
+    return [r for r in rows if not r.get("deleted_at")]
+
+
 def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
     """Match each sale to its current cost price from inventory."""
     total = 0.0
@@ -102,9 +107,9 @@ def generate_full_report(
     all_time: bool = False,
     staff_view: bool = False,
 ) -> str:
-    sales_rows = db.read_all("sales")
-    room_rows = db.read_all("rooms")
-    expense_rows = db.read_all("expenses")
+    sales_rows = _active(db.read_all("sales"))
+    room_rows = _active(db.read_all("rooms"))
+    expense_rows = _active(db.read_all("expenses"))
     debtor_rows = db.read_all("debtors")
 
     sales_rows = _apply_filter(sales_rows, for_date, for_month, all_time)
@@ -226,7 +231,7 @@ def generate_sales_report(
     staff_view: bool = False,
 ) -> str:
     """Drink-level sales breakdown. staff_view shows qty only — no cost/profit."""
-    sales_rows = db.read_all("sales")
+    sales_rows = _active(db.read_all("sales"))
     sales_rows = _apply_filter(sales_rows, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
@@ -316,7 +321,7 @@ def generate_expense_report(
     all_time: bool = False,
 ) -> str:
     """Expense breakdown by account and category."""
-    expense_rows = db.read_all("expenses")
+    expense_rows = _active(db.read_all("expenses"))
     expense_rows = _apply_filter(expense_rows, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
@@ -388,8 +393,8 @@ def generate_staff_report(
     for_month: tuple[int, int] | None = None,
 ) -> str:
     """Sales breakdown by staff member who recorded the entry."""
-    sales_rows = db.read_all("sales")
-    room_rows = db.read_all("rooms")
+    sales_rows = _active(db.read_all("sales"))
+    room_rows = _active(db.read_all("rooms"))
     sales_rows = _apply_filter(sales_rows, for_date, for_month, False)
     room_rows = _apply_filter(room_rows, for_date, for_month, False)
     label = _period_label(for_date, for_month, False)
@@ -457,8 +462,8 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
     today = target or datetime.now().date()
     label = today.strftime("%A, %d %b %Y")
 
-    sales_rows = _filter_by_date(db.read_all("sales"), today)
-    room_rows = _filter_by_date(db.read_all("rooms"), today)
+    sales_rows = _filter_by_date(_active(db.read_all("sales")), today)
+    room_rows = _filter_by_date(_active(db.read_all("rooms")), today)
 
     # Top selling drinks today
     drink_qty: dict[str, int] = {}
@@ -491,7 +496,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
         lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
 
-    expense_rows = _filter_by_date(db.read_all("expenses"), today)
+    expense_rows = _filter_by_date(_active(db.read_all("expenses")), today)
     outstanding = [r for r in db.read_all("debtors") if r["status"] == "outstanding"]
 
     bar_rev = _sum_revenue(sales_rows)
@@ -588,9 +593,9 @@ def generate_allocation_report(
     Show recommended set-asides (tax, buffer, restock) calculated on gross revenue,
     actual expenses, net working capital, and burn rate.
     """
-    sales_rows  = _apply_filter(db.read_all("sales"),    for_date, for_month, all_time)
-    room_rows   = _apply_filter(db.read_all("rooms"),    for_date, for_month, all_time)
-    expense_rows = _apply_filter(db.read_all("expenses"), for_date, for_month, all_time)
+    sales_rows  = _apply_filter(_active(db.read_all("sales")),    for_date, for_month, all_time)
+    room_rows   = _apply_filter(_active(db.read_all("rooms")),    for_date, for_month, all_time)
+    expense_rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
     bar_rev  = _sum_revenue(sales_rows)
@@ -933,3 +938,97 @@ def generate_price_list() -> str:
 
 def generate_daily_report() -> str:
     return generate_daily_summary()
+
+
+# ── Activity log ──────────────────────────────────────────────────────
+
+def generate_activity_log(date_str: str, username_filter: str | None = None) -> str:
+    """Chronological admin view of all staff activity for a given date."""
+    entries = db.get_activity_log(date_str, username=username_filter)
+
+    try:
+        label = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d %b %Y")
+    except ValueError:
+        label = date_str
+
+    filter_note = f" — @{username_filter}" if username_filter else ""
+
+    if not entries:
+        msg = f"No activity recorded for *{username_filter}*." if username_filter else "No activity recorded."
+        return f"📋 *Activity Log — {label}*{filter_note}\n\n{msg}"
+
+    # Group by actor (recorded_by for most; paid_by for debtor_pay)
+    by_actor: dict[str, list[dict]] = {}
+    for entry in entries:
+        if entry["entry_type"] == "debtor_pay":
+            actor = (entry.get("paid_by") or "Unknown").strip() or "Unknown"
+        else:
+            actor = (entry.get("recorded_by") or "Unknown").strip() or "Unknown"
+        by_actor.setdefault(actor, []).append(entry)
+
+    lines = [f"📋 *Activity Log — {label}*{filter_note}", _SEP]
+
+    for actor in sorted(by_actor):
+        lines.append(f"👤 *@{actor}*")
+        for e in by_actor[actor]:
+            ts = e.get("timestamp", "")
+            try:
+                time_str = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+            except ValueError:
+                time_str = "--:--"
+
+            etype = e["entry_type"]
+            is_voided = bool(e.get("deleted_at"))
+            void_suffix = ""
+            if is_voided:
+                voided_by = e.get("deleted_by") or "?"
+                try:
+                    void_time = datetime.strptime(e["deleted_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+                except (ValueError, KeyError):
+                    void_time = "?"
+                void_suffix = f" [VOIDED {void_time} by {voided_by}]"
+
+            if etype == "sale":
+                drink = str(e.get("drink_name", "?")).title()
+                qty = int(e.get("quantity", 0))
+                total = float(e.get("total_revenue", 0))
+                icon = "🔴" if is_voided else "🍺"
+                lines.append(f"  {time_str}  {icon} Sold {qty}× {drink} — {_fmt(total)}{void_suffix}")
+            elif etype == "room":
+                rtype = str(e.get("room_type", "?")).title()
+                qty = int(e.get("quantity", 0))
+                nights = int(e.get("nights", 0))
+                total = float(e.get("total_revenue", 0))
+                icon = "🔴" if is_voided else "🏨"
+                lines.append(f"  {time_str}  {icon} Room: {qty}× {rtype}, {nights}n — {_fmt(total)}{void_suffix}")
+            elif etype == "expense":
+                acct = str(e.get("account", "?")).title()
+                cat = str(e.get("category", "?")).title()
+                amt = float(e.get("amount", 0))
+                desc = e.get("description", "")
+                desc_note = f' "{desc}"' if desc else ""
+                icon = "🔴" if is_voided else "💸"
+                lines.append(f"  {time_str}  {icon} Expense [{acct}/{cat}] {_fmt(amt)}{desc_note}{void_suffix}")
+            elif etype == "debtor_add":
+                acct = str(e.get("account", "?")).title()
+                name = str(e.get("name", "?")).title()
+                amt = float(e.get("amount", 0))
+                lines.append(f"  {time_str}  🧾 Added debtor: {name} ({acct}) — {_fmt(amt)}")
+            elif etype == "debtor_pay":
+                acct = str(e.get("account", "?")).title()
+                name = str(e.get("name", "?")).title()
+                amt = float(e.get("amount", 0))
+                lines.append(f"  {time_str}  ✅ Paid debtor: {name} ({acct}) — {_fmt(amt)}")
+            elif etype == "transfer":
+                drink = str(e.get("drink_name", "?")).title()
+                qty = int(e.get("quantity", 0))
+                lines.append(f"  {time_str}  📦 Transfer: {qty}× {drink} store→bar")
+        lines.append("")
+
+    # Remove trailing blank line
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    lines.append(_SEP)
+    lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    return "\n".join(lines)

@@ -79,13 +79,13 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
 VALID_ACCOUNTS = ("rooms", "bar")
 
 
-def process_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None) -> tuple[bool, str]:
+def process_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
 
-    db.record_expense(account.strip(), category.strip(), amount, description.strip(), timestamp=timestamp)
+    db.record_expense(account.strip(), category.strip(), amount, description.strip(), timestamp=timestamp, recorded_by=recorded_by)
     date_note = f"\nDate: {timestamp}" if timestamp else ""
     return True, (
         f"✅ Expense recorded.\n"
@@ -97,7 +97,7 @@ def process_expense(account: str, category: str, amount: float, description: str
 
 # ── Debtors ───────────────────────────────────────────────────────────
 
-def process_add_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None) -> tuple[bool, str]:
+def process_add_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if not name.strip():
@@ -105,7 +105,7 @@ def process_add_debtor(account: str, name: str, amount: float, description: str 
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
 
-    db.record_debtor(account.strip(), name.strip(), amount, description.strip(), timestamp=timestamp)
+    db.record_debtor(account.strip(), name.strip(), amount, description.strip(), timestamp=timestamp, recorded_by=recorded_by)
     date_note = f"\nDate: {timestamp}" if timestamp else ""
     return True, (
         f"✅ Debtor recorded.\n"
@@ -115,13 +115,13 @@ def process_add_debtor(account: str, name: str, amount: float, description: str 
     )
 
 
-def process_pay_debtor(account: str, name: str) -> tuple[bool, str]:
+def process_pay_debtor(account: str, name: str, paid_by: str = "") -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if not name.strip():
         return False, "❌ Debtor name cannot be empty."
 
-    updated = db.mark_debtor_paid(name.strip(), account.strip())
+    updated = db.mark_debtor_paid(name.strip(), account.strip(), paid_by=paid_by)
     if updated:
         return True, f"✅ *{name.title()}* ({account.title()}) marked as paid."
     return False, f"❌ No outstanding debt found for *{name.title()}* in *{account.title()}*."
@@ -129,7 +129,7 @@ def process_pay_debtor(account: str, name: str) -> tuple[bool, str]:
 
 # ── Restock ───────────────────────────────────────────────────────────
 
-def process_restock(drink: str, qty: int, cost_price: float) -> tuple[bool, str]:
+def process_restock(drink: str, qty: int, cost_price: float, recorded_by: str = "") -> tuple[bool, str]:
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
     if cost_price <= 0:
@@ -143,6 +143,7 @@ def process_restock(drink: str, qty: int, cost_price: float) -> tuple[bool, str]
             category="restock",
             amount=total_cost,
             description=f"Restock: {drink.strip().title()} ×{qty} @ ₦{cost_price:,.2f}",
+            recorded_by=recorded_by,
         )
     return result.ok, result.message
 
@@ -152,52 +153,52 @@ def process_restock(drink: str, qty: int, cost_price: float) -> tuple[bool, str]
 _VALID_ENTRY_TYPES = ("sale", "room", "expense")
 
 
-def process_delete(entry_type: str, entry_id: int) -> tuple[bool, str]:
+def process_delete(entry_type: str, entry_id: int, actor: str = "") -> tuple[bool, str]:
     if entry_type not in _VALID_ENTRY_TYPES:
         return False, f"❌ Type must be *sale*, *room*, or *expense*. Got: `{entry_type}`"
 
     if entry_type == "sale":
-        row = db.delete_sale(entry_id)
+        row = db.void_sale(entry_id, actor=actor)
         if row is None:
-            return False, f"❌ Sale entry `#{entry_id}` not found."
+            return False, f"❌ Sale entry `#{entry_id}` not found (or already voided)."
         drink = row["drink_name"].title()
         qty = int(row["quantity"])
         total = float(row["total_revenue"])
         inv.restore_bar_stock(row["drink_name"], qty)
         return True, (
-            f"✅ Sale `#{entry_id}` deleted.\n"
+            f"✅ Sale `#{entry_id}` voided.\n"
             f"{drink} ×{qty} — ₦{total:,.2f} removed from revenue.\n"
             f"Bar stock restored +{qty}."
         )
 
     if entry_type == "room":
-        found = db.delete_room(entry_id)
+        found = db.void_room(entry_id, actor=actor)
         if not found:
-            return False, f"❌ Room entry `#{entry_id}` not found."
-        return True, f"✅ Room entry `#{entry_id}` deleted."
+            return False, f"❌ Room entry `#{entry_id}` not found (or already voided)."
+        return True, f"✅ Room entry `#{entry_id}` voided."
 
     # expense
-    found = db.delete_expense(entry_id)
+    found = db.void_expense(entry_id, actor=actor)
     if not found:
-        return False, f"❌ Expense entry `#{entry_id}` not found."
-    return True, f"✅ Expense entry `#{entry_id}` deleted."
+        return False, f"❌ Expense entry `#{entry_id}` not found (or already voided)."
+    return True, f"✅ Expense entry `#{entry_id}` voided."
 
 
 # ── Undo last entry ──────────────────────────────────────────────────
 
 def process_undo(username: str) -> tuple[bool, str]:
-    """Delete the last sale or room entry by this user if within the 5-min window."""
+    """Soft-void the last sale or room entry by this user if within the 2-min window."""
     entry = db.get_last_staff_entry(username)
     if entry is None:
         return False, (
             "❌ Nothing to undo.\n"
-            "Either you have no recent entries, or the 5-minute window has passed."
+            "Either you have no recent entries, or the 2-minute window has passed."
         )
 
     entry_type = entry["entry_type"]
 
     if entry_type == "sale":
-        row = db.delete_sale(int(entry["id"]))
+        row = db.void_sale(int(entry["id"]), actor=username)
         if row is None:
             return False, "❌ Could not find the entry to undo."
         drink = row["drink_name"].title()
@@ -210,7 +211,7 @@ def process_undo(username: str) -> tuple[bool, str]:
         )
 
     if entry_type == "room":
-        found = db.delete_room(int(entry["id"]))
+        found = db.void_room(int(entry["id"]), actor=username)
         if not found:
             return False, "❌ Could not find the entry to undo."
         room_type = entry["room_type"].title()
@@ -222,11 +223,13 @@ def process_undo(username: str) -> tuple[bool, str]:
 
 # ── Store → Bar transfer ──────────────────────────────────────────────
 
-def process_transfer(drink: str, qty: int) -> tuple[bool, str]:
+def process_transfer(drink: str, qty: int, recorded_by: str = "") -> tuple[bool, str]:
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
 
     result: StockResult = inv.transfer_to_bar(drink.strip(), qty)
+    if result.ok:
+        db.record_transfer(drink.strip(), qty, recorded_by=recorded_by)
     msg = result.message
     if result.low_stock_alert:
         msg += f"\n\n{result.low_stock_alert}"

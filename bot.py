@@ -149,6 +149,27 @@ async def _reply(update: Update, text: str) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+async def _reply_long(update: Update, text: str) -> None:
+    """Send a message, splitting into ≤4000-char chunks at line boundaries if needed."""
+    limit = 4000
+    if len(text) <= limit:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+    lines = text.split("\n")
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        # +1 for the newline we'll re-add
+        if size + len(line) + 1 > limit and chunk:
+            await update.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+            chunk = []
+            size = 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        await update.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+
+
 # ── /start ────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -217,7 +238,8 @@ def _help_text(is_admin: bool = False) -> str:
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>`\n"
         "`/removestaff <user_id>`\n"
-        "`/dailyreport on|off`"
+        "`/dailyreport on|off`\n"
+        "`/activity` | `/activity YYYY-MM-DD` | `/activity username` — daily staff activity log"
     )
     return staff_cmds + admin_cmds
 
@@ -338,7 +360,9 @@ async def cmd_restock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, err)
         return
 
-    ok, msg = logic.process_restock(drink, qty, cost)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_restock(drink, qty, cost, recorded_by=recorded_by)
     await _reply(update, msg)
 
 
@@ -399,7 +423,9 @@ async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     description = " ".join(args[3:]) if len(args) > 3 else ""
 
-    ok, msg = logic.process_expense(account, category, amount, description, timestamp=ts)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_expense(account, category, amount, description, timestamp=ts, recorded_by=recorded_by)
     await _reply(update, msg)
 
 
@@ -426,7 +452,9 @@ async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
     description = " ".join(args[3:]) if len(args) > 3 else ""
 
-    ok, msg = logic.process_add_debtor(account, name, amount, description, timestamp=ts)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_add_debtor(account, name, amount, description, timestamp=ts, recorded_by=recorded_by)
     await _reply(update, msg)
 
 
@@ -447,7 +475,9 @@ async def cmd_pay_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     account = args[0]
     name = " ".join(args[1:])
 
-    ok, msg = logic.process_pay_debtor(account, name)
+    user = update.effective_user
+    paid_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_pay_debtor(account, name, paid_by=paid_by)
     await _reply(update, msg)
 
 
@@ -570,7 +600,9 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, "❌ ID must be a number.")
         return
 
-    ok, msg = logic.process_delete(entry_type, entry_id)
+    user = update.effective_user
+    actor = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_delete(entry_type, entry_id, actor=actor)
     await _reply(update, msg)
 
 
@@ -793,8 +825,37 @@ async def cmd_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, err)
         return
 
-    ok, msg = logic.process_transfer(drink, qty)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_transfer(drink, qty, recorded_by=recorded_by)
     await _reply(update, msg)
+
+
+# ── /activity (admin) ────────────────────────────────────────────────
+
+_USERNAME_RE = re.compile(r"^@?[\w]+$")
+
+
+@_require_admin
+async def cmd_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a chronological activity log for all staff (or one member) for a given day."""
+    from datetime import datetime
+    args = _parse_args(ctx)
+
+    date_str: str | None = None
+    username_filter: str | None = None
+
+    for arg in args:
+        if _DATE_RE.match(arg):
+            date_str = arg
+        elif _USERNAME_RE.match(arg):
+            username_filter = arg.lstrip("@")
+
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    text = reports.generate_activity_log(date_str, username_filter=username_filter)
+    await _reply_long(update, text)
 
 
 # ── /setthreshold (admin) ─────────────────────────────────────────────
@@ -944,6 +1005,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sales_report", cmd_sales_report))
     app.add_handler(CommandHandler("expense_report", cmd_expense_report))
     app.add_handler(CommandHandler("staff_report", cmd_staff_report))
+    app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("allocation", cmd_allocation))
     app.add_handler(CommandHandler("setallocation", cmd_setallocation))
