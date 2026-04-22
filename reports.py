@@ -206,10 +206,12 @@ def generate_full_report(
 
     outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
     if outstanding:
+        def _rem(r: dict) -> float:
+            return round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
         bar_debtors = [r for r in outstanding if r["account"] == "bar"]
         room_debtors = [r for r in outstanding if r["account"] == "rooms"]
-        bar_owed = sum(float(r["amount"]) for r in bar_debtors)
-        room_owed = sum(float(r["amount"]) for r in room_debtors)
+        bar_owed = sum(_rem(r) for r in bar_debtors)
+        room_owed = sum(_rem(r) for r in room_debtors)
         lines.append("💳 *OUTSTANDING DEBTORS*")
         if bar_debtors:
             lines.append(f"  🍺 Bar ({len(bar_debtors)}):    {_fmt(bar_owed)}")
@@ -510,7 +512,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
             lines.append(f"  • {drink}: {qty} units")
 
     if outstanding:
-        owed = sum(float(r["amount"]) for r in outstanding)
+        owed = sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding)
         lines.append(_SEP)
         lines.append(f"💳 Outstanding Debtors: {len(outstanding)} ({_fmt(owed)} owed)")
 
@@ -730,7 +732,7 @@ def _debt_age(timestamp_str: str) -> str:
     return f" _({days} days){flag}_"
 
 
-def generate_debtors_report(account: str | None = None) -> str:
+def generate_debtors_report(account: str | None = None, staff_view: bool = False) -> str:
     """List all outstanding debtors, optionally filtered to one account."""
     rows = db.get_debtors(account=account)
 
@@ -746,22 +748,33 @@ def generate_debtors_report(account: str | None = None) -> str:
         _SEP,
     ]
 
+    def _remaining(r: dict) -> float:
+        return round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
+
+    def _debt_lines(r: dict) -> list[str]:
+        did = r["id"]
+        note = f" — {r['description']}" if r.get("description") else ""
+        age = _debt_age(r.get("timestamp", ""))
+        original = float(r["amount"])
+        paid = float(r.get("amount_paid") or 0)
+        rem = round(original - paid, 2)
+        out = [f"  • `[#{did}]` {r['name'].title()}: {_fmt(original)}{note}{age}"]
+        if paid > 0:
+            out.append(f"      Paid: {_fmt(paid)} | *Remaining: {_fmt(rem)}*")
+        return out
+
     if bar_rows and (account is None or account == "bar"):
         lines.append("🍺 *BAR*")
         for r in bar_rows:
-            note = f" — {r['description']}" if r.get("description") else ""
-            age = _debt_age(r.get("timestamp", ""))
-            lines.append(f"  • {r['name'].title()}: {_fmt(float(r['amount']))}{note}{age}")
-        lines.append(f"  *Total: {_fmt(sum(float(r['amount']) for r in bar_rows))}*")
+            lines.extend(_debt_lines(r))
+        lines.append(f"  *Total remaining: {_fmt(sum(_remaining(r) for r in bar_rows))}*")
         lines.append("")
 
     if room_rows and (account is None or account == "rooms"):
         lines.append("🛏 *ROOMS*")
         for r in room_rows:
-            note = f" — {r['description']}" if r.get("description") else ""
-            age = _debt_age(r.get("timestamp", ""))
-            lines.append(f"  • {r['name'].title()}: {_fmt(float(r['amount']))}{note}{age}")
-        lines.append(f"  *Total: {_fmt(sum(float(r['amount']) for r in room_rows))}*")
+            lines.extend(_debt_lines(r))
+        lines.append(f"  *Total remaining: {_fmt(sum(_remaining(r) for r in room_rows))}*")
 
     overdue = [r for r in rows if (lambda d: d >= 7)(
         (datetime.now() - datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")).days
@@ -770,6 +783,8 @@ def generate_debtors_report(account: str | None = None) -> str:
     lines.append(_SEP)
     if overdue:
         lines.append(f"⚠️ {len(overdue)} debt(s) outstanding for 7+ days — follow up needed.")
+    if not staff_view:
+        lines.append("_Use /pay_debt <id> [amount] to pay a specific debt._")
     lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
@@ -907,6 +922,62 @@ def generate_price_list() -> str:
         lines.append(f"⚠️ No price set for: {', '.join(unpriced)}")
         lines.append("_Admin: use /setprice <drink> <amount> to set._")
     lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    return "\n".join(lines)
+
+
+# ── Debtor history ────────────────────────────────────────────────────
+
+def generate_debtor_history(account: str, name: str) -> str:
+    """Full payment timeline for one person + account (admin-only)."""
+    data = db.get_debtor_history(name, account)
+    debts = data["debts"]
+    payments_by_id = data["payments"]
+
+    if not debts:
+        return f"🧾 No debt history for *{name.title()}* in *{account.title()}*."
+
+    lines = [
+        f"🧾 *Debt History — {name.title()} ({account.title()})*",
+        _SEP,
+    ]
+
+    grand_remaining = 0.0
+    for debt in debts:
+        did = int(debt["id"])
+        original = float(debt["amount"])
+        paid_total = float(debt.get("amount_paid") or 0)
+        remaining = round(original - paid_total, 2)
+        status = debt["status"]
+        ts = str(debt.get("timestamp", ""))[:10]
+        desc = debt.get("description", "")
+        desc_note = f" — {desc}" if desc else ""
+
+        icon = "✅" if status == "paid" else "🔴"
+        lines.append(f"{icon} `[#{did}]` Opened {ts}: *{_fmt(original)}*{desc_note}")
+
+        for p in payments_by_id.get(did, []):
+            pts = str(p.get("timestamp", ""))[:10]
+            pamt = float(p["amount"])
+            pby = p.get("recorded_by", "")
+            by_note = f" by @{pby}" if pby else ""
+            lines.append(f"    💳 {pts}: paid {_fmt(pamt)}{by_note}")
+
+        if status == "outstanding":
+            lines.append(f"    Balance: *{_fmt(remaining)}* outstanding")
+            grand_remaining += remaining
+        else:
+            paid_at = str(debt.get("paid_at", ""))[:10]
+            lines.append(f"    ✅ Cleared on {paid_at}")
+        lines.append("")
+
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    lines += [
+        _SEP,
+        f"*Total still owed: {_fmt(grand_remaining)}*" if grand_remaining > 0 else "✅ All debts cleared.",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
     return "\n".join(lines)
 
 

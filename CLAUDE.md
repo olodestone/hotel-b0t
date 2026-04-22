@@ -54,11 +54,11 @@ Two roles: `admin` and `staff`. Role lookup hits the `users` table on every requ
 **Staff can:**
 - `/sell_drink` — record drink sales (tracked with `recorded_by`)
 - `/room` — record room bookings
-- `/report`, `/sales_report`, `/expense_report`, `/stock`, `/summary`, `/history`, `/debtors` — view only
+- `/report`, `/stock`, `/summary`, `/history`, `/debtors` — view only
 
 **Admin only:**
 - `/expense`, `/add_debtor`, `/pay_debtor`, `/restock`, `/transfer`, `/delete`
-- `/staff_report`, `/allocation`, `/setallocation`
+- `/sales_report`, `/expense_report`, `/staff_report`, `/allocation`, `/setallocation`
 - `/setthreshold`, `/addstaff`, `/removestaff`, `/dailyreport`
 
 Staff cannot delete anything — audit trail is preserved. Mistakes are corrected by admin via `/delete` then re-entry.
@@ -71,7 +71,6 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/sell_drink <drink> <qty> <price> [YYYY-MM-DD]` | Record drink sale |
 | `/room <type> <qty> <price> <nights> [YYYY-MM-DD]` | Record room booking |
 | `/report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Full financial report |
-| `/expense_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Expense breakdown by category |
 | `/summary [YYYY-MM-DD]` | Daily overview with set-aside nudge |
 | `/stock` | Inventory table (store + bar columns) |
 | `/history [YYYY-MM-DD]` | All entries for a date with IDs |
@@ -81,9 +80,11 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | Command | Description |
 |---|---|
 | `/sales_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Drink-level sales breakdown with cost & profit |
+| `/expense_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Expense breakdown by category |
 | `/expense <room\|bar> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages |
 | `/add_debtor <room\|bar> <name> <amount> [note] [YYYY-MM-DD]` | Log debtor |
-| `/pay_debtor <room\|bar> <name>` | Mark debtor paid |
+| `/pay_debtor <room\|bar> <name> [amount]` | Full or partial debt payment |
+| `/debtor_history <bar\|rooms> <name>` | Full payment timeline for a debtor |
 | `/restock <drink> <qty> <cost_price>` | Add inventory to store |
 | `/transfer <drink> <qty>` | Move store → bar |
 | `/delete <sale\|room\|expense> <id>` | Remove an entry |
@@ -191,7 +192,8 @@ Detection: `_extract_date(args)` in `bot.py` checks if the last arg matches `^\d
 | `sales` | `id`, `timestamp`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by` |
 | `rooms` | `id`, `timestamp`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue` |
 | `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description` |
-| `debtors` | `id`, `timestamp`, `account`, `name`, `amount`, `description`, `status`, `paid_at` |
+| `debtors` | `id`, `timestamp`, `account`, `name`, `amount`, `amount_paid`, `description`, `status`, `paid_at` |
+| `debtor_payments` | `id`, `debtor_id`, `timestamp`, `amount`, `recorded_by` — one row per payment event |
 | `inventory` | `drink_name`, `current_stock`, `store_stock`, `total_purchased`, `total_sold`, `cost_price`, `low_stock_threshold` |
 | `users` | `user_id`, `username`, `role`, `added_at` |
 | `settings` | `key`, `value` — stores allocation percentages |

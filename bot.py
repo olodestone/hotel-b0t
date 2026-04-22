@@ -12,7 +12,6 @@ Staff (any registered user):
   /room <type> <qty> <price> <nights>        — Record room booking
   /debtors [bar|rooms]                       — List outstanding debtors
   /report [today|YYYY-MM-DD|YYYY-MM|all]     — Financial report
-  /expense_report [today|YYYY-MM-DD|YYYY-MM|all] — Expense breakdown
   /stock                                     — Inventory status
   /summary [YYYY-MM-DD]                      — Today's key numbers
   /history [YYYY-MM-DD]                      — View entries for a date
@@ -24,6 +23,8 @@ Admin only:
   /restock <drink> <qty> <cost>              — Add inventory
   /transfer <drink> <qty>                    — Move store → bar
   /delete <sale|room|expense> <id>           — Remove an entry
+  /sales_report [today|YYYY-MM-DD|YYYY-MM|all] — Sales breakdown with cost & profit
+  /expense_report [today|YYYY-MM-DD|YYYY-MM|all] — Expense breakdown by category
   /staff_report [today|YYYY-MM-DD|YYYY-MM]   — Sales per staff member
   /setthreshold <drink> <amount>             — Set low-stock alert threshold
   /addstaff <user_id> <username>             — Grant staff access
@@ -223,7 +224,8 @@ def _help_text(is_admin: bool = False) -> str:
         "\n\n*Admin Commands:*\n"
         "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
         "`/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
-        "`/pay_debtor <room|bar> <name>`\n"
+        "`/pay_debtor <room|bar> <name> [amount]` — pay oldest debt for a person\n"
+        "`/pay_debt <id> [amount]` — pay a specific debt by ID (IDs shown in /debtors)\n"
         "`/restock <drink> <qty> <cost_price>`\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
         "`/delete <sale|room|expense> <id>`\n"
@@ -237,7 +239,8 @@ def _help_text(is_admin: bool = False) -> str:
         "`/addstaff <user_id> <username>`\n"
         "`/removestaff <user_id>`\n"
         "`/dailyreport on|off`\n"
-        "`/activity` | `/activity YYYY-MM-DD` | `/activity username` — daily staff activity log"
+        "`/activity` | `/activity YYYY-MM-DD` | `/activity username` — daily staff activity log\n"
+        "`/debtor_history <bar|rooms> <name>` — full payment timeline for a debtor"
     )
     return staff_cmds + admin_cmds
 
@@ -464,19 +467,89 @@ async def cmd_pay_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if len(args) < 2:
         await _reply(
             update,
-            "Usage: `/pay_debtor <room|bar> <name>`\n"
-            "Example: `/pay_debtor bar john`\n"
-            "Example: `/pay_debtor rooms emeka`",
+            "Usage: `/pay_debtor <room|bar> <name> [amount]`\n"
+            "Full payment:    `/pay_debtor bar john`\n"
+            "Partial payment: `/pay_debtor bar john 5000`\n"
+            "Example rooms:   `/pay_debtor rooms emeka 10000`",
         )
         return
 
     account = args[0]
-    name = " ".join(args[1:])
+    amount: float | None = None
+
+    # If last arg is a number, treat it as the payment amount
+    if len(args) >= 3:
+        try:
+            parsed = float(args[-1])
+            if parsed > 0:
+                amount = parsed
+                name = " ".join(args[1:-1])
+            else:
+                name = " ".join(args[1:])
+        except ValueError:
+            name = " ".join(args[1:])
+    else:
+        name = args[1]
 
     user = update.effective_user
     paid_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_pay_debtor(account, name, paid_by=paid_by)
+    ok, msg = logic.process_pay_debtor(account, name, paid_by=paid_by, amount=amount)
     await _reply(update, msg)
+
+
+# ── /pay_debt ─────────────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_pay_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(
+            update,
+            "Usage: `/pay_debt <id> [amount]`\n"
+            "Full payment:    `/pay_debt 14`\n"
+            "Partial payment: `/pay_debt 14 5000`\n"
+            "_Get debt IDs from /debtors_",
+        )
+        return
+
+    try:
+        debt_id = int(args[0])
+    except ValueError:
+        await _reply(update, "❌ Debt ID must be a number. Get IDs from /debtors.")
+        return
+
+    amount: float | None = None
+    if len(args) >= 2:
+        amount, err = _to_float(args[1], "amount")
+        if err:
+            await _reply(update, err)
+            return
+
+    user = update.effective_user
+    paid_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_pay_debt_by_id(debt_id, paid_by=paid_by, amount=amount)
+    await _reply(update, msg)
+
+
+# ── /debtor_history ───────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_debtor_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/debtor_history <bar|rooms> <name>`\n"
+            "Example: `/debtor_history bar john`",
+        )
+        return
+    account = args[0].lower()
+    if account not in ("bar", "rooms"):
+        await _reply(update, "❌ Account must be `bar` or `rooms`.")
+        return
+    name = " ".join(args[1:])
+    text = reports.generate_debtor_history(account, name)
+    await _reply_long(update, text)
 
 
 # ── /debtors ──────────────────────────────────────────────────────────
@@ -488,7 +561,8 @@ async def cmd_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if account and account not in ("bar", "rooms"):
         await _reply(update, "Usage: `/debtors` or `/debtors bar` or `/debtors rooms`")
         return
-    text = reports.generate_debtors_report(account=account)
+    staff_view = not _is_admin(update.effective_user.id)
+    text = reports.generate_debtors_report(account=account, staff_view=staff_view)
     await _reply(update, text)
 
 
@@ -997,6 +1071,8 @@ def main() -> None:
     app.add_handler(CommandHandler("expense", cmd_expense))
     app.add_handler(CommandHandler("add_debtor", cmd_add_debtor))
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
+    app.add_handler(CommandHandler("pay_debt", cmd_pay_debt))
+    app.add_handler(CommandHandler("debtor_history", cmd_debtor_history))
     app.add_handler(CommandHandler("debtors", cmd_debtors))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("sales_report", cmd_sales_report))

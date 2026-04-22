@@ -115,16 +115,63 @@ def process_add_debtor(account: str, name: str, amount: float, description: str 
     )
 
 
-def process_pay_debtor(account: str, name: str, paid_by: str = "") -> tuple[bool, str]:
+def process_pay_debtor(account: str, name: str, paid_by: str = "", amount: float | None = None) -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if not name.strip():
         return False, "❌ Debtor name cannot be empty."
+    if amount is not None and amount <= 0:
+        return False, "❌ Payment amount must be a positive number."
 
-    updated = db.mark_debtor_paid(name.strip(), account.strip(), paid_by=paid_by)
-    if updated:
-        return True, f"✅ *{name.title()}* ({account.title()}) marked as paid."
-    return False, f"❌ No outstanding debt found for *{name.title()}* in *{account.title()}*."
+    result = db.mark_debtor_paid(name.strip(), account.strip(), paid_by=paid_by, amount=amount)
+    if result is None:
+        return False, f"❌ No outstanding debt found for *{name.title()}* in *{account.title()}*."
+    if result.get("error") == "overpayment":
+        return False, (
+            f"❌ Payment of ₦{amount:,.2f} exceeds remaining balance of "
+            f"*₦{result['remaining']:,.2f}* for *{name.title()}*."
+        )
+
+    if result["is_fully_paid"]:
+        return True, (
+            f"✅ *{name.title()}* ({account.title()}) — debt fully cleared.\n"
+            f"Paid: ₦{result['amount_paid_now']:,.2f} | Original: ₦{result['original_amount']:,.2f}"
+        )
+    return True, (
+        f"💳 Partial payment recorded for *{name.title()}* ({account.title()}).\n"
+        f"Paid now:   ₦{result['amount_paid_now']:,.2f}\n"
+        f"Total paid: ₦{result['total_paid']:,.2f} / ₦{result['original_amount']:,.2f}\n"
+        f"Still owes: *₦{result['remaining']:,.2f}*"
+    )
+
+
+def process_pay_debt_by_id(debt_id: int, paid_by: str = "", amount: float | None = None) -> tuple[bool, str]:
+    """Pay a specific debt by its row ID (partial or full)."""
+    if amount is not None and amount <= 0:
+        return False, "❌ Payment amount must be a positive number."
+
+    result = db.mark_debt_paid_by_id(debt_id, paid_by=paid_by, amount=amount)
+    if result is None:
+        return False, f"❌ Debt `#{debt_id}` not found or already cleared."
+    if result.get("error") == "overpayment":
+        return False, (
+            f"❌ Payment of ₦{amount:,.2f} exceeds remaining balance of "
+            f"*₦{result['remaining']:,.2f}* on debt `#{debt_id}`."
+        )
+
+    name = result["name"].title()
+    account = result["account"].title()
+    if result["is_fully_paid"]:
+        return True, (
+            f"✅ *{name}* ({account}) debt `#{debt_id}` fully cleared.\n"
+            f"Paid: ₦{result['amount_paid_now']:,.2f} | Original: ₦{result['original_amount']:,.2f}"
+        )
+    return True, (
+        f"💳 Partial payment on debt `#{debt_id}` — *{name}* ({account}).\n"
+        f"Paid now:   ₦{result['amount_paid_now']:,.2f}\n"
+        f"Total paid: ₦{result['total_paid']:,.2f} / ₦{result['original_amount']:,.2f}\n"
+        f"Still owes: *₦{result['remaining']:,.2f}*"
+    )
 
 
 # ── Restock ───────────────────────────────────────────────────────────

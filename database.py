@@ -127,8 +127,18 @@ def init_db() -> None:
         """))
         # Migrations: track who recorded expenses/debtors and who marked debts paid
         conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
-        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
-        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS paid_by     TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS recorded_by  TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS paid_by      TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS amount_paid  FLOAT DEFAULT 0"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS debtor_payments (
+                id          SERIAL PRIMARY KEY,
+                debtor_id   INTEGER,
+                timestamp   TEXT,
+                amount      FLOAT,
+                recorded_by TEXT DEFAULT ''
+            )
+        """))
         # Migrations: soft-delete support (void instead of hard delete)
         conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
@@ -253,26 +263,155 @@ def get_debtors(account: str | None = None) -> list[dict[str, Any]]:
     return df.to_dict(orient="records")
 
 
-def mark_debtor_paid(name: str, account: str, paid_by: str = "") -> bool:
+def mark_debtor_paid(name: str, account: str, paid_by: str = "", amount: float | None = None) -> dict[str, Any] | None:
     """
-    Mark the oldest outstanding debt for this name + account as paid.
-    Returns True if a row was updated, False if not found.
+    Apply a payment (partial or full) to the oldest outstanding debt for name+account.
+    If amount is None, pays the full remaining balance.
+    Returns a result dict, or None if no outstanding debt found.
     """
     engine = get_engine()
     with engine.connect() as conn:
-        result = conn.execute(text("""
-            UPDATE debtors SET status = 'paid', paid_at = :paid_at, paid_by = :paid_by
-            WHERE id = (
-                SELECT id FROM debtors
-                WHERE lower(name) = lower(:name)
-                  AND account = :account
-                  AND status  = 'outstanding'
-                ORDER BY timestamp ASC
-                LIMIT 1
-            )
-        """), {"paid_at": now_str(), "paid_by": paid_by, "name": name.strip(), "account": account.lower()})
+        row_result = conn.execute(text("""
+            SELECT * FROM debtors
+            WHERE lower(name) = lower(:name)
+              AND account = :account
+              AND status = 'outstanding'
+            ORDER BY timestamp ASC
+            LIMIT 1
+        """), {"name": name.strip(), "account": account.lower()})
+        row = row_result.fetchone()
+        if row is None:
+            return None
+
+        debt = dict(row._mapping)
+        debtor_id = int(debt["id"])
+        original = float(debt["amount"])
+        already_paid = float(debt.get("amount_paid") or 0)
+        remaining_before = round(original - already_paid, 2)
+
+        if amount is not None and round(amount, 2) > remaining_before:
+            return {"error": "overpayment", "remaining": remaining_before, "debtor_id": debtor_id}
+
+        pay_now = round(amount if amount is not None else remaining_before, 2)
+        new_total_paid = round(already_paid + pay_now, 2)
+        new_remaining = round(original - new_total_paid, 2)
+        is_fully_paid = new_remaining <= 0
+
+        if is_fully_paid:
+            conn.execute(text("""
+                UPDATE debtors SET
+                    amount_paid = :total_paid,
+                    status  = 'paid',
+                    paid_at = :paid_at,
+                    paid_by = :paid_by
+                WHERE id = :id
+            """), {"total_paid": new_total_paid, "paid_at": now_str(), "paid_by": paid_by, "id": debtor_id})
+        else:
+            conn.execute(text("""
+                UPDATE debtors SET amount_paid = :total_paid WHERE id = :id
+            """), {"total_paid": new_total_paid, "id": debtor_id})
+
+        conn.execute(text("""
+            INSERT INTO debtor_payments (debtor_id, timestamp, amount, recorded_by)
+            VALUES (:debtor_id, :ts, :amount, :recorded_by)
+        """), {"debtor_id": debtor_id, "ts": now_str(), "amount": pay_now, "recorded_by": paid_by})
+
         conn.commit()
-        return result.rowcount > 0
+
+    return {
+        "debtor_id": debtor_id,
+        "name": name.strip(),
+        "account": account.lower(),
+        "original_amount": original,
+        "amount_paid_now": pay_now,
+        "total_paid": new_total_paid,
+        "remaining": max(new_remaining, 0),
+        "is_fully_paid": is_fully_paid,
+    }
+
+
+def mark_debt_paid_by_id(debt_id: int, paid_by: str = "", amount: float | None = None) -> dict[str, Any] | None:
+    """
+    Apply a payment to a specific debt row by its ID.
+    Returns the same result dict as mark_debtor_paid, or None if not found / already paid.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        row_result = conn.execute(text("""
+            SELECT * FROM debtors WHERE id = :id AND status = 'outstanding'
+        """), {"id": debt_id})
+        row = row_result.fetchone()
+        if row is None:
+            return None
+
+        debt = dict(row._mapping)
+        original = float(debt["amount"])
+        already_paid = float(debt.get("amount_paid") or 0)
+        remaining_before = round(original - already_paid, 2)
+
+        if amount is not None and round(amount, 2) > remaining_before:
+            return {"error": "overpayment", "remaining": remaining_before, "debtor_id": debt_id}
+
+        pay_now = round(amount if amount is not None else remaining_before, 2)
+        new_total_paid = round(already_paid + pay_now, 2)
+        new_remaining = round(original - new_total_paid, 2)
+        is_fully_paid = new_remaining <= 0
+
+        if is_fully_paid:
+            conn.execute(text("""
+                UPDATE debtors SET
+                    amount_paid = :total_paid,
+                    status  = 'paid',
+                    paid_at = :paid_at,
+                    paid_by = :paid_by
+                WHERE id = :id
+            """), {"total_paid": new_total_paid, "paid_at": now_str(), "paid_by": paid_by, "id": debt_id})
+        else:
+            conn.execute(text("""
+                UPDATE debtors SET amount_paid = :total_paid WHERE id = :id
+            """), {"total_paid": new_total_paid, "id": debt_id})
+
+        conn.execute(text("""
+            INSERT INTO debtor_payments (debtor_id, timestamp, amount, recorded_by)
+            VALUES (:debtor_id, :ts, :amount, :recorded_by)
+        """), {"debtor_id": debt_id, "ts": now_str(), "amount": pay_now, "recorded_by": paid_by})
+
+        conn.commit()
+
+    return {
+        "debtor_id": debt_id,
+        "name": str(debt["name"]),
+        "account": str(debt["account"]),
+        "original_amount": original,
+        "amount_paid_now": pay_now,
+        "total_paid": new_total_paid,
+        "remaining": max(new_remaining, 0),
+        "is_fully_paid": is_fully_paid,
+    }
+
+
+def get_debtor_history(name: str, account: str) -> dict[str, Any]:
+    """Return all debts and payment events for a given person + account."""
+    engine = get_engine()
+    debts_df = pd.read_sql(
+        "SELECT * FROM debtors WHERE lower(name) = lower(%(name)s) AND account = %(account)s ORDER BY timestamp ASC",
+        engine, params={"name": name.strip(), "account": account.lower()},
+    )
+    debts = debts_df.to_dict(orient="records")
+    if not debts:
+        return {"debts": [], "payments": {}}
+
+    debtor_ids = [int(d["id"]) for d in debts]
+    payments_df = pd.read_sql(
+        "SELECT * FROM debtor_payments WHERE debtor_id = ANY(%(ids)s) ORDER BY timestamp ASC",
+        engine, params={"ids": debtor_ids},
+    )
+    payments_by_id: dict[int, list[dict]] = {}
+    for row in payments_df.to_dict(orient="records"):
+        did = int(row["debtor_id"])
+        payments_by_id.setdefault(did, []).append(row)
+
+    return {"debts": debts, "payments": payments_by_id}
 
 
 # ── Inventory operations ──────────────────────────────────────────────
