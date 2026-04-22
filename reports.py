@@ -24,6 +24,13 @@ def _fmt(amount: float) -> str:
     return f"₦{amount:,.0f}"
 
 
+def _esc(text: str) -> str:
+    """Escape MarkdownV1 special characters in user-provided text."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 # ── Core aggregations ─────────────────────────────────────────────────
 
 def _sum_revenue(rows: list[dict], key: str = "total_revenue") -> float:
@@ -321,7 +328,7 @@ def generate_expense_report(
         if salary_rows:
             out.append(f"  👤 *Salary* — {_fmt(salary_total)}")
             for e in salary_rows:
-                note = f" _{e['description']}_" if e.get("description") else ""
+                note = f" _{_esc(str(e['description']))}_" if e.get("description") else ""
                 ts = e.get("timestamp", "")[:10]
                 out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
             cat_total += salary_total
@@ -337,7 +344,7 @@ def generate_expense_report(
             cat_total += cat_sum
             out.append(f"  *{cat}* — {_fmt(cat_sum)}")
             for e in entries:
-                note = f" _{e['description']}_" if e.get("description") else ""
+                note = f" _{_esc(str(e['description']))}_" if e.get("description") else ""
                 ts = e.get("timestamp", "")[:10]
                 out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
 
@@ -753,12 +760,13 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
 
     def _debt_lines(r: dict) -> list[str]:
         did = r["id"]
-        note = f" — {r['description']}" if r.get("description") else ""
+        name = _esc(str(r["name"]).title())
+        note = f" — {_esc(str(r['description']))}" if r.get("description") else ""
         age = _debt_age(r.get("timestamp", ""))
         original = float(r["amount"])
         paid = float(r.get("amount_paid") or 0)
         rem = round(original - paid, 2)
-        out = [f"  • `[#{did}]` {r['name'].title()}: {_fmt(original)}{note}{age}"]
+        out = [f"  • `[#{did}]` {name}: {_fmt(original)}{note}{age}"]
         if paid > 0:
             out.append(f"      Paid: {_fmt(paid)} | *Remaining: {_fmt(rem)}*")
         return out
@@ -950,9 +958,9 @@ def generate_debtor_history(account: str, name: str) -> str:
         status = debt["status"]
         ts = str(debt.get("timestamp", ""))[:10]
         desc = debt.get("description", "")
-        desc_note = f" — {desc}" if desc else ""
 
         icon = "✅" if status == "paid" else "🔴"
+        desc_note = f" — {_esc(desc)}" if desc else ""
         lines.append(f"{icon} `[#{did}]` Opened {ts}: *{_fmt(original)}*{desc_note}")
 
         for p in payments_by_id.get(did, []):
@@ -1036,34 +1044,34 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
                 void_suffix = f" [VOIDED {void_time} by {voided_by}]"
 
             if etype == "sale":
-                drink = str(e.get("drink_name", "?")).title()
+                drink = _esc(str(e.get("drink_name", "?")).title())
                 qty = int(e.get("quantity", 0))
                 total = float(e.get("total_revenue", 0))
                 icon = "🔴" if is_voided else "🍺"
                 lines.append(f"  {time_str}  {icon} Sold {qty}× {drink} — {_fmt(total)}{void_suffix}")
             elif etype == "room":
-                rtype = str(e.get("room_type", "?")).title()
+                rtype = _esc(str(e.get("room_type", "?")).title())
                 qty = int(e.get("quantity", 0))
                 nights = int(e.get("nights", 0))
                 total = float(e.get("total_revenue", 0))
                 icon = "🔴" if is_voided else "🏨"
                 lines.append(f"  {time_str}  {icon} Room: {qty}× {rtype}, {nights}n — {_fmt(total)}{void_suffix}")
             elif etype == "expense":
-                acct = str(e.get("account", "?")).title()
-                cat = str(e.get("category", "?")).title()
+                acct = _esc(str(e.get("account", "?")).title())
+                cat = _esc(str(e.get("category", "?")).title())
                 amt = float(e.get("amount", 0))
-                desc = e.get("description", "")
+                desc = _esc(str(e.get("description", "") or ""))
                 desc_note = f' "{desc}"' if desc else ""
                 icon = "🔴" if is_voided else "💸"
                 lines.append(f"  {time_str}  {icon} Expense [{acct}/{cat}] {_fmt(amt)}{desc_note}{void_suffix}")
             elif etype == "debtor_add":
-                acct = str(e.get("account", "?")).title()
-                name = str(e.get("name", "?")).title()
+                acct = _esc(str(e.get("account", "?")).title())
+                name = _esc(str(e.get("name", "?")).title())
                 amt = float(e.get("amount", 0))
                 lines.append(f"  {time_str}  🧾 Added debtor: {name} ({acct}) — {_fmt(amt)}")
             elif etype == "debtor_pay":
-                acct = str(e.get("account", "?")).title()
-                name = str(e.get("name", "?")).title()
+                acct = _esc(str(e.get("account", "?")).title())
+                name = _esc(str(e.get("name", "?")).title())
                 amt = float(e.get("amount", 0))
                 lines.append(f"  {time_str}  ✅ Paid debtor: {name} ({acct}) — {_fmt(amt)}")
             elif etype == "transfer":
