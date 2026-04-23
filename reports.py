@@ -792,7 +792,7 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
     if overdue:
         lines.append(f"⚠️ {len(overdue)} debt(s) outstanding for 7+ days — follow up needed.")
     if not staff_view:
-        lines.append("_Use /pay_debt <id> [amount] to pay a specific debt._")
+        lines.append("_Use_ `/pay_debt <id> [amount]` _to pay a specific debt._")
     lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
@@ -1063,7 +1063,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
                 desc = _esc(str(e.get("description", "") or ""))
                 desc_note = f' "{desc}"' if desc else ""
                 icon = "🔴" if is_voided else "💸"
-                lines.append(f"  {time_str}  {icon} Expense [{acct}/{cat}] {_fmt(amt)}{desc_note}{void_suffix}")
+                lines.append(f"  {time_str}  {icon} Expense {acct}/{cat} {_fmt(amt)}{desc_note}{void_suffix}")
             elif etype == "debtor_add":
                 acct = _esc(str(e.get("account", "?")).title())
                 name = _esc(str(e.get("name", "?")).title())
