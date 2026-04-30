@@ -276,6 +276,16 @@ def update_debt_staff_name(debt_id: int, staff_name: str) -> bool:
         return result.rowcount > 0
 
 
+def get_debts_by_staff(staff_name: str) -> list[dict[str, Any]]:
+    """Return all outstanding debts attributed to a staff member."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT * FROM debtors WHERE lower(staff_name) = lower(%(staff)s) AND status = 'outstanding' ORDER BY timestamp ASC",
+        engine, params={"staff": staff_name.strip()},
+    )
+    return df.to_dict(orient="records")
+
+
 def get_outstanding_by_name(name: str) -> list[dict[str, Any]]:
     """Return all outstanding debts for a person across both accounts."""
     engine = get_engine()

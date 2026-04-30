@@ -242,6 +242,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/dailyreport on|off`\n"
         "`/activity` | `/activity YYYY-MM-DD` | `/activity username` — daily staff activity log\n"
         "`/debtor_history <bar|rooms> <name>` — full payment timeline for a debtor\n"
+        "`/debtor_staff <staff>` — all outstanding debts attributed to a staff member\n"
         "`/set_debt_staff <id> <staff>` — assign staff to an existing debt (IDs from /debtors)"
     )
     return staff_cmds + admin_cmds
@@ -541,6 +542,24 @@ async def cmd_pay_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     paid_by = user.username or user.first_name or str(user.id)
     ok, msg = logic.process_pay_debt_by_id(debt_id, paid_by=paid_by, amount=amount)
     await _reply(update, msg)
+
+
+# ── /debtor_staff ─────────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_debtor_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(
+            update,
+            "Usage: `/debtor_staff <staff name>`\n"
+            "Example: `/debtor_staff bola`\n"
+            "Shows all outstanding debts attributed to that staff member.",
+        )
+        return
+    staff_name = " ".join(args)
+    text = reports.generate_staff_debtors(staff_name)
+    await _reply(update, text)
 
 
 # ── /set_debt_staff ───────────────────────────────────────────────────
@@ -1130,6 +1149,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add_debtor", cmd_add_debtor))
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
     app.add_handler(CommandHandler("pay_debt", cmd_pay_debt))
+    app.add_handler(CommandHandler("debtor_staff", cmd_debtor_staff))
     app.add_handler(CommandHandler("set_debt_staff", cmd_set_debt_staff))
     app.add_handler(CommandHandler("debtor_history", cmd_debtor_history))
     app.add_handler(CommandHandler("debtor", cmd_debtor))

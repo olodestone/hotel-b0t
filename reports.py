@@ -853,6 +853,58 @@ def generate_debtor_lookup(name: str) -> str:
     return "\n".join(lines)
 
 
+# ── Staff debtor report ───────────────────────────────────────────────
+
+def generate_staff_debtors(staff_name: str) -> str:
+    """All outstanding debts attributed to a specific staff member."""
+    rows = db.get_debts_by_staff(staff_name)
+    display = _esc(staff_name.title())
+
+    if not rows:
+        return f"✅ No outstanding debts attributed to *{display}*."
+
+    bar_rows  = [r for r in rows if r["account"] == "bar"]
+    room_rows = [r for r in rows if r["account"] == "rooms"]
+
+    def _remaining(r: dict) -> float:
+        return round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
+
+    def _debt_line(r: dict) -> list[str]:
+        did      = r["id"]
+        customer = _esc(str(r["name"]).title())
+        note     = f" — {_esc(str(r['description']))}" if r.get("description") else ""
+        age      = _debt_age(r.get("timestamp", ""))
+        original = float(r["amount"])
+        paid     = float(r.get("amount_paid") or 0)
+        rem      = round(original - paid, 2)
+        out = [f"  • `[#{did}]` {customer}: {_fmt(original)}{note}{age}"]
+        if paid > 0:
+            out.append(f"      Paid: {_fmt(paid)} | *Remaining: {_fmt(rem)}*")
+        return out
+
+    lines = [f"🏨 *{HOTEL_NAME} — Debtors under {display}*", _SEP]
+
+    if bar_rows:
+        lines.append("🍺 *BAR*")
+        for r in bar_rows:
+            lines.extend(_debt_line(r))
+        lines.append(f"  *Total: {_fmt(sum(_remaining(r) for r in bar_rows))}*")
+        lines.append("")
+
+    if room_rows:
+        lines.append("🛏 *ROOMS*")
+        for r in room_rows:
+            lines.extend(_debt_line(r))
+        lines.append(f"  *Total: {_fmt(sum(_remaining(r) for r in room_rows))}*")
+        lines.append("")
+
+    grand = sum(_remaining(r) for r in rows)
+    lines.append(_SEP)
+    lines.append(f"*Total outstanding under {display}: {_fmt(grand)}*")
+    lines.append("_Use_ `/pay_debt <id> [amount]` _to pay a specific debt._")
+    return "\n".join(lines)
+
+
 # ── Stock report ──────────────────────────────────────────────────────
 
 def generate_stock_report(staff_view: bool = False) -> str:
