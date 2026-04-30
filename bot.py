@@ -236,7 +236,6 @@ def _help_text(is_admin: bool = False) -> str:
         "`/debtor_history <bar|rooms> <name>` — full payment timeline\n"
         "`/debtor_staff <staff>` — all debts under a staff member\n"
         "`/history` | `/history YYYY-MM-DD` — daily entry log\n"
-        "`/report` | `/report today` | `/report YYYY-MM` — revenue report\n"
         "`/summary` | `/summary YYYY-MM-DD` — detailed daily overview\n"
         "\n"
         "_Tip: add a date to backdate any recording — e.g._ `/sell_drink heineken 3 2026-04-29`"
@@ -255,6 +254,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/delete <sale|room|expense> <id>`\n"
         "`/setprice <drink> <price>`\n"
         "`/setroomtype <type> <price>` — set room type preset price\n"
+        "`/report` | `/report today` | `/report YYYY-MM` | `/report all`\n"
         "`/sales_report` | `/expense_report` | `/staff_report` | `/allocation`\n"
         "`/setallocation <key> <percent>`\n"
         "`/setthreshold <drink> <amount>`\n"
@@ -715,7 +715,7 @@ async def cmd_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /report ───────────────────────────────────────────────────────────
 
-@_require_auth
+@_require_admin
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from datetime import datetime
     args = _parse_args(ctx)
@@ -1219,7 +1219,7 @@ def _drink_keyboard() -> InlineKeyboardMarkup:
         in_stock = [i["drink"].title() for i in items]
     rows: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
-    for d in in_stock[:16]:
+    for d in in_stock:
         row.append(InlineKeyboardButton(d, callback_data=f"sd:{d.lower()}"))
         if len(row) == 2:
             rows.append(row); row = []
