@@ -39,12 +39,16 @@ import re
 from datetime import time as dtime
 
 import pytz
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import database as db
@@ -66,6 +70,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["🍺 Sell", "🛏 Book Room"], ["📋 Today", "📦 Stock"]],
+    resize_keyboard=True,
+)
 
 # ── Access helpers ────────────────────────────────────────────────────
 
@@ -180,7 +189,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     already = db.get_user(uid)
     if already:
         role = already.get("role", "staff")
-        await _reply(update, f"👋 Welcome back, *{username}*! Role: _{role}_")
+        await update.message.reply_text(
+            f"👋 Welcome back, *{username}*! Role: _{role}_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
     # First-ever user becomes admin if no ADMIN_IDS configured
@@ -207,10 +220,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def _help_text(is_admin: bool = False) -> str:
     staff_cmds = (
         "*📌 Recording*\n"
-        "`/sell_drink <drink> <qty>` — record a bar sale\n"
-        "`/room <type> <qty> <nights>` — record a room booking _(uses preset price)_\n"
-        "`/room <type> <qty> <price> <nights>` — room booking with custom price\n"
+        "`/sell` — 🍺 tap-to-sell guided flow _(easiest)_\n"
+        "`/book` — 🛏 tap-to-book room guided flow _(easiest)_\n"
+        "`/sell_drink <drink> <qty>` — quick text sale\n"
+        "`/room <type> <qty> <nights>` — quick text room booking\n"
         "`/undo` — undo your last entry within 2 minutes\n"
+        "`/cancel` — cancel a guided flow\n"
         "\n"
         "*📊 Viewing*\n"
         "`/today` — quick shift snapshot _(revenue, top sellers, debtors, stock)_\n"
@@ -1189,6 +1204,279 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("⚠️ An unexpected error occurred. Please try again.")
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ── Guided tap flows ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+
+_SELL_DRINK, _SELL_DRINK_TEXT, _SELL_QTY, _SELL_QTY_TEXT = range(4)
+_BOOK_TYPE, _BOOK_TYPE_TEXT, _BOOK_QTY, _BOOK_QTY_TEXT, _BOOK_NIGHTS, _BOOK_NIGHTS_TEXT = range(4, 10)
+
+
+def _drink_keyboard() -> InlineKeyboardMarkup:
+    items = inv.get_inventory_summary()
+    in_stock = [i["drink"].title() for i in items if i["bar_stock"] > 0]
+    if not in_stock:
+        in_stock = [i["drink"].title() for i in items]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for d in in_stock[:16]:
+        row.append(InlineKeyboardButton(d, callback_data=f"sd:{d.lower()}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Other drink", callback_data="sd:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _qty_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"{prefix}:{n}") for n in (1, 2, 3)],
+        [InlineKeyboardButton(str(n), callback_data=f"{prefix}:{n}") for n in (6, 12)],
+        [InlineKeyboardButton("✏️ Other", callback_data=f"{prefix}:__other__")],
+    ])
+
+
+def _nights_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"bn:{n}") for n in (1, 2, 3)],
+        [InlineKeyboardButton(str(n), callback_data=f"bn:{n}") for n in (4, 5, 7)],
+        [InlineKeyboardButton("✏️ Other", callback_data="bn:__other__")],
+    ])
+
+
+def _room_type_keyboard() -> InlineKeyboardMarkup:
+    presets = db.get_all_room_type_prices()
+    rows = []
+    for p in presets:
+        label = f"{p['room_type']} — ₦{int(p['price']):,}/night"
+        rows.append([InlineKeyboardButton(label, callback_data=f"bt:{p['room_type'].lower()}")])
+    rows.append([InlineKeyboardButton("✏️ Other type", callback_data="bt:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.clear()
+    if update.message:
+        await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# ── /sell guided flow ─────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_sell_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text(
+        "🍺 *Which drink?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_drink_keyboard(),
+    )
+    return _SELL_DRINK
+
+
+async def _sell_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data[3:]
+    if drink == "__other__":
+        await q.edit_message_text("Type the drink name:")
+        return _SELL_DRINK_TEXT
+    ctx.user_data["sell_drink"] = drink
+    await q.edit_message_text(
+        f"🍺 *{drink.title()}* — how many?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_qty_keyboard("sq"),
+    )
+    return _SELL_QTY
+
+
+async def _sell_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    drink = update.message.text.strip().lower()
+    ctx.user_data["sell_drink"] = drink
+    await update.message.reply_text(
+        f"🍺 *{drink.title()}* — how many?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_qty_keyboard("sq"),
+    )
+    return _SELL_QTY
+
+
+async def _sell_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[3:]
+    if val == "__other__":
+        await q.edit_message_text("How many? (type a number)")
+        return _SELL_QTY_TEXT
+    await q.edit_message_text(f"🍺 {val}× {ctx.user_data.get('sell_drink', '').title()}")
+    return await _do_sell(update, ctx, int(val))
+
+
+async def _sell_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        qty = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number:")
+        return _SELL_QTY_TEXT
+    return await _do_sell(update, ctx, qty)
+
+
+async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, qty: int) -> int:
+    drink = ctx.user_data.pop("sell_drink", "")
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg, alert = logic.process_drink_sale(drink, qty, recorded_by=recorded_by)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+    if ok and alert:
+        for admin_id in ADMIN_IDS:
+            if admin_id != user.id:
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"⚠️ *Low Stock Alert*\n_{recorded_by} sold {qty}× {drink}_\n\n{alert}",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+    return ConversationHandler.END
+
+
+# ── /book guided flow ─────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_book_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    presets = db.get_all_room_type_prices()
+    if not presets:
+        await update.effective_message.reply_text(
+            "No room types configured yet.\nAsk admin to run: `/setroomtype standard 15000`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.effective_message.reply_text(
+        "🛏 *Room type?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_room_type_keyboard(),
+    )
+    return _BOOK_TYPE
+
+
+async def _book_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    rtype = q.data[3:]
+    if rtype == "__other__":
+        await q.edit_message_text("Type the room type:")
+        return _BOOK_TYPE_TEXT
+    ctx.user_data["book_type"] = rtype
+    await q.edit_message_text(
+        f"🛏 *{rtype.title()}* — how many rooms?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_qty_keyboard("bq"),
+    )
+    return _BOOK_QTY
+
+
+async def _book_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    rtype = update.message.text.strip().lower()
+    ctx.user_data["book_type"] = rtype
+    await update.message.reply_text(
+        f"🛏 *{rtype.title()}* — how many rooms?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_qty_keyboard("bq"),
+    )
+    return _BOOK_QTY
+
+
+async def _book_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[3:]
+    if val == "__other__":
+        await q.edit_message_text("How many rooms? (type a number)")
+        return _BOOK_QTY_TEXT
+    ctx.user_data["book_qty"] = int(val)
+    rtype = ctx.user_data.get("book_type", "room")
+    await q.edit_message_text(
+        f"🛏 {val}× *{rtype.title()}* — how many nights?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_nights_keyboard(),
+    )
+    return _BOOK_NIGHTS
+
+
+async def _book_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        qty = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number:")
+        return _BOOK_QTY_TEXT
+    ctx.user_data["book_qty"] = qty
+    rtype = ctx.user_data.get("book_type", "room")
+    await update.message.reply_text(
+        f"🛏 {qty}× *{rtype.title()}* — how many nights?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_nights_keyboard(),
+    )
+    return _BOOK_NIGHTS
+
+
+async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[3:]
+    if val == "__other__":
+        await q.edit_message_text("How many nights? (type a number)")
+        return _BOOK_NIGHTS_TEXT
+    await q.edit_message_text(
+        f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {val} nights"
+    )
+    return await _do_book(update, ctx, int(val))
+
+
+async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        nights = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number:")
+        return _BOOK_NIGHTS_TEXT
+    return await _do_book(update, ctx, nights)
+
+
+async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, nights: int) -> int:
+    rtype = ctx.user_data.pop("book_type", "")
+    qty   = ctx.user_data.pop("book_qty", 1)
+    user  = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    price = db.get_room_type_price(rtype)
+    if price is None:
+        await update.effective_chat.send_message(
+            f"❌ No preset price for *{rtype.title()}*.\nAsk admin: `/setroomtype {rtype} <price>`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    ok, msg = logic.process_room_sale(rtype, qty, price, nights, recorded_by=recorded_by)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# ── Keyboard shortcut handlers ────────────────────────────────────────
+
+@_require_auth
+async def _btn_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    staff_view = not _is_admin(update.effective_user.id)
+    text = reports.generate_daily_summary(target=None, staff_view=staff_view)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+
+
+@_require_auth
+async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    staff_view = not _is_admin(update.effective_user.id)
+    text = reports.generate_stock_report(staff_view=staff_view)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1200,7 +1488,42 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # Register handlers — ConversationHandlers FIRST so they capture their entry points
+    sell_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("sell", cmd_sell_start),
+            MessageHandler(filters.Text(["🍺 Sell"]) & ~filters.COMMAND, cmd_sell_start),
+        ],
+        states={
+            _SELL_DRINK:      [CallbackQueryHandler(_sell_pick_drink, pattern="^sd:")],
+            _SELL_DRINK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_drink_text)],
+            _SELL_QTY:        [CallbackQueryHandler(_sell_pick_qty, pattern="^sq:")],
+            _SELL_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_qty_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    book_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("book", cmd_book_start),
+            MessageHandler(filters.Text(["🛏 Book Room"]) & ~filters.COMMAND, cmd_book_start),
+        ],
+        states={
+            _BOOK_TYPE:        [CallbackQueryHandler(_book_pick_type, pattern="^bt:")],
+            _BOOK_TYPE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_type_text)],
+            _BOOK_QTY:         [CallbackQueryHandler(_book_pick_qty, pattern="^bq:")],
+            _BOOK_QTY_TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_qty_text)],
+            _BOOK_NIGHTS:      [CallbackQueryHandler(_book_pick_nights, pattern="^bn:")],
+            _BOOK_NIGHTS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_nights_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    app.add_handler(sell_conv)
+    app.add_handler(book_conv)
+    app.add_handler(MessageHandler(filters.Text(["📋 Today"]) & ~filters.COMMAND, _btn_today))
+    app.add_handler(MessageHandler(filters.Text(["📦 Stock"]) & ~filters.COMMAND, _btn_stock))
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))
