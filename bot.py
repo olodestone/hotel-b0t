@@ -585,7 +585,7 @@ async def cmd_set_debt_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     staff_name = " ".join(args[1:])
     updated = db.update_debt_staff_name(debt_id, staff_name)
     if updated:
-        await _reply(update, f"✅ Debt `#{debt_id}` — staff set to *{_esc(staff_name.title())}*.")
+        await _reply(update, f"✅ Debt `#{debt_id}` — staff set to *{staff_name.title()}*.")
     else:
         await _reply(update, f"❌ No debt found with ID `#{debt_id}`.")
 
