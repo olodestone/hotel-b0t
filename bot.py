@@ -241,7 +241,8 @@ def _help_text(is_admin: bool = False) -> str:
         "`/removestaff <user_id>`\n"
         "`/dailyreport on|off`\n"
         "`/activity` | `/activity YYYY-MM-DD` | `/activity username` — daily staff activity log\n"
-        "`/debtor_history <bar|rooms> <name>` — full payment timeline for a debtor"
+        "`/debtor_history <bar|rooms> <name>` — full payment timeline for a debtor\n"
+        "`/set_debt_staff <id> <staff>` — assign staff to an existing debt (IDs from /debtors)"
     )
     return staff_cmds + admin_cmds
 
@@ -540,6 +541,34 @@ async def cmd_pay_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     paid_by = user.username or user.first_name or str(user.id)
     ok, msg = logic.process_pay_debt_by_id(debt_id, paid_by=paid_by, amount=amount)
     await _reply(update, msg)
+
+
+# ── /set_debt_staff ───────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_set_debt_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/set_debt_staff <id> <staff name>`\n"
+            "Example: `/set_debt_staff 12 bola`\n"
+            "_Get debt IDs from /debtors_",
+        )
+        return
+
+    try:
+        debt_id = int(args[0])
+    except ValueError:
+        await _reply(update, "❌ Debt ID must be a number. Get IDs from /debtors.")
+        return
+
+    staff_name = " ".join(args[1:])
+    updated = db.update_debt_staff_name(debt_id, staff_name)
+    if updated:
+        await _reply(update, f"✅ Debt `#{debt_id}` — staff set to *{_esc(staff_name.title())}*.")
+    else:
+        await _reply(update, f"❌ No debt found with ID `#{debt_id}`.")
 
 
 # ── /debtor_history ───────────────────────────────────────────────────
@@ -1101,6 +1130,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add_debtor", cmd_add_debtor))
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
     app.add_handler(CommandHandler("pay_debt", cmd_pay_debt))
+    app.add_handler(CommandHandler("set_debt_staff", cmd_set_debt_staff))
     app.add_handler(CommandHandler("debtor_history", cmd_debtor_history))
     app.add_handler(CommandHandler("debtor", cmd_debtor))
     app.add_handler(CommandHandler("debtors", cmd_debtors))

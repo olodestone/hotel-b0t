@@ -264,6 +264,18 @@ def get_debtors(account: str | None = None) -> list[dict[str, Any]]:
     return df.to_dict(orient="records")
 
 
+def update_debt_staff_name(debt_id: int, staff_name: str) -> bool:
+    """Set or update staff_name on a debt record. Returns True if a row was updated."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("UPDATE debtors SET staff_name = :staff WHERE id = :id"),
+            {"staff": staff_name.strip(), "id": debt_id},
+        )
+        conn.commit()
+        return result.rowcount > 0
+
+
 def get_outstanding_by_name(name: str) -> list[dict[str, Any]]:
     """Return all outstanding debts for a person across both accounts."""
     engine = get_engine()
