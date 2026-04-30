@@ -1208,8 +1208,8 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None
 # ── Guided tap flows ──────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 
-_SELL_DRINK, _SELL_DRINK_TEXT, _SELL_QTY, _SELL_QTY_TEXT = range(4)
-_BOOK_TYPE, _BOOK_TYPE_TEXT, _BOOK_QTY, _BOOK_QTY_TEXT, _BOOK_NIGHTS, _BOOK_NIGHTS_TEXT = range(4, 10)
+_SELL_DRINK, _SELL_DRINK_TEXT, _SELL_QTY, _SELL_QTY_TEXT, _SELL_DATE, _SELL_DATE_TEXT = range(6)
+_BOOK_TYPE, _BOOK_TYPE_TEXT, _BOOK_QTY, _BOOK_QTY_TEXT, _BOOK_NIGHTS, _BOOK_NIGHTS_TEXT, _BOOK_DATE, _BOOK_DATE_TEXT = range(6, 14)
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -1253,6 +1253,13 @@ def _room_type_keyboard() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(label, callback_data=f"bt:{p['room_type'].lower()}")])
     rows.append([InlineKeyboardButton("✏️ Other type", callback_data="bt:__other__")])
     return InlineKeyboardMarkup(rows)
+
+
+def _date_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Today", callback_data=f"{prefix}:today"),
+        InlineKeyboardButton("📅 Different date", callback_data=f"{prefix}:other"),
+    ]])
 
 
 async def _cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1308,8 +1315,13 @@ async def _sell_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if val == "__other__":
         await q.edit_message_text("How many? (type a number)")
         return _SELL_QTY_TEXT
-    await q.edit_message_text(f"🍺 {val}× {ctx.user_data.get('sell_drink', '').title()}")
-    return await _do_sell(update, ctx, int(val))
+    ctx.user_data["sell_qty"] = int(val)
+    await q.edit_message_text(
+        f"🍺 {val}× {ctx.user_data.get('sell_drink', '').title()} — when?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_date_keyboard("sdd"),
+    )
+    return _SELL_DATE
 
 
 async def _sell_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1318,14 +1330,43 @@ async def _sell_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     except ValueError:
         await update.message.reply_text("❌ Enter a whole number:")
         return _SELL_QTY_TEXT
-    return await _do_sell(update, ctx, qty)
+    ctx.user_data["sell_qty"] = qty
+    drink = ctx.user_data.get("sell_drink", "")
+    await update.message.reply_text(
+        f"🍺 {qty}× {drink.title()} — when?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_date_keyboard("sdd"),
+    )
+    return _SELL_DATE
 
 
-async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, qty: int) -> int:
+async def _sell_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]  # strip "sdd:"
+    if val == "other":
+        await q.edit_message_text("Enter date (YYYY-MM-DD):")
+        return _SELL_DATE_TEXT
+    await q.edit_message_text("📝 Recording...")
+    return await _do_sell(update, ctx, timestamp=None)
+
+
+async def _sell_date_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not _DATE_RE.match(text):
+        await update.message.reply_text("❌ Use format YYYY-MM-DD (e.g. 2026-04-28):")
+        return _SELL_DATE_TEXT
+    return await _do_sell(update, ctx, timestamp=text)
+
+
+async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: str | None = None) -> int:
     drink = ctx.user_data.pop("sell_drink", "")
-    user = update.effective_user
+    qty   = ctx.user_data.pop("sell_qty", 1)
+    user  = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg, alert = logic.process_drink_sale(drink, qty, recorded_by=recorded_by)
+    ok, msg, alert = logic.process_drink_sale(drink, qty, timestamp=timestamp, recorded_by=recorded_by)
+    if timestamp and ok:
+        msg += f"\n_(recorded for {timestamp})_"
     await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
     if ok and alert:
         for admin_id in ADMIN_IDS:
@@ -1428,10 +1469,13 @@ async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     if val == "__other__":
         await q.edit_message_text("How many nights? (type a number)")
         return _BOOK_NIGHTS_TEXT
+    ctx.user_data["book_nights"] = int(val)
     await q.edit_message_text(
-        f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {val} nights"
+        f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {val} nights — when?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_date_keyboard("bdd"),
     )
-    return await _do_book(update, ctx, int(val))
+    return _BOOK_DATE
 
 
 async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1440,13 +1484,39 @@ async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     except ValueError:
         await update.message.reply_text("❌ Enter a whole number:")
         return _BOOK_NIGHTS_TEXT
-    return await _do_book(update, ctx, nights)
+    ctx.user_data["book_nights"] = nights
+    await update.message.reply_text(
+        f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {nights} nights — when?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_date_keyboard("bdd"),
+    )
+    return _BOOK_DATE
 
 
-async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, nights: int) -> int:
-    rtype = ctx.user_data.pop("book_type", "")
-    qty   = ctx.user_data.pop("book_qty", 1)
-    user  = update.effective_user
+async def _book_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]  # strip "bdd:"
+    if val == "other":
+        await q.edit_message_text("Enter date (YYYY-MM-DD):")
+        return _BOOK_DATE_TEXT
+    await q.edit_message_text("📝 Recording...")
+    return await _do_book(update, ctx, timestamp=None)
+
+
+async def _book_date_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not _DATE_RE.match(text):
+        await update.message.reply_text("❌ Use format YYYY-MM-DD (e.g. 2026-04-28):")
+        return _BOOK_DATE_TEXT
+    return await _do_book(update, ctx, timestamp=text)
+
+
+async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: str | None = None) -> int:
+    rtype  = ctx.user_data.pop("book_type", "")
+    qty    = ctx.user_data.pop("book_qty", 1)
+    nights = ctx.user_data.pop("book_nights", 1)
+    user   = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
     price = db.get_room_type_price(rtype)
     if price is None:
@@ -1456,7 +1526,7 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, nights: int) 
             reply_markup=MAIN_KEYBOARD,
         )
         return ConversationHandler.END
-    ok, msg = logic.process_room_sale(rtype, qty, price, nights, recorded_by=recorded_by)
+    ok, msg = logic.process_room_sale(rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
     await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -1499,6 +1569,8 @@ def main() -> None:
             _SELL_DRINK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_drink_text)],
             _SELL_QTY:        [CallbackQueryHandler(_sell_pick_qty, pattern="^sq:")],
             _SELL_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_qty_text)],
+            _SELL_DATE:       [CallbackQueryHandler(_sell_pick_date, pattern="^sdd:")],
+            _SELL_DATE_TEXT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_date_text)],
         },
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
@@ -1515,6 +1587,8 @@ def main() -> None:
             _BOOK_QTY_TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_qty_text)],
             _BOOK_NIGHTS:      [CallbackQueryHandler(_book_pick_nights, pattern="^bn:")],
             _BOOK_NIGHTS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_nights_text)],
+            _BOOK_DATE:        [CallbackQueryHandler(_book_pick_date, pattern="^bdd:")],
+            _BOOK_DATE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_date_text)],
         },
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
