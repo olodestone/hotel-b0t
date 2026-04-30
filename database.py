@@ -251,16 +251,19 @@ def record_debtor(account: str, name: str, amount: float, description: str = "",
         conn.commit()
 
 
-def get_debtors(account: str | None = None) -> list[dict[str, Any]]:
-    """Return all outstanding debtor rows, optionally filtered by account."""
+def get_debtors(account: str | None = None, month: str | None = None) -> list[dict[str, Any]]:
+    """Return all outstanding debtor rows, optionally filtered by account and/or month (YYYY-MM)."""
     engine = get_engine()
+    clauses = ["status = 'outstanding'"]
+    params: dict[str, Any] = {}
     if account:
-        df = pd.read_sql(
-            "SELECT * FROM debtors WHERE status = 'outstanding' AND account = %(account)s",
-            engine, params={"account": account.lower()},
-        )
-    else:
-        df = pd.read_sql("SELECT * FROM debtors WHERE status = 'outstanding'", engine)
+        clauses.append("account = %(account)s")
+        params["account"] = account.lower()
+    if month:
+        clauses.append("timestamp LIKE %(month)s")
+        params["month"] = f"{month}%"
+    where = " AND ".join(clauses)
+    df = pd.read_sql(f"SELECT * FROM debtors WHERE {where} ORDER BY timestamp ASC", engine, params=params or None)
     return df.to_dict(orient="records")
 
 

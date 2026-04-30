@@ -740,21 +740,20 @@ def _debt_age(timestamp_str: str) -> str:
     return f" _({days} days, {date_str}){flag}_"
 
 
-def generate_debtors_report(account: str | None = None, staff_view: bool = False) -> str:
-    """List all outstanding debtors, optionally filtered to one account."""
-    rows = db.get_debtors(account=account)
+def generate_debtors_report(account: str | None = None, staff_view: bool = False, month: str | None = None) -> str:
+    """List all outstanding debtors, optionally filtered to one account and/or month."""
+    rows = db.get_debtors(account=account, month=month)
 
+    acct_label  = f"{account.title()} " if account else ""
+    month_label = f" — {month}" if month else ""
     if not rows:
-        label = f"{account.title()} " if account else ""
-        return f"✅ No outstanding {label}debtors."
+        return f"✅ No outstanding {acct_label}debtors{month_label}."
 
     bar_rows = [r for r in rows if r["account"] == "bar"]
     room_rows = [r for r in rows if r["account"] == "rooms"]
 
-    lines = [
-        f"🏨 *{HOTEL_NAME} — Outstanding Debtors*",
-        _SEP,
-    ]
+    title = f"🏨 *{HOTEL_NAME} — {acct_label}Debtors{month_label}*" if (account or month) else f"🏨 *{HOTEL_NAME} — Outstanding Debtors*"
+    lines = [title, _SEP]
 
     def _remaining(r: dict) -> float:
         return round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)

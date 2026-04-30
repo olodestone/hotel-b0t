@@ -209,7 +209,7 @@ def _help_text(is_admin: bool = False) -> str:
         "*Staff Commands:*\n"
         "`/sell_drink <drink> <qty> [YYYY-MM-DD]`\n"
         "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
-        "`/debtors` | `/debtors bar` | `/debtors rooms`\n"
+        "`/debtors` | `/debtors bar` | `/debtors rooms` | `/debtors YYYY-MM` | `/debtors bar YYYY-MM`\n"
         "`/debtor <name>` — all outstanding debts for a person\n"
         "`/history` | `/history YYYY-MM-DD`\n"
         "`/report` — current month revenue summary\n"
@@ -634,12 +634,18 @@ async def cmd_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_require_auth
 async def cmd_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
-    account = args[0].lower() if args else None
-    if account and account not in ("bar", "rooms"):
-        await _reply(update, "Usage: `/debtors` or `/debtors bar` or `/debtors rooms`")
-        return
+    account: str | None = None
+    month: str | None = None
+    for arg in args:
+        if re.match(r"^\d{4}-\d{2}$", arg):
+            month = arg
+        elif arg.lower() in ("bar", "rooms"):
+            account = arg.lower()
+        else:
+            await _reply(update, "Usage: `/debtors` | `/debtors bar` | `/debtors rooms` | `/debtors 2026-04` | `/debtors bar 2026-04`")
+            return
     staff_view = not _is_admin(update.effective_user.id)
-    text = reports.generate_debtors_report(account=account, staff_view=staff_view)
+    text = reports.generate_debtors_report(account=account, staff_view=staff_view, month=month)
     await _reply(update, text)
 
 
