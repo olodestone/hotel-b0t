@@ -210,6 +210,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/sell_drink <drink> <qty> [YYYY-MM-DD]`\n"
         "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
         "`/debtors` | `/debtors bar` | `/debtors rooms`\n"
+        "`/debtor <name>` — all outstanding debts for a person\n"
         "`/history` | `/history YYYY-MM-DD`\n"
         "`/report` — current month revenue summary\n"
         "`/report today` | `/report YYYY-MM-DD` | `/report YYYY-MM` | `/report all`\n"
@@ -223,7 +224,7 @@ def _help_text(is_admin: bool = False) -> str:
     admin_cmds = (
         "\n\n*Admin Commands:*\n"
         "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
-        "`/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
+        "`/add_debtor <room|bar> <name> <amount> [note] [by:<staff>] [YYYY-MM-DD]`\n"
         "`/pay_debtor <room|bar> <name> [amount]` — pay oldest debt for a person\n"
         "`/pay_debt <id> [amount]` — pay a specific debt by ID (IDs shown in /debtors)\n"
         "`/restock <drink> <qty> <cost_price>`\n"
@@ -438,9 +439,10 @@ async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if len(args) < 3:
         await _reply(
             update,
-            "Usage: `/add_debtor <room|bar> <name> <amount> [note] [YYYY-MM-DD]`\n"
+            "Usage: `/add_debtor <room|bar> <name> <amount> [note] [by:<staff>] [YYYY-MM-DD]`\n"
             "Example: `/add_debtor bar john 2500`\n"
-            "Example: `/add_debtor rooms emeka 45000 room 12 unpaid`\n"
+            "Example: `/add_debtor bar yussuf 2500 tab by:bola`\n"
+            "Example: `/add_debtor rooms emeka 45000 room 12 unpaid by:tunde`\n"
             "Backdate: `/add_debtor bar john 2500 2025-03-15`",
         )
         return
@@ -451,11 +453,20 @@ async def cmd_add_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if err:
         await _reply(update, err)
         return
-    description = " ".join(args[3:]) if len(args) > 3 else ""
+
+    rest = args[3:]
+    staff_name = ""
+    filtered = []
+    for token in rest:
+        if token.lower().startswith("by:") and len(token) > 3:
+            staff_name = token[3:]
+        else:
+            filtered.append(token)
+    description = " ".join(filtered)
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_add_debtor(account, name, amount, description, timestamp=ts, recorded_by=recorded_by)
+    ok, msg = logic.process_add_debtor(account, name, amount, description, timestamp=ts, recorded_by=recorded_by, staff_name=staff_name)
     await _reply(update, msg)
 
 
@@ -550,6 +561,24 @@ async def cmd_debtor_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     name = " ".join(args[1:])
     text = reports.generate_debtor_history(account, name)
     await _reply_long(update, text)
+
+
+# ── /debtor <name> ────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(
+            update,
+            "Usage: `/debtor <name>`\n"
+            "Example: `/debtor john`\n"
+            "Shows all outstanding debts for that person across bar and rooms.",
+        )
+        return
+    name = " ".join(args)
+    text = reports.generate_debtor_lookup(name)
+    await _reply(update, text)
 
 
 # ── /debtors ──────────────────────────────────────────────────────────
@@ -1073,6 +1102,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
     app.add_handler(CommandHandler("pay_debt", cmd_pay_debt))
     app.add_handler(CommandHandler("debtor_history", cmd_debtor_history))
+    app.add_handler(CommandHandler("debtor", cmd_debtor))
     app.add_handler(CommandHandler("debtors", cmd_debtors))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("sales_report", cmd_sales_report))

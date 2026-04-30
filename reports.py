@@ -763,10 +763,12 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
         name = _esc(str(r["name"]).title())
         note = f" — {_esc(str(r['description']))}" if r.get("description") else ""
         age = _debt_age(r.get("timestamp", ""))
+        staff = r.get("staff_name", "") or ""
+        by_tag = f" _(by {_esc(staff.title())})_" if staff.strip() else ""
         original = float(r["amount"])
         paid = float(r.get("amount_paid") or 0)
         rem = round(original - paid, 2)
-        out = [f"  • `[#{did}]` {name}: {_fmt(original)}{note}{age}"]
+        out = [f"  • `[#{did}]` {name}: {_fmt(original)}{note}{by_tag}{age}"]
         if paid > 0:
             out.append(f"      Paid: {_fmt(paid)} | *Remaining: {_fmt(rem)}*")
         return out
@@ -794,6 +796,60 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
     if not staff_view:
         lines.append("_Use_ `/pay_debt <id> [amount]` _to pay a specific debt._")
     lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    return "\n".join(lines)
+
+
+# ── Debtor name lookup ────────────────────────────────────────────────
+
+def generate_debtor_lookup(name: str) -> str:
+    """All outstanding debts for a single person across bar and rooms."""
+    rows = db.get_outstanding_by_name(name)
+    display = _esc(name.title())
+
+    if not rows:
+        return f"✅ No outstanding debts found for *{display}*."
+
+    bar_rows  = [r for r in rows if r["account"] == "bar"]
+    room_rows = [r for r in rows if r["account"] == "rooms"]
+
+    def _remaining(r: dict) -> float:
+        return round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
+
+    def _debt_lines(r: dict) -> list[str]:
+        did  = r["id"]
+        note = f" — {_esc(str(r['description']))}" if r.get("description") else ""
+        age  = _debt_age(r.get("timestamp", ""))
+        staff = r.get("staff_name", "") or ""
+        original = float(r["amount"])
+        paid     = float(r.get("amount_paid") or 0)
+        rem      = round(original - paid, 2)
+        out = [f"  • `[#{did}]` {_fmt(original)}{note}{age}"]
+        if staff.strip():
+            out.append(f"      Sold by: *{_esc(staff.title())}*")
+        if paid > 0:
+            out.append(f"      Paid: {_fmt(paid)} | *Remaining: {_fmt(rem)}*")
+        return out
+
+    lines = [f"🏨 *{HOTEL_NAME} — Debts for {display}*", _SEP]
+
+    if bar_rows:
+        lines.append("🍺 *BAR*")
+        for r in bar_rows:
+            lines.extend(_debt_lines(r))
+        lines.append(f"  *Total: {_fmt(sum(_remaining(r) for r in bar_rows))}*")
+        lines.append("")
+
+    if room_rows:
+        lines.append("🛏 *ROOMS*")
+        for r in room_rows:
+            lines.extend(_debt_lines(r))
+        lines.append(f"  *Total: {_fmt(sum(_remaining(r) for r in room_rows))}*")
+        lines.append("")
+
+    grand = sum(_remaining(r) for r in rows)
+    lines.append(_SEP)
+    lines.append(f"*Total outstanding: {_fmt(grand)}*")
+    lines.append("_Use_ `/pay_debt <id> [amount]` _to pay a specific debt._")
     return "\n".join(lines)
 
 
@@ -959,9 +1015,11 @@ def generate_debtor_history(account: str, name: str) -> str:
         ts = str(debt.get("timestamp", ""))[:10]
         desc = debt.get("description", "")
 
+        staff = str(debt.get("staff_name", "") or "").strip()
         icon = "✅" if status == "paid" else "🔴"
         desc_note = f" — {_esc(desc)}" if desc else ""
-        lines.append(f"{icon} `[#{did}]` Opened {ts}: *{_fmt(original)}*{desc_note}")
+        staff_note = f" _(sold by {_esc(staff.title())})_" if staff else ""
+        lines.append(f"{icon} `[#{did}]` Opened {ts}: *{_fmt(original)}*{desc_note}{staff_note}")
 
         for p in payments_by_id.get(did, []):
             pts = str(p.get("timestamp", ""))[:10]

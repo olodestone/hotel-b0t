@@ -97,7 +97,7 @@ def process_expense(account: str, category: str, amount: float, description: str
 
 # ── Debtors ───────────────────────────────────────────────────────────
 
-def process_add_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
+def process_add_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "", staff_name: str = "") -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if not name.strip():
@@ -105,12 +105,14 @@ def process_add_debtor(account: str, name: str, amount: float, description: str 
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
 
-    db.record_debtor(account.strip(), name.strip(), amount, description.strip(), timestamp=timestamp, recorded_by=recorded_by)
+    db.record_debtor(account.strip(), name.strip(), amount, description.strip(), timestamp=timestamp, recorded_by=recorded_by, staff_name=staff_name)
     date_note = f"\nDate: {timestamp}" if timestamp else ""
+    staff_note = f"\nSold by: *{staff_name.title()}*" if staff_name.strip() else ""
     return True, (
         f"✅ Debtor recorded.\n"
         f"Account: *{account.title()}* | Name: *{name.title()}* | Owes: ₦{amount:,.2f}"
         + (f"\nNote: {description}" if description else "")
+        + staff_note
         + date_note
     )
 

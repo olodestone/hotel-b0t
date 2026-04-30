@@ -130,6 +130,7 @@ def init_db() -> None:
         conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS recorded_by  TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS paid_by      TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS amount_paid  FLOAT DEFAULT 0"))
+        conn.execute(text("ALTER TABLE debtors  ADD COLUMN IF NOT EXISTS staff_name   TEXT DEFAULT ''"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS debtor_payments (
                 id          SERIAL PRIMARY KEY,
@@ -235,17 +236,17 @@ def record_expense(account: str, category: str, amount: float, description: str 
 
 # ── Debtor records ────────────────────────────────────────────────────
 
-def record_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> None:
+def record_debtor(account: str, name: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "", staff_name: str = "") -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO debtors (timestamp, account, name, amount, description, status, paid_at, recorded_by)
-            VALUES (:ts, :account, :name, :amount, :desc, 'outstanding', '', :recorded_by)
+            INSERT INTO debtors (timestamp, account, name, amount, description, status, paid_at, recorded_by, staff_name)
+            VALUES (:ts, :account, :name, :amount, :desc, 'outstanding', '', :recorded_by, :staff_name)
         """), {
             "ts": _ts(timestamp), "account": account.lower(),
             "name": name.strip(),
             "amount": round(amount, 2), "desc": description,
-            "recorded_by": recorded_by,
+            "recorded_by": recorded_by, "staff_name": staff_name.strip(),
         })
         conn.commit()
 
@@ -260,6 +261,16 @@ def get_debtors(account: str | None = None) -> list[dict[str, Any]]:
         )
     else:
         df = pd.read_sql("SELECT * FROM debtors WHERE status = 'outstanding'", engine)
+    return df.to_dict(orient="records")
+
+
+def get_outstanding_by_name(name: str) -> list[dict[str, Any]]:
+    """Return all outstanding debts for a person across both accounts."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT * FROM debtors WHERE lower(name) = lower(%(name)s) AND status = 'outstanding' ORDER BY timestamp ASC",
+        engine, params={"name": name.strip()},
+    )
     return df.to_dict(orient="records")
 
 
