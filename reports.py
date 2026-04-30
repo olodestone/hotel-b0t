@@ -463,17 +463,27 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
     empty_store = [i["drink"] for i in items if i["store_stock"] == 0]
 
     if staff_view:
+        bar_rev  = _sum_revenue(sales_rows)
+        room_rev = _sum_revenue(room_rows)
+        outstanding = [r for r in db.read_all("debtors") if r["status"] == "outstanding"]
+        owed = sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding)
+
         lines = [
             f"📋 *Daily Summary — {label}*",
             _SEP,
-            f"🍺 Bar: {len(sales_rows)} transactions",
-            f"🛏 Rooms: {len(room_rows)} bookings",
+            "💰 *Revenue*",
+            f"  🍺 Bar:    {_fmt(bar_rev)}  ({len(sales_rows)} sales)",
+            f"  🛏 Rooms:  {_fmt(room_rev)}  ({len(room_rows)} bookings)",
+            f"  *Total:   {_fmt(bar_rev + room_rev)}*",
         ]
         if top_drinks:
             lines.append(_SEP)
             lines.append("🏆 *Top Sellers*")
             for drink, qty in top_drinks:
                 lines.append(f"  • {drink}: {qty} units")
+        if outstanding:
+            lines.append(_SEP)
+            lines.append(f"💳 *Debtors:* {len(outstanding)} outstanding — {_fmt(owed)} owed")
         if low_bar:
             lines.append(_SEP)
             lines.append(f"⚠️ Low Bar Stock: {', '.join(low_bar)}")
@@ -1037,6 +1047,21 @@ def generate_price_list() -> str:
     if unpriced:
         lines.append(f"⚠️ No price set for: {', '.join(unpriced)}")
         lines.append("_Admin: use /setprice <drink> <amount> to set._")
+
+    room_presets = db.get_all_room_type_prices()
+    if room_presets:
+        rcol = max(len(r["room_type"]) for r in room_presets) + 1
+        rcol = max(rcol, 10)
+        lines += [
+            "",
+            "🛏 *Room Types*",
+            "```",
+            f"{'Type':<{rcol}} {'Price/Night':>12}",
+            "-" * (rcol + 13),
+            *[f"{r['room_type']:<{rcol}} {_fmt(r['price']):>12}" for r in room_presets],
+            "```",
+        ]
+
     lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 

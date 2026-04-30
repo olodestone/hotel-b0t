@@ -206,44 +206,46 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _help_text(is_admin: bool = False) -> str:
     staff_cmds = (
-        "*Staff Commands:*\n"
-        "`/sell_drink <drink> <qty> [YYYY-MM-DD]`\n"
-        "`/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
-        "`/debtors` | `/debtors bar` | `/debtors rooms` | `/debtors YYYY-MM` | `/debtors bar YYYY-MM`\n"
-        "`/debtor <name>` — all outstanding debts for a person\n"
-        "`/history` | `/history YYYY-MM-DD`\n"
-        "`/report` — current month revenue summary\n"
-        "`/report today` | `/report YYYY-MM-DD` | `/report YYYY-MM` | `/report all`\n"
-        "`/summary` | `/summary YYYY-MM-DD` — daily overview\n"
+        "*📌 Recording*\n"
+        "`/sell_drink <drink> <qty>` — record a bar sale\n"
+        "`/room <type> <qty> <nights>` — record a room booking _(uses preset price)_\n"
+        "`/room <type> <qty> <price> <nights>` — room booking with custom price\n"
+        "`/undo` — undo your last entry within 2 minutes\n"
+        "\n"
+        "*📊 Viewing*\n"
+        "`/today` — quick shift snapshot _(revenue, top sellers, debtors, stock)_\n"
         "`/stock` — bar stock levels\n"
-        "`/prices` — current drink price list\n"
-        "`/undo` — undo your last entry (within 2 minutes, admin is notified)"
+        "`/prices` — drink & room type prices\n"
+        "`/debtors` | `/debtors bar` | `/debtors rooms` | `/debtors YYYY-MM`\n"
+        "`/debtor <name>` — all debts for one person\n"
+        "`/debtor_history <bar|rooms> <name>` — full payment timeline\n"
+        "`/debtor_staff <staff>` — all debts under a staff member\n"
+        "`/history` | `/history YYYY-MM-DD` — daily entry log\n"
+        "`/report` | `/report today` | `/report YYYY-MM` — revenue report\n"
+        "`/summary` | `/summary YYYY-MM-DD` — detailed daily overview\n"
+        "\n"
+        "_Tip: add a date to backdate any recording — e.g._ `/sell_drink heineken 3 2026-04-29`"
     )
     if not is_admin:
         return staff_cmds
     admin_cmds = (
-        "\n\n*Admin Commands:*\n"
+        "\n\n*🔧 Admin Commands*\n"
         "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
         "`/add_debtor <room|bar> <name> <amount> [note] [by:<staff>] [YYYY-MM-DD]`\n"
-        "`/pay_debtor <room|bar> <name> [amount]` — pay oldest debt for a person\n"
-        "`/pay_debt <id> [amount]` — pay a specific debt by ID (IDs shown in /debtors)\n"
+        "`/pay_debtor <room|bar> <name> [amount]`\n"
+        "`/pay_debt <id> [amount]` — pay by debt ID\n"
+        "`/set_debt_staff <id> <staff>` — assign staff to a debt\n"
         "`/restock <drink> <qty> <cost_price>`\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
         "`/delete <sale|room|expense> <id>`\n"
-        "`/setprice <drink> <price>` — set canonical selling price\n"
-        "`/sales_report` — full sales breakdown with cost & profit\n"
-        "`/expense_report` — expense breakdown by category\n"
-        "`/staff_report` | `/staff_report today` | `/staff_report YYYY-MM`\n"
-        "`/allocation` | `/allocation today` | `/allocation YYYY-MM` | `/allocation all`\n"
-        "`/setallocation <buffer|restock|draw|reinvest|float> <percent>`\n"
+        "`/setprice <drink> <price>`\n"
+        "`/setroomtype <type> <price>` — set room type preset price\n"
+        "`/sales_report` | `/expense_report` | `/staff_report` | `/allocation`\n"
+        "`/setallocation <key> <percent>`\n"
         "`/setthreshold <drink> <amount>`\n"
-        "`/addstaff <user_id> <username>`\n"
-        "`/removestaff <user_id>`\n"
+        "`/addstaff <user_id> <username>` | `/removestaff <user_id>`\n"
         "`/dailyreport on|off`\n"
-        "`/activity` | `/activity YYYY-MM-DD` | `/activity username` — daily staff activity log\n"
-        "`/debtor_history <bar|rooms> <name>` — full payment timeline for a debtor\n"
-        "`/debtor_staff <staff>` — all outstanding debts attributed to a staff member\n"
-        "`/set_debt_staff <id> <staff>` — assign staff to an existing debt (IDs from /debtors)"
+        "`/activity` | `/activity YYYY-MM-DD` | `/activity username`"
     )
     return staff_cmds + admin_cmds
 
@@ -314,6 +316,29 @@ async def cmd_setprice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, msg)
 
 
+# ── /setroomtype (admin) ──────────────────────────────────────────────
+
+@_require_admin
+async def cmd_setroomtype(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/setroomtype <type> <price_per_night>`\n"
+            "Example: `/setroomtype standard 15000`\n"
+            "Example: `/setroomtype executive 25000`\n"
+            "Staff can then book with: `/room standard 1 3` _(qty nights)_",
+        )
+        return
+    price, err = _to_float(args[-1], "price")
+    if err:
+        await _reply(update, err)
+        return
+    room_type = " ".join(args[:-1])
+    db.set_room_type_price(room_type, price)
+    await _reply(update, f"✅ *{room_type.title()}* preset set to ₦{price:,.0f}/night.\nStaff can now use: `/room {room_type.lower()} <qty> <nights>`")
+
+
 # ── /prices ──────────────────────────────────────────────────────────
 
 @_require_auth
@@ -375,12 +400,14 @@ async def cmd_restock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_require_auth
 async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args, ts = _extract_date(_parse_args(ctx))
-    if len(args) < 4:
+    if len(args) < 3:
         await _reply(
             update,
-            "Usage: `/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
-            "Example: `/room standard 2 15000 3`\n"
-            "Backdate: `/room standard 2 15000 3 2025-03-10`",
+            "Usage: `/room <type> <qty> <nights> [YYYY-MM-DD]`  _(uses preset price)_\n"
+            "Or:    `/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
+            "Example: `/room standard 1 3`\n"
+            "Example: `/room standard 1 12000 3`  _(negotiated price)_\n"
+            "Set room prices: `/setroomtype standard 15000`",
         )
         return
 
@@ -389,18 +416,40 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if err:
         await _reply(update, err)
         return
-    price, err = _to_float(args[2], "price")
-    if err:
-        await _reply(update, err)
-        return
-    nights, err = _to_int(args[3], "nights")
-    if err:
-        await _reply(update, err)
-        return
+
+    if len(args) == 3:
+        # /room <type> <qty> <nights> — use preset price
+        nights, err = _to_int(args[2], "nights")
+        if err:
+            await _reply(update, err)
+            return
+        price = db.get_room_type_price(room_type)
+        if price is None:
+            await _reply(
+                update,
+                f"❌ No preset price for room type *{room_type}*.\n"
+                f"Set one with `/setroomtype {room_type} <price>` or provide price:\n"
+                f"`/room {room_type} {qty} <price> {nights}`",
+            )
+            return
+        price_note = f" _(preset price ₦{price:,.0f})_"
+    else:
+        # /room <type> <qty> <price> <nights>
+        price, err = _to_float(args[2], "price")
+        if err:
+            await _reply(update, err)
+            return
+        nights, err = _to_int(args[3], "nights")
+        if err:
+            await _reply(update, err)
+            return
+        price_note = ""
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
     ok, msg = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts, recorded_by=recorded_by)
+    if ok and price_note:
+        msg += f"\n{price_note}"
     await _reply(update, msg)
 
 
@@ -546,7 +595,7 @@ async def cmd_pay_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /debtor_staff ─────────────────────────────────────────────────────
 
-@_require_admin
+@_require_auth
 async def cmd_debtor_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     if not args:
@@ -592,7 +641,7 @@ async def cmd_set_debt_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 # ── /debtor_history ───────────────────────────────────────────────────
 
-@_require_admin
+@_require_auth
 async def cmd_debtor_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     if len(args) < 2:
@@ -867,6 +916,15 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target = None
     staff_view = not _is_admin(update.effective_user.id)
     text = reports.generate_daily_summary(target=target, staff_view=staff_view)
+    await _reply(update, text)
+
+
+# ── /today ────────────────────────────────────────────────────────────
+
+@_require_auth
+async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    staff_view = not _is_admin(update.effective_user.id)
+    text = reports.generate_daily_summary(target=None, staff_view=staff_view)
     await _reply(update, text)
 
 
@@ -1147,6 +1205,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))
     app.add_handler(CommandHandler("setprice", cmd_setprice))
+    app.add_handler(CommandHandler("setroomtype", cmd_setroomtype))
     app.add_handler(CommandHandler("prices", cmd_prices))
     app.add_handler(CommandHandler("undo", cmd_undo))
     app.add_handler(CommandHandler("restock", cmd_restock))
@@ -1166,6 +1225,7 @@ def main() -> None:
     app.add_handler(CommandHandler("staff_report", cmd_staff_report))
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("allocation", cmd_allocation))
     app.add_handler(CommandHandler("setallocation", cmd_setallocation))
     app.add_handler(CommandHandler("stock", cmd_stock))

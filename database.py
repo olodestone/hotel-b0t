@@ -771,6 +771,37 @@ def set_setting(key: str, value: str) -> None:
         conn.commit()
 
 
+# ── Room type presets ─────────────────────────────────────────────────
+
+def get_room_type_price(room_type: str) -> float | None:
+    val = get_setting(f"roomtype_price:{room_type.strip().lower()}")
+    try:
+        return float(val) if val else None
+    except ValueError:
+        return None
+
+
+def set_room_type_price(room_type: str, price: float) -> None:
+    set_setting(f"roomtype_price:{room_type.strip().lower()}", str(round(price, 2)))
+
+
+def get_all_room_type_prices() -> list[dict[str, Any]]:
+    """Return all configured room type presets as [{room_type, price}]."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT key, value FROM settings WHERE key LIKE 'roomtype_price:%' ORDER BY key",
+        engine,
+    )
+    rows = []
+    for _, r in df.iterrows():
+        rtype = str(r["key"]).replace("roomtype_price:", "").title()
+        try:
+            rows.append({"room_type": rtype, "price": float(r["value"])})
+        except ValueError:
+            pass
+    return rows
+
+
 # ── User management ───────────────────────────────────────────────────
 
 def get_user(user_id: int) -> dict[str, Any] | None:
