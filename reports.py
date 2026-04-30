@@ -731,12 +731,13 @@ def _debt_age(timestamp_str: str) -> str:
         days = (datetime.now() - created).days
     except (ValueError, TypeError):
         return ""
+    date_str = created.strftime("%d %b")
     if days == 0:
-        return " _(today)_"
+        return f" _(today, {date_str})_"
     if days == 1:
-        return " _(1 day)_"
+        return f" _(1 day, {date_str})_"
     flag = " ⚠️" if days >= 7 else ""
-    return f" _({days} days){flag}_"
+    return f" _({days} days, {date_str}){flag}_"
 
 
 def generate_debtors_report(account: str | None = None, staff_view: bool = False) -> str:
