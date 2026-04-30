@@ -359,7 +359,7 @@ async def cmd_setroomtype(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 @_require_auth
 async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = reports.generate_price_list()
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /undo ─────────────────────────────────────────────────────────────
@@ -623,7 +623,7 @@ async def cmd_debtor_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     staff_name = " ".join(args)
     text = reports.generate_staff_debtors(staff_name)
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /set_debt_staff ───────────────────────────────────────────────────
@@ -690,7 +690,7 @@ async def cmd_debtor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     name = " ".join(args)
     text = reports.generate_debtor_lookup(name)
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /debtors ──────────────────────────────────────────────────────────
@@ -710,7 +710,7 @@ async def cmd_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
     staff_view = not _is_admin(update.effective_user.id)
     text = reports.generate_debtors_report(account=account, staff_view=staff_view, month=month)
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /report ───────────────────────────────────────────────────────────
@@ -742,7 +742,7 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await _reply(update, "Usage: `/report` | `/report today` | `/report 2025-04-01` | `/report 2025-03` | `/report all`")
                 return
 
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /history ─────────────────────────────────────────────────────────
@@ -800,7 +800,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if is_admin:
         lines.append("")
         lines.append("_Use_ `/delete <sale|room|expense> <id>` _to remove an entry._")
-    await _reply(update, "\n".join(lines))
+    await _reply_long(update, "\n".join(lines))
 
 
 # ── /delete ───────────────────────────────────────────────────────────
@@ -831,7 +831,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     is_admin = _is_admin(update.effective_user.id)
     text = reports.generate_stock_report(staff_view=not is_admin)
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /sales_report ─────────────────────────────────────────────────────
@@ -860,7 +860,7 @@ async def cmd_sales_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             except ValueError:
                 await _reply(update, "Usage: `/sales_report` | `/sales_report today` | `/sales_report YYYY-MM-DD` | `/sales_report YYYY-MM` | `/sales_report all`")
                 return
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /expense_report ───────────────────────────────────────────────────
@@ -889,7 +889,7 @@ async def cmd_expense_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             except ValueError:
                 await _reply(update, "Usage: `/expense_report` | `/expense_report today` | `/expense_report YYYY-MM-DD` | `/expense_report YYYY-MM` | `/expense_report all`")
                 return
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /staff_report (admin) ─────────────────────────────────────────────
@@ -916,7 +916,7 @@ async def cmd_staff_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             except ValueError:
                 await _reply(update, "Usage: `/staff_report` | `/staff_report today` | `/staff_report YYYY-MM-DD` | `/staff_report YYYY-MM`")
                 return
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /summary ──────────────────────────────────────────────────────────
@@ -931,7 +931,7 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target = None
     staff_view = not _is_admin(update.effective_user.id)
     text = reports.generate_daily_summary(target=target, staff_view=staff_view)
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /today ────────────────────────────────────────────────────────────
@@ -940,7 +940,7 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     staff_view = not _is_admin(update.effective_user.id)
     text = reports.generate_daily_summary(target=None, staff_view=staff_view)
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /allocation (admin) ──────────────────────────────────────────────
@@ -969,7 +969,7 @@ async def cmd_allocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             except ValueError:
                 await _reply(update, "Usage: `/allocation` | `/allocation today` | `/allocation YYYY-MM-DD` | `/allocation YYYY-MM` | `/allocation all`")
                 return
-    await _reply(update, text)
+    await _reply_long(update, text)
 
 
 # ── /setallocation (admin) ────────────────────────────────────────────
