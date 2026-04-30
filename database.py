@@ -789,7 +789,7 @@ def get_all_room_type_prices() -> list[dict[str, Any]]:
     """Return all configured room type presets as [{room_type, price}]."""
     engine = get_engine()
     df = pd.read_sql(
-        "SELECT key, value FROM settings WHERE key LIKE 'roomtype_price:%' ORDER BY key",
+        text("SELECT key, value FROM settings WHERE key LIKE 'roomtype_price:%' ORDER BY key"),
         engine,
     )
     rows = []
