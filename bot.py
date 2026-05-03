@@ -33,9 +33,11 @@ Admin only:
 """
 from __future__ import annotations
 
+import calendar as _cal
 import logging
 import os
 import re
+from datetime import date, timedelta
 from datetime import time as dtime
 
 import pytz
@@ -72,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["🍺 Sell", "🛏 Book Room"], ["📋 Today", "📦 Stock"]],
+    [["🍺 Sell", "🛏 Book Room"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"]],
     resize_keyboard=True,
 )
 
@@ -1255,11 +1257,47 @@ def _room_type_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _calendar_keyboard(prefix: str, year: int, month: int) -> InlineKeyboardMarkup:
+    today = date.today()
+    rows: list[list[InlineKeyboardButton]] = []
+
+    rows.append([InlineKeyboardButton("✅ Today", callback_data=f"{prefix}:today")])
+
+    first = date(year, month, 1)
+    prev = (first - timedelta(days=1)).replace(day=1)
+    nxt_year, nxt_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    is_current = (year == today.year and month == today.month)
+    rows.append([
+        InlineKeyboardButton("◀", callback_data=f"{prefix}:cal_p:{prev.year:04d}-{prev.month:02d}"),
+        InlineKeyboardButton(f"{_cal.month_abbr[month]} {year}", callback_data=f"{prefix}:cal_x"),
+        InlineKeyboardButton(
+            "·" if is_current else "▶",
+            callback_data=f"{prefix}:cal_x" if is_current else f"{prefix}:cal_n:{nxt_year:04d}-{nxt_month:02d}",
+        ),
+    ])
+
+    rows.append([InlineKeyboardButton(d, callback_data=f"{prefix}:cal_x") for d in ["M", "T", "W", "T", "F", "S", "S"]])
+
+    for week in _cal.monthcalendar(year, month):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data=f"{prefix}:cal_x"))
+            else:
+                d = date(year, month, day)
+                if d > today:
+                    row.append(InlineKeyboardButton("·", callback_data=f"{prefix}:cal_x"))
+                else:
+                    label = f"[{day}]" if d == today else str(day)
+                    row.append(InlineKeyboardButton(label, callback_data=f"{prefix}:{d.isoformat()}"))
+        rows.append(row)
+
+    return InlineKeyboardMarkup(rows)
+
+
 def _date_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Today", callback_data=f"{prefix}:today"),
-        InlineKeyboardButton("📅 Different date", callback_data=f"{prefix}:other"),
-    ]])
+    today = date.today()
+    return _calendar_keyboard(prefix, today.year, today.month)
 
 
 async def _cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1344,19 +1382,31 @@ async def _sell_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     q = update.callback_query
     await q.answer()
     val = q.data[4:]  # strip "sdd:"
-    if val == "other":
-        await q.edit_message_text("Enter date (YYYY-MM-DD):")
-        return _SELL_DATE_TEXT
-    await q.edit_message_text("📝 Recording...")
-    return await _do_sell(update, ctx, timestamp=None)
 
+    if val == "today":
+        await q.edit_message_text("📝 Recording...")
+        return await _do_sell(update, ctx, timestamp=None)
 
-async def _sell_date_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if not _DATE_RE.match(text):
-        await update.message.reply_text("❌ Use format YYYY-MM-DD (e.g. 2026-04-28):")
-        return _SELL_DATE_TEXT
-    return await _do_sell(update, ctx, timestamp=text)
+    if val.startswith("cal_p:") or val.startswith("cal_n:"):
+        ym = val[6:]
+        year, month = int(ym[:4]), int(ym[5:7])
+        drink = ctx.user_data.get("sell_drink", "")
+        qty = ctx.user_data.get("sell_qty", 1)
+        await q.edit_message_text(
+            f"🍺 {qty}× {drink.title()} — when?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_calendar_keyboard("sdd", year, month),
+        )
+        return _SELL_DATE
+
+    if val == "cal_x":
+        return _SELL_DATE
+
+    if _DATE_RE.match(val):
+        await q.edit_message_text("📝 Recording...")
+        return await _do_sell(update, ctx, timestamp=val)
+
+    return _SELL_DATE
 
 
 async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: str | None = None) -> int:
@@ -1497,19 +1547,32 @@ async def _book_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     q = update.callback_query
     await q.answer()
     val = q.data[4:]  # strip "bdd:"
-    if val == "other":
-        await q.edit_message_text("Enter date (YYYY-MM-DD):")
-        return _BOOK_DATE_TEXT
-    await q.edit_message_text("📝 Recording...")
-    return await _do_book(update, ctx, timestamp=None)
 
+    if val == "today":
+        await q.edit_message_text("📝 Recording...")
+        return await _do_book(update, ctx, timestamp=None)
 
-async def _book_date_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if not _DATE_RE.match(text):
-        await update.message.reply_text("❌ Use format YYYY-MM-DD (e.g. 2026-04-28):")
-        return _BOOK_DATE_TEXT
-    return await _do_book(update, ctx, timestamp=text)
+    if val.startswith("cal_p:") or val.startswith("cal_n:"):
+        ym = val[6:]
+        year, month = int(ym[:4]), int(ym[5:7])
+        rtype = ctx.user_data.get("book_type", "")
+        qty = ctx.user_data.get("book_qty", 1)
+        nights = ctx.user_data.get("book_nights", 1)
+        await q.edit_message_text(
+            f"🛏 {qty}× {rtype.title()}, {nights} nights — when?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_calendar_keyboard("bdd", year, month),
+        )
+        return _BOOK_DATE
+
+    if val == "cal_x":
+        return _BOOK_DATE
+
+    if _DATE_RE.match(val):
+        await q.edit_message_text("📝 Recording...")
+        return await _do_book(update, ctx, timestamp=val)
+
+    return _BOOK_DATE
 
 
 async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: str | None = None) -> int:
@@ -1534,17 +1597,23 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
 # ── Keyboard shortcut handlers ────────────────────────────────────────
 
 @_require_auth
-async def _btn_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    staff_view = not _is_admin(update.effective_user.id)
-    text = reports.generate_daily_summary(target=None, staff_view=staff_view)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
-
-
-@_require_auth
 async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     staff_view = not _is_admin(update.effective_user.id)
     text = reports.generate_stock_report(staff_view=staff_view)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+
+
+@_require_auth
+async def _btn_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    is_admin = _is_admin(user.id)
+    if not is_admin:
+        username = user.username or user.first_name or ""
+        if username:
+            personal = reports.generate_staff_debtors(username)
+            await _reply_long(update, personal)
+    text = reports.generate_debtors_report(staff_view=not is_admin)
+    await _reply_long(update, text)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -1570,7 +1639,6 @@ def main() -> None:
             _SELL_QTY:        [CallbackQueryHandler(_sell_pick_qty, pattern="^sq:")],
             _SELL_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_qty_text)],
             _SELL_DATE:       [CallbackQueryHandler(_sell_pick_date, pattern="^sdd:")],
-            _SELL_DATE_TEXT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_date_text)],
         },
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
@@ -1588,15 +1656,16 @@ def main() -> None:
             _BOOK_NIGHTS:      [CallbackQueryHandler(_book_pick_nights, pattern="^bn:")],
             _BOOK_NIGHTS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_nights_text)],
             _BOOK_DATE:        [CallbackQueryHandler(_book_pick_date, pattern="^bdd:")],
-            _BOOK_DATE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_date_text)],
         },
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
     app.add_handler(sell_conv)
     app.add_handler(book_conv)
-    app.add_handler(MessageHandler(filters.Text(["📋 Today"]) & ~filters.COMMAND, _btn_today))
+    app.add_handler(MessageHandler(filters.Text(["💰 Prices"]) & ~filters.COMMAND, cmd_prices))
     app.add_handler(MessageHandler(filters.Text(["📦 Stock"]) & ~filters.COMMAND, _btn_stock))
+    app.add_handler(MessageHandler(filters.Text(["📜 History"]) & ~filters.COMMAND, cmd_history))
+    app.add_handler(MessageHandler(filters.Text(["💳 Debtors"]) & ~filters.COMMAND, _btn_debtors))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
