@@ -804,14 +804,14 @@ def get_all_room_type_prices() -> list[dict[str, Any]]:
 
 # ── User management ───────────────────────────────────────────────────
 
-def get_all_staff() -> list[dict]:
-    """Return all users with role 'staff', sorted by username."""
+def get_all_staff() -> list[str]:
+    """Return distinct staff names that have outstanding debts assigned to them."""
     engine = get_engine()
     df = pd.read_sql(
-        "SELECT * FROM users WHERE role = 'staff' ORDER BY username ASC",
+        "SELECT DISTINCT staff_name FROM debtors WHERE status = 'outstanding' AND staff_name IS NOT NULL AND staff_name <> '' ORDER BY staff_name ASC",
         engine,
     )
-    return df.to_dict(orient="records")
+    return [row["staff_name"] for row in df.to_dict(orient="records")]
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:

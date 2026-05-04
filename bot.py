@@ -1627,8 +1627,7 @@ async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _btn_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     staff_list = db.get_all_staff()
     buttons: list[list[InlineKeyboardButton]] = []
-    for s in staff_list:
-        name = (s.get("username") or "").strip() or str(s["user_id"])
+    for name in staff_list:
         buttons.append([InlineKeyboardButton(f"👤 {name.title()}", callback_data=f"dbt:staff:{name}")])
     buttons.append([InlineKeyboardButton("📋 All Debtors", callback_data="dbt:all")])
     await update.message.reply_text(
