@@ -160,6 +160,26 @@ async def _reply(update: Update, text: str) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+async def _reply_long_cb(q, text: str) -> None:
+    """Send a long reply from a CallbackQuery context."""
+    limit = 4000
+    if len(text) <= limit:
+        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+    lines = text.split("\n")
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > limit and chunk:
+            await q.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+            chunk = []
+            size = 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        await q.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+
+
 async def _reply_long(update: Update, text: str) -> None:
     """Send a message, splitting into ≤4000-char chunks at line boundaries if needed."""
     limit = 4000
@@ -1605,15 +1625,35 @@ async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_auth
 async def _btn_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    is_admin = _is_admin(user.id)
-    if not is_admin:
-        username = user.username or user.first_name or ""
-        if username:
-            personal = reports.generate_staff_debtors(username)
-            await _reply_long(update, personal)
-    text = reports.generate_debtors_report(staff_view=not is_admin)
-    await _reply_long(update, text)
+    staff_list = db.get_all_staff()
+    buttons: list[list[InlineKeyboardButton]] = []
+    for s in staff_list:
+        name = (s.get("username") or "").strip() or str(s["user_id"])
+        buttons.append([InlineKeyboardButton(f"👤 {name.title()}", callback_data=f"dbt:staff:{name}")])
+    buttons.append([InlineKeyboardButton("📋 All Debtors", callback_data="dbt:all")])
+    await update.message.reply_text(
+        "💳 *Debtors — View by:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _cb_debtors_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _is_authorized(q.from_user.id):
+        await q.message.reply_text("🔒 Access denied.")
+        return
+    data = q.data
+    is_admin = _is_admin(q.from_user.id)
+    if data == "dbt:all":
+        text = reports.generate_debtors_report(staff_view=not is_admin)
+    elif data.startswith("dbt:staff:"):
+        staff_name = data[len("dbt:staff:"):]
+        text = reports.generate_staff_debtors(staff_name)
+    else:
+        return
+    await _reply_long_cb(q, text)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -1666,6 +1706,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Text(["📦 Stock"]) & ~filters.COMMAND, _btn_stock))
     app.add_handler(MessageHandler(filters.Text(["📜 History"]) & ~filters.COMMAND, cmd_history))
     app.add_handler(MessageHandler(filters.Text(["💳 Debtors"]) & ~filters.COMMAND, _btn_debtors))
+    app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

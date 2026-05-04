@@ -804,6 +804,16 @@ def get_all_room_type_prices() -> list[dict[str, Any]]:
 
 # ── User management ───────────────────────────────────────────────────
 
+def get_all_staff() -> list[dict]:
+    """Return all users with role 'staff', sorted by username."""
+    engine = get_engine()
+    df = pd.read_sql(
+        "SELECT * FROM users WHERE role = 'staff' ORDER BY username ASC",
+        engine,
+    )
+    return df.to_dict(orient="records")
+
+
 def get_user(user_id: int) -> dict[str, Any] | None:
     engine = get_engine()
     df = pd.read_sql(
