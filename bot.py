@@ -77,6 +77,14 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["🍺 Sell", "🛏 Book Room"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"]],
     resize_keyboard=True,
 )
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["📊 Summary", "📋 Report"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"]],
+    resize_keyboard=True,
+)
+
+
+def _get_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    return ADMIN_KEYBOARD if _is_admin(user_id) else MAIN_KEYBOARD
 
 # ── Access helpers ────────────────────────────────────────────────────
 
@@ -214,7 +222,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"👋 Welcome back, *{username}*! Role: _{role}_",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=_get_keyboard(uid),
         )
         return
 
@@ -1323,7 +1331,7 @@ def _date_keyboard(prefix: str) -> InlineKeyboardMarkup:
 async def _cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data.clear()
     if update.message:
-        await update.message.reply_text("❌ Cancelled.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=_get_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -1437,7 +1445,7 @@ async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
     ok, msg, alert = logic.process_drink_sale(drink, qty, timestamp=timestamp, recorded_by=recorded_by)
     if timestamp and ok:
         msg += f"\n_(recorded for {timestamp})_"
-    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
     if ok and alert:
         for admin_id in ADMIN_IDS:
             if admin_id != user.id:
@@ -1461,7 +1469,7 @@ async def cmd_book_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.effective_message.reply_text(
             "No room types configured yet.\nAsk admin to run: `/setroomtype standard 15000`",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=_get_keyboard(update.effective_user.id),
         )
         return ConversationHandler.END
     await update.effective_message.reply_text(
@@ -1606,11 +1614,11 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
         await update.effective_chat.send_message(
             f"❌ No preset price for *{rtype.title()}*.\nAsk admin: `/setroomtype {rtype} <price>`",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=_get_keyboard(user.id),
         )
         return ConversationHandler.END
     ok, msg = logic.process_room_sale(rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
-    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
 
 
@@ -1618,9 +1626,206 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
 
 @_require_auth
 async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    staff_view = not _is_admin(update.effective_user.id)
-    text = reports.generate_stock_report(staff_view=staff_view)
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
+    uid = update.effective_user.id
+    text = reports.generate_stock_report(staff_view=not _is_admin(uid))
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(uid))
+
+
+# ── Report / Summary date-picker keyboard ────────────────────────────
+
+def _report_date_keyboard(rtype: str, year: int, month: int) -> InlineKeyboardMarkup:
+    """Calendar picker with Today / This Month / All Time quick buttons."""
+    today = date.today()
+    rows: list[list[InlineKeyboardButton]] = []
+
+    rows.append([
+        InlineKeyboardButton("✅ Today",      callback_data=f"rpd:{rtype}:today"),
+        InlineKeyboardButton("📅 This Month", callback_data=f"rpd:{rtype}:month"),
+        InlineKeyboardButton("🔁 All Time",   callback_data=f"rpd:{rtype}:all"),
+    ])
+
+    first = date(year, month, 1)
+    prev = (first - timedelta(days=1)).replace(day=1)
+    nxt_year, nxt_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    is_current = (year == today.year and month == today.month)
+    rows.append([
+        InlineKeyboardButton("◀", callback_data=f"rpd:{rtype}:cal_p:{prev.year:04d}-{prev.month:02d}"),
+        InlineKeyboardButton(f"📅 {_cal.month_abbr[month]} {year}", callback_data=f"rpd:{rtype}:cal_m:{year:04d}-{month:02d}"),
+        InlineKeyboardButton(
+            "·" if is_current else "▶",
+            callback_data=f"rpd:{rtype}:cal_x" if is_current else f"rpd:{rtype}:cal_n:{nxt_year:04d}-{nxt_month:02d}",
+        ),
+    ])
+
+    rows.append([InlineKeyboardButton(d, callback_data=f"rpd:{rtype}:cal_x") for d in ["M", "T", "W", "T", "F", "S", "S"]])
+
+    for week in _cal.monthcalendar(year, month):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data=f"rpd:{rtype}:cal_x"))
+            else:
+                d = date(year, month, day)
+                if d > today:
+                    row.append(InlineKeyboardButton("·", callback_data=f"rpd:{rtype}:cal_x"))
+                else:
+                    label = f"[{day}]" if d == today else str(day)
+                    row.append(InlineKeyboardButton(label, callback_data=f"rpd:{rtype}:{d.isoformat()}"))
+        rows.append(row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Full Report",    callback_data="rep:full")],
+        [InlineKeyboardButton("🍺 Sales Report",   callback_data="rep:sales")],
+        [InlineKeyboardButton("💸 Expense Report", callback_data="rep:expense")],
+        [InlineKeyboardButton("👥 Staff Report",   callback_data="rep:staff")],
+    ])
+
+
+def _run_report(rtype: str, for_date=None, for_month=None, all_time: bool = False) -> str:
+    from datetime import datetime
+    staff_view = False
+    if rtype == "full":
+        if for_date:
+            return reports.generate_full_report(for_date=for_date, staff_view=staff_view)
+        if for_month:
+            return reports.generate_full_report(for_month=for_month, staff_view=staff_view)
+        return reports.generate_full_report(all_time=all_time, staff_view=staff_view)
+    if rtype == "sales":
+        if for_date:
+            return reports.generate_sales_report(for_date=for_date)
+        if for_month:
+            return reports.generate_sales_report(for_month=for_month)
+        return reports.generate_sales_report(all_time=all_time)
+    if rtype == "expense":
+        if for_date:
+            return reports.generate_expense_report(for_date=for_date)
+        if for_month:
+            return reports.generate_expense_report(for_month=for_month)
+        return reports.generate_expense_report(all_time=all_time)
+    if rtype == "staff":
+        if for_date:
+            return reports.generate_staff_report(for_date=for_date)
+        if for_month:
+            return reports.generate_staff_report(for_month=for_month)
+        now = datetime.now()
+        return reports.generate_staff_report(for_month=(now.year, now.month))
+    return "❌ Unknown report type."
+
+
+# ── 📋 Report button handlers ─────────────────────────────────────────
+
+@_require_admin
+async def _btn_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📋 *Which report?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_report_type_keyboard(),
+    )
+
+
+async def _cb_report_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.message.reply_text("🔒 Admin only.")
+        return
+    rtype = q.data[4:]  # strip "rep:"
+    labels = {"full": "Full", "sales": "Sales", "expense": "Expense", "staff": "Staff"}
+    today = date.today()
+    await q.edit_message_text(
+        f"📅 *{labels.get(rtype, rtype.title())} Report — select period:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_report_date_keyboard(rtype, today.year, today.month),
+    )
+
+
+async def _cb_report_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    q = update.callback_query
+    await q.answer()
+
+    parts = q.data.split(":")
+    # "rpd:{rtype}:{choice}" or "rpd:{rtype}:cal_p:{YYYY-MM}"
+    rtype = parts[1]
+    choice = parts[2]
+    is_summary = rtype == "summary"
+
+    # Summary is staff-accessible; all other report types are admin-only
+    if is_summary:
+        if not _is_authorized(q.from_user.id):
+            await q.message.reply_text("🔒 Access denied.")
+            return
+    else:
+        if not _is_admin(q.from_user.id):
+            await q.message.reply_text("🔒 Admin only.")
+            return
+
+    staff_view = not _is_admin(q.from_user.id)
+
+    if choice == "cal_x":
+        return
+
+    if choice in ("cal_p", "cal_n"):
+        ym = parts[3]
+        year, month = int(ym[:4]), int(ym[5:7])
+        header = "📊 *Summary — select period:*" if is_summary else (
+            f"📅 *{'Full' if rtype == 'full' else rtype.title()} Report — select period:*"
+        )
+        await q.edit_message_text(
+            header,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_report_date_keyboard(rtype, year, month),
+        )
+        return
+
+    today = date.today()
+    if choice == "cal_m":
+        ym = parts[3]
+        year, month = int(ym[:4]), int(ym[5:7])
+        if is_summary:
+            text = reports.generate_full_report(for_month=(year, month), staff_view=staff_view)
+        else:
+            text = _run_report(rtype, for_month=(year, month))
+    elif choice == "today":
+        if is_summary:
+            text = reports.generate_daily_summary(target=None, staff_view=staff_view)
+        else:
+            text = _run_report(rtype, for_date=today)
+    elif choice == "month":
+        if is_summary:
+            text = reports.generate_full_report(for_month=(today.year, today.month), staff_view=staff_view)
+        else:
+            text = _run_report(rtype, for_month=(today.year, today.month))
+    elif choice == "all":
+        if is_summary:
+            text = reports.generate_full_report(all_time=True, staff_view=staff_view)
+        else:
+            text = _run_report(rtype, all_time=True)
+    elif _DATE_RE.match(choice):
+        dt = datetime.strptime(choice, "%Y-%m-%d").date()
+        if is_summary:
+            text = reports.generate_daily_summary(target=dt, staff_view=staff_view)
+        else:
+            text = _run_report(rtype, for_date=dt)
+    else:
+        return
+    await _reply_long_cb(q, text)
+
+
+# ── 📊 Summary button handler ─────────────────────────────────────────
+
+@_require_auth
+async def _btn_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    today = date.today()
+    await update.message.reply_text(
+        "📊 *Summary — select period:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_report_date_keyboard("summary", today.year, today.month),
+    )
 
 
 @_require_auth
@@ -1701,10 +1906,14 @@ def main() -> None:
     )
     app.add_handler(sell_conv)
     app.add_handler(book_conv)
+    app.add_handler(MessageHandler(filters.Text(["📊 Summary"]) & ~filters.COMMAND, _btn_summary))
+    app.add_handler(MessageHandler(filters.Text(["📋 Report"]) & ~filters.COMMAND, _btn_report))
     app.add_handler(MessageHandler(filters.Text(["💰 Prices"]) & ~filters.COMMAND, cmd_prices))
     app.add_handler(MessageHandler(filters.Text(["📦 Stock"]) & ~filters.COMMAND, _btn_stock))
     app.add_handler(MessageHandler(filters.Text(["📜 History"]) & ~filters.COMMAND, cmd_history))
     app.add_handler(MessageHandler(filters.Text(["💳 Debtors"]) & ~filters.COMMAND, _btn_debtors))
+    app.add_handler(CallbackQueryHandler(_cb_report_type, pattern="^rep:"))
+    app.add_handler(CallbackQueryHandler(_cb_report_date, pattern="^rpd:"))
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
 
     app.add_handler(CommandHandler("start", cmd_start))
