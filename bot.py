@@ -1290,6 +1290,42 @@ async def cmd_hotels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, "\n\n".join(lines))
 
 
+# ── /addhotel (app owner only) ───────────────────────────────────────
+
+@_require_owner
+async def cmd_addhotel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /addhotel <schema> <bot_token> <admin_id>"""
+    args = _parse_args(ctx)
+    if len(args) < 3:
+        await _reply(update,
+            "*Usage:* `/addhotel <schema> <bot_token> <admin_id>`\n\n"
+            "*Example:*\n"
+            "`/addhotel kings_inn 7123456789:AAGxx 98765432`"
+        )
+        return
+
+    schema = args[0].strip().lower().replace(" ", "_")
+    token = args[1].strip()
+    admin_id = args[2].strip()
+
+    if not admin_id.isdigit():
+        await _reply(update, "❌ `admin_id` must be a numeric Telegram user ID.")
+        return
+
+    try:
+        db.init_db(schema=schema, token=token)
+        db.add_hotel_config(schema=schema, token=token, admin_ids=admin_id)
+    except Exception as e:
+        await _reply(update, f"❌ Failed: `{e}`")
+        return
+
+    await _reply(update,
+        f"✅ *{schema}* registered successfully.\n\n"
+        f"Redeploy the Railway service — the new bot will start automatically.\n"
+        f"Then the hotel owner messages their bot and runs `/setup`."
+    )
+
+
 # ── /suspend + /unsuspend (app owner only) ───────────────────────────
 
 @_require_owner
@@ -2279,6 +2315,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("dailyreport", cmd_dailyreport))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("hotels", cmd_hotels))
+    app.add_handler(CommandHandler("addhotel", cmd_addhotel))
     app.add_handler(CommandHandler("suspend", cmd_suspend))
     app.add_handler(CommandHandler("unsuspend", cmd_unsuspend))
     app.add_error_handler(_error_handler)
