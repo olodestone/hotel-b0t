@@ -23,7 +23,7 @@ Each hotel's data lives in its own PostgreSQL schema. They cannot see each other
 ## Access Levels
 
 ```
-App Owner (you)
+App Owner (you) — controlled by OWNER_ID env var
 ├── Onboard / suspend / delete hotels
 ├── Set who the hotel admin is
 └── Full database access
@@ -57,13 +57,11 @@ Message `@BotFather` → `/newbot` → copy the token.
 **Step 2 — Get the hotel owner's Telegram ID**
 Ask them to message `@userinfobot` and send you the number.
 
-**Step 3 — Register the hotel**
-```bash
-DATABASE_URL="postgresql://..." python3 scripts/add_hotel.py \
-  --schema kings_inn \
-  --token 7123456789:AAGxx... \
-  --admin-id 98765432
+**Step 3 — Register the hotel (from inside your bot)**
 ```
+/addhotel kings_inn 7123456789:AAGxx 98765432
+```
+Schema slug, bot token, hotel owner's Telegram ID — all in one message.
 
 **Step 4 — Restart the Railway service**
 Railway → your service → Redeploy. The new hotel's bot starts automatically.
@@ -72,9 +70,10 @@ Railway → your service → Redeploy. The new hotel's bot starts automatically.
 
 | Command | What it does |
 |---|---|
+| `/addhotel <schema> <token> <admin_id>` | Register a new hotel |
 | `/hotels` | List all hotels with name, owner, and status |
-| `/suspend kings_inn` | Suspend a hotel — data fully preserved, bot stops on restart |
-| `/unsuspend kings_inn` | Reinstate a suspended hotel |
+| `/suspend <schema>` | Suspend a hotel — data fully preserved, bot stops on restart |
+| `/unsuspend <schema>` | Reinstate a suspended hotel |
 | `/export` | Download your own hotel's data as Excel |
 
 > After `/suspend` or `/unsuspend`, restart the Railway service to apply the change.
@@ -231,7 +230,8 @@ Each hotel's tables live in their own PostgreSQL schema (e.g. `hotel85.sales`, `
 | `BOT_TOKEN` | Your hotel85 bot token from @BotFather |
 | `HOTEL_SCHEMA` | `hotel85` |
 | `DATABASE_URL` | Set automatically by Railway |
-| `ADMIN_IDS` | Your Telegram user ID (comma-separated) |
+| `OWNER_ID` | Your Telegram user ID — the only person who can `/addhotel`, `/suspend`, `/unsuspend`, `/hotels` |
+| `ADMIN_IDS` | Telegram user IDs for hotel85 hotel admins (comma-separated) |
 | `REPORT_CHAT_ID` | Optional — chat ID for scheduled daily reports |
 
 ---
