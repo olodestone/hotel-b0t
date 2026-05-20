@@ -69,6 +69,7 @@ from config import (
     DAILY_REPORT_TIME,
     HOTEL_NAME,
     HOTEL_SCHEMA,
+    OWNER_ID,
     REPORT_CHAT_ID,
     TIMEZONE,
 )
@@ -141,10 +142,11 @@ def _require_admin(fn):
 
 
 def _require_owner(fn):
-    """Decorator: app-owner only — checks the global ADMIN_IDS env var, not per-hotel admins."""
+    """Decorator: app-owner only — checks OWNER_ID env var exclusively.
+    Neither hotel admins nor ADMIN_IDS members can bypass this."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
-        if uid not in ADMIN_IDS:
+        if OWNER_ID is None or uid != OWNER_ID:
             await update.message.reply_text("🔒 This command is restricted to the service owner.")
             return
         return await fn(update, ctx)

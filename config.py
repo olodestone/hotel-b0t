@@ -24,6 +24,11 @@ HOTEL_SCHEMA: str = os.getenv("HOTEL_SCHEMA", "")
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: list[int] = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
 
+# Single app owner — the only person who can /addhotel, /suspend, /unsuspend, /hotels.
+# Set OWNER_ID in Railway env vars. Separate from ADMIN_IDS (hotel85 hotel admins).
+_raw_owner = os.getenv("OWNER_ID", "")
+OWNER_ID: int | None = int(_raw_owner) if _raw_owner.isdigit() else None
+
 # Chat ID that receives daily automated reports (set to an admin chat or group)
 _rcid = os.getenv("REPORT_CHAT_ID", "")
 REPORT_CHAT_ID: int | None = int(_rcid) if _rcid.lstrip("-").isdigit() else None
