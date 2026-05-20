@@ -16,6 +16,10 @@ HOTEL_NAME: str = os.getenv("HOTEL_NAME", "Hotel 85")
 # On Railway: add a PostgreSQL plugin — DATABASE_URL is set automatically
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
+# Unique slug identifying this hotel's PostgreSQL schema (e.g. "hotel85", "kings_inn").
+# Every hotel deployment must set this. The schema is auto-created on first startup.
+HOTEL_SCHEMA: str = os.getenv("HOTEL_SCHEMA", "")
+
 # ── Access control ───────────────────────────────────────────────────
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: list[int] = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]

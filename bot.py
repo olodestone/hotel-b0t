@@ -62,6 +62,7 @@ from config import (
     BOT_TOKEN,
     DAILY_REPORT_TIME,
     HOTEL_NAME,
+    HOTEL_SCHEMA,
     REPORT_CHAT_ID,
     TIMEZONE,
 )
@@ -215,6 +216,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id
     username = user.username or user.first_name or str(uid)
+    logger.info("cmd_start received from uid=%s username=%s", uid, username)
 
     already = db.get_user(uid)
     if already:
@@ -1240,6 +1242,7 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 _SELL_DRINK, _SELL_DRINK_TEXT, _SELL_QTY, _SELL_QTY_TEXT, _SELL_DATE, _SELL_DATE_TEXT = range(6)
 _BOOK_TYPE, _BOOK_TYPE_TEXT, _BOOK_QTY, _BOOK_QTY_TEXT, _BOOK_NIGHTS, _BOOK_NIGHTS_TEXT, _BOOK_DATE, _BOOK_DATE_TEXT = range(6, 14)
+_SETUP_NAME, _SETUP_TZ, _SETUP_CONFIRM = range(14, 17)
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -1860,6 +1863,147 @@ async def _cb_debtors_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await _reply_long_cb(q, text)
 
 
+# ── /setup wizard ─────────────────────────────────────────────────────
+
+async def _cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    # Only a hardcoded admin (ADMIN_IDS) can run setup — the users table may not
+    # exist yet or may be empty on a brand-new deployment.
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text(
+            "🔒 Only the configured bot owner can run /setup.\n"
+            "Add your Telegram ID to ADMIN\\_IDS in the deployment environment.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    existing = db.get_setting("hotel_name")
+    if existing:
+        await update.message.reply_text(
+            f"✅ Already set up as *{existing}*\\.\n"
+            "Run /help to see all available commands\\.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    ctx.user_data["setup_username"] = update.effective_user.username or str(uid)
+    await update.message.reply_text(
+        "👋 *Welcome to Hotel Bot Setup!*\n\n"
+        "Let's configure your hotel in a few steps.\n\n"
+        "What is your hotel's name?",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SETUP_NAME
+
+
+async def _setup_receive_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text("Please enter a valid hotel name (at least 2 characters).")
+        return _SETUP_NAME
+
+    ctx.user_data["setup_name"] = name
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇳🇬 Africa/Lagos",        callback_data="stz:Africa/Lagos"),
+            InlineKeyboardButton("🇬🇭 Africa/Accra",        callback_data="stz:Africa/Accra"),
+        ],
+        [
+            InlineKeyboardButton("🇰🇪 Africa/Nairobi",      callback_data="stz:Africa/Nairobi"),
+            InlineKeyboardButton("🇿🇦 Africa/Johannesburg", callback_data="stz:Africa/Johannesburg"),
+        ],
+        [InlineKeyboardButton("✏️ Enter manually",          callback_data="stz:manual")],
+    ])
+    await update.message.reply_text(
+        f"*{name}* ✓\n\nSelect your timezone:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+    return _SETUP_TZ
+
+
+async def _setup_tz_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    choice = q.data[len("stz:"):]
+
+    if choice == "manual":
+        await q.message.reply_text(
+            "Type your timezone — e.g. `Europe/London`, `America/New_York`:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return _SETUP_TZ
+
+    ctx.user_data["setup_tz"] = choice
+    await _show_setup_confirm(q.message, ctx)
+    return _SETUP_CONFIRM
+
+
+async def _setup_tz_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tz_input = update.message.text.strip()
+    try:
+        pytz.timezone(tz_input)
+    except pytz.exceptions.UnknownTimeZoneError:
+        await update.message.reply_text(
+            f"❌ Unknown timezone `{tz_input}`\\. Try again — e.g. `Africa/Lagos`:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return _SETUP_TZ
+
+    ctx.user_data["setup_tz"] = tz_input
+    await _show_setup_confirm(update.message, ctx)
+    return _SETUP_CONFIRM
+
+
+async def _show_setup_confirm(message, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    name = ctx.user_data["setup_name"]
+    tz   = ctx.user_data["setup_tz"]
+    uname = ctx.user_data.get("setup_username", "you")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm", callback_data="sconf:yes"),
+        InlineKeyboardButton("❌ Cancel",  callback_data="sconf:no"),
+    ]])
+    await message.reply_text(
+        f"*Ready to set up:*\n\n"
+        f"🏨 Hotel: {name}\n"
+        f"🕐 Timezone: {tz}\n"
+        f"👤 Admin: @{uname}\n\n"
+        "Confirm?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+
+async def _setup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "sconf:no":
+        ctx.user_data.clear()
+        await q.message.reply_text("Setup cancelled. Run /setup to start again.")
+        return ConversationHandler.END
+
+    name  = ctx.user_data["setup_name"]
+    tz    = ctx.user_data["setup_tz"]
+    user  = q.from_user
+
+    db.set_setting("hotel_name", name)
+    db.set_setting("timezone", tz)
+    db.upsert_user(user.id, user.username or str(user.id), role="admin")
+    db.register_hotel_details(name, user.id, tz)
+
+    ctx.user_data.clear()
+    await q.message.reply_text(
+        f"✅ *{name}* is ready\\!\n\n"
+        f"You're registered as admin\\.\n"
+        f"Add your staff: /addstaff `<user\\_id>` `<username>`\n"
+        f"Run /help to see all commands\\.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_get_keyboard(user.id),
+    )
+    return ConversationHandler.END
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1867,11 +2011,28 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
     db.init_db()
-    logger.info("Database initialised. Hotel: %s", HOTEL_NAME)
+    db.validate_hotel_schema()
+    hotel_display = db.get_setting("hotel_name") or HOTEL_NAME or HOTEL_SCHEMA
+    logger.info("Database initialised. Hotel: %s (schema: %s)", hotel_display, HOTEL_SCHEMA)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Register handlers — ConversationHandlers FIRST so they capture their entry points
+    setup_conv = ConversationHandler(
+        entry_points=[CommandHandler("setup", _cmd_setup)],
+        states={
+            _SETUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, _setup_receive_name)],
+            _SETUP_TZ: [
+                CallbackQueryHandler(_setup_tz_pick, pattern="^stz:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _setup_tz_text),
+            ],
+            _SETUP_CONFIRM: [CallbackQueryHandler(_setup_confirm, pattern="^sconf:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    app.add_handler(setup_conv)
+
     sell_conv = ConversationHandler(
         entry_points=[
             CommandHandler("sell", cmd_sell_start),
@@ -1916,6 +2077,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(_cb_report_date, pattern="^rpd:"))
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
 
+    app.add_handler(CommandHandler("setup", _cmd_setup))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))

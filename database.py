@@ -4,9 +4,15 @@ database.py — PostgreSQL persistence layer via SQLAlchemy.
 Tables are auto-created on init_db(). All reads return list[dict],
 all writes use parameterised queries. Same public API as before —
 no changes needed in inventory.py, logic.py, or reports.py.
+
+Multi-tenancy: each hotel deployment sets HOTEL_SCHEMA to a unique slug
+(e.g. "hotel85"). get_engine() injects search_path=<schema>,public so all
+unqualified table names resolve to that hotel's schema automatically.
+The master registry lives in public.hotels (always schema-qualified).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime
 from typing import Any
@@ -18,13 +24,27 @@ from sqlalchemy.engine import Engine
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 
-def get_engine() -> Engine:
+def _canonical_url() -> str:
     url = DATABASE_URL
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     if not url:
         raise RuntimeError("DATABASE_URL environment variable is not set.")
-    return create_engine(url)
+    return url
+
+
+def get_engine() -> Engine:
+    from config import HOTEL_SCHEMA
+    schema = HOTEL_SCHEMA or "public"
+    return create_engine(
+        _canonical_url(),
+        connect_args={"options": f"-c search_path={schema},public"},
+    )
+
+
+def _base_engine() -> Engine:
+    """Engine with no custom search_path — used for public-schema registry queries."""
+    return create_engine(_canonical_url())
 
 
 def now_str() -> str:
@@ -42,6 +62,38 @@ def _ts(custom: str | None = None) -> str:
 
 def init_db() -> None:
     """Create all tables if they don't exist."""
+    from config import BOT_TOKEN, HOTEL_SCHEMA
+    token_hash = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
+
+    # Step 1: create master registry + hotel schema using the base engine so
+    # the search_path doesn't interfere with public.hotels creation.
+    base = _base_engine()
+    with base.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.hotels (
+                id                 SERIAL PRIMARY KEY,
+                name               TEXT,
+                schema_name        TEXT UNIQUE NOT NULL,
+                owner_telegram_id  BIGINT,
+                timezone           TEXT DEFAULT 'Africa/Lagos',
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active          BOOLEAN DEFAULT TRUE,
+                bot_token_hash     TEXT
+            )
+        """))
+        if HOTEL_SCHEMA:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{HOTEL_SCHEMA}"'))
+            # ON CONFLICT DO NOTHING: if this schema is already registered by
+            # a different bot token, the insert silently fails — validate_hotel_schema()
+            # will catch the mismatch and abort startup.
+            conn.execute(text("""
+                INSERT INTO public.hotels (schema_name, bot_token_hash)
+                VALUES (:schema, :hash)
+                ON CONFLICT (schema_name) DO NOTHING
+            """), {"schema": HOTEL_SCHEMA, "hash": token_hash})
+        conn.commit()
+
+    # Step 2: create hotel tables under the hotel schema (search_path routes them).
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
@@ -171,6 +223,52 @@ def init_db() -> None:
                 value   TEXT NOT NULL
             )
         """))
+        conn.commit()
+
+
+# ── Schema validation & hotel registration ───────────────────────────
+
+def validate_hotel_schema() -> None:
+    """Called once on startup. Raises RuntimeError if HOTEL_SCHEMA is misconfigured
+    or if this bot token is not authorised for the registered schema (security lock)."""
+    from config import BOT_TOKEN, HOTEL_SCHEMA
+    if not HOTEL_SCHEMA:
+        raise RuntimeError(
+            "HOTEL_SCHEMA env var is not set. "
+            "Each hotel deployment must set a unique slug (e.g. HOTEL_SCHEMA=hotel85)."
+        )
+    token_hash = hashlib.sha256(BOT_TOKEN.encode()).hexdigest() if BOT_TOKEN else ""
+    with _base_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT is_active, bot_token_hash FROM public.hotels WHERE schema_name = :s"),
+            {"s": HOTEL_SCHEMA},
+        ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"Schema '{HOTEL_SCHEMA}' is not registered in public.hotels. "
+            "This should not happen — init_db() must run first."
+        )
+    if not row[0]:
+        raise RuntimeError(
+            f"Hotel '{HOTEL_SCHEMA}' is suspended. Contact the service administrator."
+        )
+    stored_hash = row[1] or ""
+    if stored_hash and stored_hash != token_hash:
+        raise RuntimeError(
+            f"This bot token is not authorised for schema '{HOTEL_SCHEMA}'. "
+            "Each hotel must use its own dedicated bot token."
+        )
+
+
+def register_hotel_details(name: str, owner_id: int, timezone: str) -> None:
+    """Update public.hotels with hotel name, owner, and timezone after /setup."""
+    from config import HOTEL_SCHEMA
+    with _base_engine().connect() as conn:
+        conn.execute(text("""
+            UPDATE public.hotels
+               SET name = :name, owner_telegram_id = :oid, timezone = :tz
+             WHERE schema_name = :schema
+        """), {"name": name, "oid": owner_id, "tz": timezone, "schema": HOTEL_SCHEMA})
         conn.commit()
 
 
