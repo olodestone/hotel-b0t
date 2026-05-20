@@ -140,6 +140,18 @@ def _require_admin(fn):
     return wrapper
 
 
+def _require_owner(fn):
+    """Decorator: app-owner only — checks the global ADMIN_IDS env var, not per-hotel admins."""
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if uid not in ADMIN_IDS:
+            await update.message.reply_text("🔒 This command is restricted to the service owner.")
+            return
+        return await fn(update, ctx)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 # ── Parse helpers ─────────────────────────────────────────────────────
 
 def _parse_args(ctx: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -1246,6 +1258,38 @@ def _schedule_daily_report(
     logger.info("Daily report scheduled at %s %s for chat_id=%s schema=%s", time_str, tz_str, chat_id, schema)
 
 
+# ── /hotels (app owner only) ─────────────────────────────────────────
+
+@_require_owner
+async def cmd_hotels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from sqlalchemy import text as _text
+    base = db._base_engine()
+    with base.connect() as conn:
+        rows = conn.execute(_text(
+            "SELECT schema_name, name, is_active, created_at, owner_telegram_id "
+            "FROM public.hotels ORDER BY id"
+        )).fetchall()
+
+    if not rows:
+        await _reply(update, "No hotels registered yet.")
+        return
+
+    lines = ["*🏨 All Hotels*\n"]
+    for r in rows:
+        status = "✅" if r[2] else "🔴 suspended"
+        name = r[1] or "_(not set up)_"
+        created = str(r[3])[:10] if r[3] else "—"
+        owner = f"tg:{r[4]}" if r[4] else "—"
+        lines.append(
+            f"{status} *{r[0]}*\n"
+            f"  Name: {name}\n"
+            f"  Owner: {owner}\n"
+            f"  Added: {created}"
+        )
+
+    await _reply(update, "\n\n".join(lines))
+
+
 # ── /export (admin) ───────────────────────────────────────────────────
 
 _EXPORT_TABLES = [
@@ -2192,6 +2236,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("removestaff", cmd_removestaff))
     app.add_handler(CommandHandler("dailyreport", cmd_dailyreport))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("hotels", cmd_hotels))
     app.add_error_handler(_error_handler)
 
 
