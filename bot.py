@@ -30,6 +30,7 @@ Admin only:
   /addstaff <user_id> <username>             — Grant staff access
   /removestaff <user_id>                     — Revoke access
   /dailyreport on|off                        — Toggle scheduled reports
+  /export                                    — Download full hotel data as Excel file
 """
 from __future__ import annotations
 
@@ -302,7 +303,8 @@ def _help_text(is_admin: bool = False) -> str:
         "`/setthreshold <drink> <amount>`\n"
         "`/addstaff <user_id> <username>` | `/removestaff <user_id>`\n"
         "`/dailyreport on|off`\n"
-        "`/activity` | `/activity YYYY-MM-DD` | `/activity username`"
+        "`/activity` | `/activity YYYY-MM-DD` | `/activity username`\n"
+        "`/export` — download full hotel data as Excel file"
     )
     return staff_cmds + admin_cmds
 
