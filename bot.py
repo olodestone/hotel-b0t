@@ -239,19 +239,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # First-ever user becomes admin if no ADMIN_IDS configured
-    if not ADMIN_IDS and not db.read_all("users"):
+    # Only the pre-approved admin ID (set via add_hotel.py --admin-id) gets admin access.
+    # Nobody can self-promote — random users are always locked out.
+    if _is_admin(uid):
         db.upsert_user(uid, username, role="admin")
+        hotel_name = db.get_setting("hotel_name") or HOTEL_NAME
         await _reply(
             update,
-            f"🏨 *{HOTEL_NAME}* Bot\n\n"
-            f"Welcome, *{username}*! You've been registered as *admin* "
-            f"(first user, no ADMIN_IDS set).\n\n"
+            f"🏨 *{hotel_name}* Bot\n\n"
+            f"Welcome, *{username}*! You're registered as *admin*.\n\n"
             + _help_text(is_admin=True),
         )
-    elif _is_admin(uid):
-        db.upsert_user(uid, username, role="admin")
-        await _reply(update, f"✅ Registered as *admin*, {username}.")
     else:
         await _reply(
             update,
