@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import calendar as _cal
 import contextvars
+import io
 import logging
 import os
 import re
@@ -1245,6 +1246,67 @@ def _schedule_daily_report(
     logger.info("Daily report scheduled at %s %s for chat_id=%s schema=%s", time_str, tz_str, chat_id, schema)
 
 
+# ── /export (admin) ───────────────────────────────────────────────────
+
+_EXPORT_TABLES = [
+    "sales", "rooms", "expenses", "debtors", "debtor_payments",
+    "inventory", "transfers", "users", "settings",
+]
+
+
+def _build_export_excel(schema: str) -> io.BytesIO:
+    import pandas as pd
+    engine = db.get_engine()
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # Summary sheet
+        with engine.connect() as conn:
+            from sqlalchemy import text as _text
+            rows = []
+            def _q(sql):
+                return round(float(conn.execute(_text(sql)).scalar() or 0), 2)
+
+            rows.append(("Bar Revenue (₦)",      _q("SELECT COALESCE(SUM(total_revenue),0) FROM sales WHERE deleted_at='' OR deleted_at IS NULL")))
+            rows.append(("Rooms Revenue (₦)",    _q("SELECT COALESCE(SUM(total_revenue),0) FROM rooms WHERE deleted_at='' OR deleted_at IS NULL")))
+            rows.append(("Total Expenses (₦)",   _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE deleted_at='' OR deleted_at IS NULL")))
+            rows.append(("Outstanding Debt (₦)", _q("SELECT COALESCE(SUM(amount - amount_paid),0) FROM debtors WHERE status='outstanding'")))
+            rows.append(("Bar Stock Value (₦)",  _q("SELECT COALESCE(SUM(current_stock * cost_price),0) FROM inventory")))
+            rows.append(("Store Stock Value (₦)",_q("SELECT COALESCE(SUM(store_stock * cost_price),0) FROM inventory")))
+            rows.append(("Export Date", date.today().strftime("%Y-%m-%d")))
+
+        pd.DataFrame(rows, columns=["Metric", "Value"]).to_excel(writer, sheet_name="Summary", index=False)
+
+        # One sheet per table
+        for table in _EXPORT_TABLES:
+            try:
+                df = pd.read_sql(f"SELECT * FROM {table}", engine)
+                df.to_excel(writer, sheet_name=table.title(), index=False)
+            except Exception:
+                pass
+
+    buf.seek(0)
+    return buf
+
+
+@_require_admin
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    schema = db._hotel_schema_var.get() or HOTEL_SCHEMA
+    await _reply(update, "⏳ Generating export, please wait…")
+    try:
+        buf = await asyncio.get_event_loop().run_in_executor(None, _build_export_excel, schema)
+        filename = f"{schema}_export_{date.today().strftime('%Y%m%d')}.xlsx"
+        await update.message.reply_document(
+            document=buf,
+            filename=filename,
+            caption=f"📊 Full data export for *{schema}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error("Export failed: %s", e, exc_info=e)
+        await _reply(update, "❌ Export failed. Please try again.")
+
+
 # ── Error handler ─────────────────────────────────────────────────────
 
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2129,6 +2191,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("addstaff", cmd_addstaff))
     app.add_handler(CommandHandler("removestaff", cmd_removestaff))
     app.add_handler(CommandHandler("dailyreport", cmd_dailyreport))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_error_handler(_error_handler)
 
 
