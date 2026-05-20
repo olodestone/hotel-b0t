@@ -33,10 +33,13 @@ Admin only:
 """
 from __future__ import annotations
 
+import asyncio
 import calendar as _cal
+import contextvars
 import logging
 import os
 import re
+import signal
 from datetime import date, timedelta
 from datetime import time as dtime
 
@@ -50,6 +53,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -73,6 +77,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Per-update context variable — set by each bot's schema-setter so _is_admin and
+# decorators use the right admin list without any handler code changes.
+_active_admin_ids: contextvars.ContextVar[list[int]] = contextvars.ContextVar("admin_ids", default=[])
+
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["🍺 Sell", "🛏 Book Room"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"]],
@@ -90,7 +98,8 @@ def _get_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 # ── Access helpers ────────────────────────────────────────────────────
 
 def _is_admin(user_id: int) -> bool:
-    if user_id in ADMIN_IDS:
+    ids = _active_admin_ids.get() or ADMIN_IDS
+    if user_id in ids:
         return True
     user = db.get_user(user_id)
     return user is not None and user.get("role") == "admin"
@@ -1202,30 +1211,38 @@ async def cmd_dailyreport(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, "✅ Daily report is already *enabled*.")
         return
 
-    chat_id = REPORT_CHAT_ID or update.effective_chat.id
-    _schedule_daily_report(ctx.job_queue, chat_id)
-    await _reply(update, f"✅ Daily report *enabled* — sends at {DAILY_REPORT_TIME} ({TIMEZONE}).")
+    bot_cfg = ctx.application.bot_data
+    chat_id = bot_cfg.get("report_chat_id") or REPORT_CHAT_ID or update.effective_chat.id
+    schema = bot_cfg.get("schema") or HOTEL_SCHEMA
+    tz_str = bot_cfg.get("timezone") or TIMEZONE
+    time_str = bot_cfg.get("daily_report_time") or DAILY_REPORT_TIME
+    _schedule_daily_report(ctx.job_queue, chat_id, schema, tz_str, time_str)
+    await _reply(update, f"✅ Daily report *enabled* — sends at {time_str} ({tz_str}).")
 
 
 # ── Scheduled job ─────────────────────────────────────────────────────
 
 async def _send_daily_report(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = ctx.job.data
+    chat_id, schema = ctx.job.data
+    db._hotel_schema_var.set(schema)
     text = reports.generate_daily_report()
     await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
-    logger.info("Daily report sent to chat_id=%s", chat_id)
+    logger.info("Daily report sent to chat_id=%s schema=%s", chat_id, schema)
 
 
-def _schedule_daily_report(job_queue, chat_id: int) -> None:
-    hour, minute = [int(x) for x in DAILY_REPORT_TIME.split(":")]
-    tz = pytz.timezone(TIMEZONE)
+def _schedule_daily_report(
+    job_queue, chat_id: int, schema: str,
+    tz_str: str = "Africa/Lagos", time_str: str = "23:00",
+) -> None:
+    hour, minute = [int(x) for x in time_str.split(":")]
+    tz = pytz.timezone(tz_str)
     job_queue.run_daily(
         _send_daily_report,
         time=dtime(hour=hour, minute=minute, tzinfo=tz),
         name="daily_report",
-        data=chat_id,
+        data=(chat_id, schema),
     )
-    logger.info("Daily report scheduled at %s %s for chat_id=%s", DAILY_REPORT_TIME, TIMEZONE, chat_id)
+    logger.info("Daily report scheduled at %s %s for chat_id=%s schema=%s", time_str, tz_str, chat_id, schema)
 
 
 # ── Error handler ─────────────────────────────────────────────────────
@@ -2006,16 +2023,15 @@ async def _setup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 # ── Main ──────────────────────────────────────────────────────────────
 
-def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is not set.")
+def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> None:
+    """Register all command/callback handlers on app. Called once per hotel bot."""
 
-    db.init_db()
-    db.validate_hotel_schema()
-    hotel_display = db.get_setting("hotel_name") or HOTEL_NAME or HOTEL_SCHEMA
-    logger.info("Database initialised. Hotel: %s (schema: %s)", hotel_display, HOTEL_SCHEMA)
+    # ── Schema + admin-IDs setter (group -1 — runs before any other handler) ──
+    async def _set_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        db._hotel_schema_var.set(schema)
+        _active_admin_ids.set(admin_ids)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(TypeHandler(Update, _set_context), group=-1)
 
     # Register handlers — ConversationHandlers FIRST so they capture their entry points
     setup_conv = ConversationHandler(
@@ -2115,12 +2131,92 @@ def main() -> None:
     app.add_handler(CommandHandler("dailyreport", cmd_dailyreport))
     app.add_error_handler(_error_handler)
 
-    # Auto-schedule daily report if REPORT_CHAT_ID is configured
-    if REPORT_CHAT_ID:
-        _schedule_daily_report(app.job_queue, REPORT_CHAT_ID)
 
-    logger.info("Bot starting (polling)…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+def _build_app(
+    token: str,
+    schema: str,
+    admin_ids: list[int],
+    report_chat_id: int | None = None,
+    timezone: str = "Africa/Lagos",
+    daily_report_time: str = "23:00",
+) -> Application:
+    """Build and configure a fully wired Application for one hotel."""
+    app = Application.builder().token(token).build()
+    app.bot_data.update({
+        "schema": schema,
+        "admin_ids": admin_ids,
+        "report_chat_id": report_chat_id,
+        "timezone": timezone,
+        "daily_report_time": daily_report_time,
+    })
+    _register_handlers(app, schema, admin_ids)
+    if report_chat_id:
+        _schedule_daily_report(app.job_queue, report_chat_id, schema, timezone, daily_report_time)
+    return app
+
+
+async def _run_bot(app: Application, schema: str) -> None:
+    async with app:
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+        )
+        logger.info("Bot running for schema=%s", schema)
+        await asyncio.Event().wait()  # block until cancelled
+
+
+def main() -> None:
+    # ── Bootstrap: run init_db once using env-var credentials ──────────
+    if BOT_TOKEN and HOTEL_SCHEMA:
+        db.init_db()
+        db.validate_hotel_schema()
+        # Register the env-var hotel's token so the multi-bot runner sees it
+        admin_ids_str = ",".join(str(i) for i in ADMIN_IDS)
+        db.add_hotel_config(HOTEL_SCHEMA, BOT_TOKEN, admin_ids_str)
+
+    # ── Load all hotel configs from DB ──────────────────────────────────
+    configs = db.get_all_hotel_configs()
+    if not configs:
+        raise RuntimeError(
+            "No hotel configs found. Set BOT_TOKEN + HOTEL_SCHEMA env vars for the first hotel."
+        )
+
+    # ── Build one Application per hotel ────────────────────────────────
+    apps: list[tuple[Application, str]] = []
+    for cfg in configs:
+        raw_ids = [x.strip() for x in (cfg["admin_ids"] or "").split(",") if x.strip().isdigit()]
+        ids = [int(x) for x in raw_ids]
+        # Ensure tables exist for this hotel schema
+        db.init_db(schema=cfg["schema"], token=cfg["token"])
+        app = _build_app(
+            token=cfg["token"],
+            schema=cfg["schema"],
+            admin_ids=ids,
+            report_chat_id=REPORT_CHAT_ID if cfg["schema"] == HOTEL_SCHEMA else None,
+            timezone=TIMEZONE,
+            daily_report_time=DAILY_REPORT_TIME,
+        )
+        apps.append((app, cfg["schema"]))
+        logger.info("Loaded hotel schema=%s", cfg["schema"])
+
+    # ── Run all bots concurrently ───────────────────────────────────────
+    async def _run_all() -> None:
+        tasks = [
+            asyncio.create_task(_run_bot(app, schema))
+            for app, schema in apps
+        ]
+        loop = asyncio.get_running_loop()
+
+        def _shutdown() -> None:
+            for t in tasks:
+                t.cancel()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _shutdown)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(_run_all())
 
 
 if __name__ == "__main__":
