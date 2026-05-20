@@ -96,6 +96,8 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         """))
         conn.execute(text("ALTER TABLE public.hotels ADD COLUMN IF NOT EXISTS bot_token TEXT"))
         conn.execute(text("ALTER TABLE public.hotels ADD COLUMN IF NOT EXISTS admin_ids TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE public.hotels ADD COLUMN IF NOT EXISTS subscription_expires_at DATE"))
+        conn.execute(text("ALTER TABLE public.hotels ADD COLUMN IF NOT EXISTS expiry_notified_days TEXT DEFAULT ''"  ))
         if s:
             conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{s}"'))
             conn.execute(text("""
@@ -285,6 +287,54 @@ def register_hotel_details(name: str, owner_id: int, timezone: str) -> None:
                SET name = :name, owner_telegram_id = :oid, timezone = :tz
              WHERE schema_name = :schema
         """), {"name": name, "oid": owner_id, "tz": timezone, "schema": schema})
+        conn.commit()
+
+
+def set_subscription_expiry(schema: str, expiry_date: str) -> None:
+    """Set subscription expiry date (YYYY-MM-DD) for a hotel. Resets notified days."""
+    with _base_engine().connect() as conn:
+        conn.execute(text("""
+            UPDATE public.hotels
+               SET subscription_expires_at = :exp, expiry_notified_days = ''
+             WHERE schema_name = :s
+        """), {"exp": expiry_date, "s": schema})
+        conn.commit()
+
+
+def get_expiring_hotels() -> list[dict]:
+    """Return all active hotels that have a subscription expiry date set."""
+    with _base_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT schema_name, name, bot_token, owner_telegram_id, admin_ids,
+                   subscription_expires_at, expiry_notified_days
+              FROM public.hotels
+             WHERE is_active = TRUE
+               AND subscription_expires_at IS NOT NULL
+             ORDER BY subscription_expires_at
+        """)).fetchall()
+    return [
+        {
+            "schema": r[0], "name": r[1] or r[0], "token": r[2],
+            "owner_id": r[3],
+            "admin_ids": r[4] or "",
+            "expires_at": str(r[5]),
+            "notified_days": r[6] or "",
+        }
+        for r in rows
+    ]
+
+
+def mark_expiry_notified(schema: str, days_label: str) -> None:
+    """Record that a notification was sent for this days_label (e.g. '7', '3', '1', '0')."""
+    with _base_engine().connect() as conn:
+        conn.execute(text("""
+            UPDATE public.hotels
+               SET expiry_notified_days = CASE
+                   WHEN expiry_notified_days = '' THEN :label
+                   ELSE expiry_notified_days || ',' || :label
+               END
+             WHERE schema_name = :s
+        """), {"label": days_label, "s": schema})
         conn.commit()
 
 

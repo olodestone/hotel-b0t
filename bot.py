@@ -84,6 +84,9 @@ logger = logging.getLogger(__name__)
 # decorators use the right admin list without any handler code changes.
 _active_admin_ids: contextvars.ContextVar[list[int]] = contextvars.ContextVar("admin_ids", default=[])
 
+# Populated in main() — maps schema → Application so broadcast can reach all hotels' bots.
+_hotel_apps: dict[str, "Application"] = {}
+
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["🍺 Sell", "🛏 Book Room"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"]],
@@ -1292,6 +1295,168 @@ async def cmd_hotels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, "\n\n".join(lines))
 
 
+# ── Subscription expiry check ─────────────────────────────────────────
+
+async def _check_subscriptions(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily job — warns hotel owner before expiry; notifies all users and auto-suspends on expiry."""
+    today = date.today()
+    hotels = db.get_expiring_hotels()
+
+    for h in hotels:
+        expires = date.fromisoformat(h["expires_at"])
+        days_left = (expires - today).days
+        notified = h["notified_days"].split(",") if h["notified_days"] else []
+
+        if days_left < 0 and "0" not in notified:
+            label = "0"
+            owner_msg = (
+                f"🔴 *{h['name']} — Subscription Expired*\n\n"
+                f"Your subscription expired on *{h['expires_at']}* and the bot has been suspended.\n\n"
+                f"Contact the service provider to renew and restore access."
+            )
+            staff_msg = (
+                f"🔴 *{h['name']} Bot — Service Suspended*\n\n"
+                f"This bot's service has ended. Please contact your hotel manager."
+            )
+        elif days_left <= 1 and "1" not in notified:
+            label = "1"
+            owner_msg = (
+                f"🚨 *{h['name']} — 1 Day Left!*\n\n"
+                f"Your subscription expires *tomorrow ({h['expires_at']})*.\n"
+                f"Renew now to avoid the bot being suspended."
+            )
+            staff_msg = None  # warnings go to owner only
+        elif days_left <= 3 and "3" not in notified:
+            label = "3"
+            owner_msg = (
+                f"⚠️ *{h['name']} — 3 Days Left*\n\n"
+                f"Your subscription expires on *{h['expires_at']}*. Please renew soon."
+            )
+            staff_msg = None
+        elif days_left <= 7 and "7" not in notified:
+            label = "7"
+            owner_msg = (
+                f"📅 *{h['name']} — 7 Days Left*\n\n"
+                f"Your subscription expires on *{h['expires_at']}*. Renew before it runs out."
+            )
+            staff_msg = None
+        else:
+            continue
+
+        app = _hotel_apps.get(h["schema"])
+        if not app:
+            continue
+
+        # Resolve owner Telegram ID
+        owner_id = h["owner_id"]
+        if not owner_id:
+            ids = [x.strip() for x in h["admin_ids"].split(",") if x.strip().isdigit()]
+            owner_id = int(ids[0]) if ids else None
+
+        # Send to owner
+        if owner_id:
+            try:
+                await app.bot.send_message(
+                    chat_id=int(owner_id), text=owner_msg, parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.warning("Failed to notify %s owner: %s", h["schema"], e)
+
+        # On expiry — notify all staff too, then auto-suspend
+        if label == "0" and staff_msg:
+            db._hotel_schema_var.set(h["schema"])
+            try:
+                users = db.read_all("users")
+                for user in users:
+                    uid = int(user["user_id"])
+                    if uid == owner_id:
+                        continue  # owner already got the owner message
+                    try:
+                        await app.bot.send_message(
+                            chat_id=uid, text=staff_msg, parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("Failed to notify %s staff on expiry: %s", h["schema"], e)
+
+            try:
+                from sqlalchemy import text as _text
+                with db._base_engine().connect() as conn:
+                    conn.execute(
+                        _text("UPDATE public.hotels SET is_active = FALSE WHERE schema_name = :s"),
+                        {"s": h["schema"]},
+                    )
+                    conn.commit()
+                logger.info("Auto-suspended %s — subscription expired", h["schema"])
+            except Exception as e:
+                logger.error("Failed to auto-suspend %s: %s", h["schema"], e)
+
+        db.mark_expiry_notified(h["schema"], label)
+
+
+# ── Broadcast helper + /broadcast (app owner only) ───────────────────
+
+async def _broadcast_all(message: str) -> tuple[int, int]:
+    """Send message to every user across every hotel. Returns (sent, failed)."""
+    sent = failed = 0
+    for schema, app in _hotel_apps.items():
+        db._hotel_schema_var.set(schema)
+        try:
+            users = db.read_all("users")
+        except Exception:
+            continue
+        for user in users:
+            try:
+                await app.bot.send_message(
+                    chat_id=int(user["user_id"]),
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+    return sent, failed
+
+
+@_require_owner
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(update, "Usage: `/broadcast <message>`\nSends to all users across all hotels.")
+        return
+    message = " ".join(args)
+    await _reply(update, "📢 Sending…")
+    sent, failed = await _broadcast_all(message)
+    await _reply(update, f"✅ Broadcast complete — {sent} delivered, {failed} failed.")
+
+
+# ── /setexpiry (app owner only) ──────────────────────────────────────
+
+@_require_owner
+async def cmd_setexpiry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(update,
+            "*Usage:* `/setexpiry <schema> <YYYY-MM-DD>`\n"
+            "*Example:* `/setexpiry kings_inn 2026-06-20`"
+        )
+        return
+    schema, expiry = args[0].strip().lower(), args[1].strip()
+    if not _DATE_RE.match(expiry):
+        await _reply(update, "❌ Date must be in `YYYY-MM-DD` format.")
+        return
+    try:
+        db.set_subscription_expiry(schema, expiry)
+    except Exception as e:
+        await _reply(update, f"❌ Failed: `{e}`")
+        return
+    await _reply(update,
+        f"✅ *{schema}* subscription set to expire on *{expiry}*.\n"
+        f"Owner will be notified at 7, 3, and 1 day before expiry."
+    )
+
+
 # ── /addhotel (app owner only) ───────────────────────────────────────
 
 @_require_owner
@@ -2318,6 +2483,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("hotels", cmd_hotels))
     app.add_handler(CommandHandler("addhotel", cmd_addhotel))
+    app.add_handler(CommandHandler("setexpiry", cmd_setexpiry))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("suspend", cmd_suspend))
     app.add_handler(CommandHandler("unsuspend", cmd_unsuspend))
     app.add_error_handler(_error_handler)
@@ -2330,6 +2497,7 @@ def _build_app(
     report_chat_id: int | None = None,
     timezone: str = "Africa/Lagos",
     daily_report_time: str = "23:00",
+    is_owner_bot: bool = False,
 ) -> Application:
     """Build and configure a fully wired Application for one hotel."""
     app = Application.builder().token(token).build()
@@ -2343,6 +2511,15 @@ def _build_app(
     _register_handlers(app, schema, admin_ids)
     if report_chat_id:
         _schedule_daily_report(app.job_queue, report_chat_id, schema, timezone, daily_report_time)
+    if is_owner_bot:
+        # Run subscription expiry check once daily at 09:00 Lagos time
+        tz = pytz.timezone(timezone)
+        app.job_queue.run_daily(
+            _check_subscriptions,
+            time=dtime(hour=9, minute=0, tzinfo=tz),
+            name="subscription_check",
+        )
+        logger.info("Subscription expiry check scheduled daily at 09:00 %s", timezone)
     return app
 
 
@@ -2386,8 +2563,10 @@ def main() -> None:
             report_chat_id=REPORT_CHAT_ID if cfg["schema"] == HOTEL_SCHEMA else None,
             timezone=TIMEZONE,
             daily_report_time=DAILY_REPORT_TIME,
+            is_owner_bot=cfg["schema"] == HOTEL_SCHEMA,
         )
         apps.append((app, cfg["schema"]))
+        _hotel_apps[cfg["schema"]] = app
         logger.info("Loaded hotel schema=%s", cfg["schema"])
 
     # ── Run all bots concurrently ───────────────────────────────────────
@@ -2399,13 +2578,22 @@ def main() -> None:
         loop = asyncio.get_running_loop()
 
         def _shutdown() -> None:
-            for t in tasks:
-                t.cancel()
+            asyncio.ensure_future(_notify_and_cancel(tasks))
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _shutdown)
 
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _notify_and_cancel(tasks) -> None:
+        try:
+            await _broadcast_all(
+                "⚠️ *Bot is restarting for maintenance.* We'll be back in a moment."
+            )
+        except Exception:
+            pass
+        for t in tasks:
+            t.cancel()
 
     asyncio.run(_run_all())
 
