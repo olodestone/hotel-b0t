@@ -1290,6 +1290,48 @@ async def cmd_hotels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, "\n\n".join(lines))
 
 
+# ── /suspend + /unsuspend (app owner only) ───────────────────────────
+
+@_require_owner
+async def cmd_suspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(update, "Usage: `/suspend <schema>`\nExample: `/suspend kings_inn`")
+        return
+    schema = args[0].strip().lower()
+    from sqlalchemy import text as _text
+    with db._base_engine().connect() as conn:
+        result = conn.execute(
+            _text("UPDATE public.hotels SET is_active = FALSE WHERE schema_name = :s"),
+            {"s": schema},
+        )
+        conn.commit()
+    if result.rowcount == 0:
+        await _reply(update, f"❌ Hotel `{schema}` not found.")
+        return
+    await _reply(update, f"🔴 *{schema}* suspended.\nData is fully preserved. Restart the service to cut off their bot.")
+
+
+@_require_owner
+async def cmd_unsuspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(update, "Usage: `/unsuspend <schema>`\nExample: `/unsuspend kings_inn`")
+        return
+    schema = args[0].strip().lower()
+    from sqlalchemy import text as _text
+    with db._base_engine().connect() as conn:
+        result = conn.execute(
+            _text("UPDATE public.hotels SET is_active = TRUE WHERE schema_name = :s"),
+            {"s": schema},
+        )
+        conn.commit()
+    if result.rowcount == 0:
+        await _reply(update, f"❌ Hotel `{schema}` not found.")
+        return
+    await _reply(update, f"✅ *{schema}* unsuspended.\nRestart the service to bring their bot back.")
+
+
 # ── /export (admin) ───────────────────────────────────────────────────
 
 _EXPORT_TABLES = [
@@ -2237,6 +2279,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("dailyreport", cmd_dailyreport))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("hotels", cmd_hotels))
+    app.add_handler(CommandHandler("suspend", cmd_suspend))
+    app.add_handler(CommandHandler("unsuspend", cmd_unsuspend))
     app.add_error_handler(_error_handler)
 
 
