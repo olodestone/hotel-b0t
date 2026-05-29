@@ -25,10 +25,83 @@ def _fmt(amount: float) -> str:
 
 
 def _esc(text: str) -> str:
-    """Escape MarkdownV1 special characters in user-provided text."""
+    """Escape the MarkdownV2 *markup* delimiters in a single dynamic field.
+
+    Only the characters that escape_markdown_v2() treats as intentional markup
+    (``_ * `` and ``[``) need pre-escaping here, so that literal underscores in
+    a user-typed description/name are not mistaken for italics. Every other V2
+    special character (``. - ( ) ! + = | { } # > ~``) is escaped automatically
+    by escape_markdown_v2() at send time, so it must NOT be doubled here.
+    """
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+# MarkdownV2 characters that must be backslash-escaped outside of code blocks.
+_MD2_SPECIAL = set("_*[]()~`>#+-=|{}.!")
+
+
+def escape_markdown_v2(s: str) -> str:
+    """Escape a fully-assembled message for Telegram MarkdownV2.
+
+    This is a *markup-aware* escaper applied once to the final string at send
+    time. Bare ``*``/``_``/`` ` `` (and ``` ``` ``` fences) are left intact as
+    intentional bold/italic/code markup; every other special character is
+    backslash-escaped so literal dates (``2026-05-05``), amounts, parentheses
+    and punctuation render verbatim. Content inside inline code spans and
+    fenced code blocks is passed through untouched (Telegram only treats
+    backtick/backslash specially there). Sequences already escaped by _esc()
+    (e.g. ``\\_``) are preserved as-is rather than double-escaped.
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    in_block = False   # inside a ``` fenced block
+    in_span = False    # inside an inline `code` span
+    while i < n:
+        # Fenced code block delimiter (only outside an inline span).
+        if not in_span and s.startswith("```", i):
+            in_block = not in_block
+            out.append("```")
+            i += 3
+            continue
+        ch = s[i]
+        if in_block:
+            out.append("\\\\" if ch == "\\" else ch)
+            i += 1
+            continue
+        if ch == "`":
+            in_span = not in_span
+            out.append("`")
+            i += 1
+            continue
+        if in_span:
+            out.append("\\\\" if ch == "\\" else ch)
+            i += 1
+            continue
+        # Outside any code context.
+        if ch == "\\":
+            # Preserve an already-escaped special pair from _esc(); otherwise
+            # escape a literal backslash.
+            if i + 1 < n and s[i + 1] in _MD2_SPECIAL:
+                out.append(s[i:i + 2])
+                i += 2
+            else:
+                out.append("\\\\")
+                i += 1
+            continue
+        if ch in "*_":
+            out.append(ch)            # intentional bold/italic markup
+            i += 1
+            continue
+        if ch in _MD2_SPECIAL:
+            out.append("\\")
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 # ── Core aggregations ─────────────────────────────────────────────────
@@ -491,13 +564,13 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
             lines.append(_SEP)
             lines.append("🏆 *Top Sellers*")
             for drink, qty in top_drinks:
-                lines.append(f"  • {drink}: {qty} units")
+                lines.append(f"  • {_esc(drink)}: {qty} units")
         if outstanding:
             lines.append(_SEP)
             lines.append(f"💳 *Debtors:* {len(outstanding)} outstanding — {_fmt(owed)} owed")
         if low_bar:
             lines.append(_SEP)
-            lines.append(f"⚠️ Low Bar Stock: {', '.join(low_bar)}")
+            lines.append(f"⚠️ Low Bar Stock: {', '.join(_esc(d) for d in low_bar)}")
             lines.append("_Ask admin to transfer from store._")
         lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
@@ -537,7 +610,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
         lines.append(_SEP)
         lines.append("🏆 *Top Sellers*")
         for drink, qty in top_drinks:
-            lines.append(f"  • {drink}: {qty} units")
+            lines.append(f"  • {_esc(drink)}: {qty} units")
 
     if outstanding:
         owed = sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding)
@@ -547,9 +620,9 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
     if low_bar or empty_store:
         lines.append(_SEP)
         if low_bar:
-            lines.append(f"⚠️ Low Bar Stock: {', '.join(low_bar)}")
+            lines.append(f"⚠️ Low Bar Stock: {', '.join(_esc(d) for d in low_bar)}")
         if empty_store:
-            lines.append(f"🔴 Empty Store: {', '.join(empty_store)}")
+            lines.append(f"🔴 Empty Store: {', '.join(_esc(d) for d in empty_store)}")
 
     if total_rev > 0:
         buffer_pct, restock_pct = _get_alloc_pcts()
@@ -659,7 +732,7 @@ def generate_allocation_report(
         for rt in sorted(room_by_type):
             d = room_by_type[rt]
             pct = round(d["revenue"] / room_rev * 100)
-            lines.append(f"    • {rt} ({d['bookings']} bookings): {_fmt(d['revenue'])}  {pct}%")
+            lines.append(f"    • {_esc(rt)} ({d['bookings']} bookings): {_fmt(d['revenue'])}  {pct}%")
 
     lines += [
         _SEP,
@@ -965,7 +1038,7 @@ def generate_stock_report(staff_view: bool = False) -> str:
         if low_bar_items:
             lines.append("⚠️ *Low Bar Stock* — ask admin to transfer:")
             for name in low_bar_items:
-                lines.append(f"  • {name}")
+                lines.append(f"  • {_esc(name)}")
         lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
 
@@ -1016,12 +1089,12 @@ def generate_stock_report(staff_view: bool = False) -> str:
     if low_bar_items:
         lines.append("⚠️ *Low Bar Stock* (transfer from store):")
         for name in low_bar_items:
-            lines.append(f"  • {name}")
+            lines.append(f"  • {_esc(name)}")
 
     if empty_store_items:
         lines.append("🔴 *Store Empty* (needs restock):")
         for name in empty_store_items:
-            lines.append(f"  • {name}")
+            lines.append(f"  • {_esc(name)}")
 
     lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
@@ -1062,7 +1135,7 @@ def generate_price_list() -> str:
         "```",
     ]
     if unpriced:
-        lines.append(f"⚠️ No price set for: {', '.join(unpriced)}")
+        lines.append(f"⚠️ No price set for: {', '.join(_esc(u) for u in unpriced)}")
         lines.append("_Admin: use /setprice <drink> <amount> to set._")
 
     room_presets = db.get_all_room_type_prices()
@@ -1095,7 +1168,7 @@ def generate_debtor_history(account: str, name: str) -> str:
         return f"🧾 No debt history for *{_esc(name.title())}* in *{_esc(account.title())}*."
 
     lines = [
-        f"🧾 *Debt History — {name.title()} ({account.title()})*",
+        f"🧾 *Debt History — {_esc(name.title())} ({_esc(account.title())})*",
         _SEP,
     ]
 
@@ -1120,7 +1193,7 @@ def generate_debtor_history(account: str, name: str) -> str:
             pts = str(p.get("timestamp", ""))[:10]
             pamt = float(p["amount"])
             pby = p.get("recorded_by", "")
-            by_note = f" by @{pby}" if pby else ""
+            by_note = f" by @{_esc(pby)}" if pby else ""
             lines.append(f"    💳 {pts}: paid {_fmt(pamt)}{by_note}")
 
         if status == "outstanding":
@@ -1159,7 +1232,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
     except ValueError:
         label = date_str
 
-    filter_note = f" — @{username_filter}" if username_filter else ""
+    filter_note = f" — @{_esc(username_filter)}" if username_filter else ""
 
     if not entries:
         msg = f"No activity recorded for *{_esc(username_filter)}*." if username_filter else "No activity recorded."
@@ -1177,7 +1250,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
     lines = [f"📋 *Activity Log — {label}*{filter_note}", _SEP]
 
     for actor in sorted(by_actor):
-        lines.append(f"👤 *@{actor}*")
+        lines.append(f"👤 *@{_esc(actor)}*")
         for e in by_actor[actor]:
             ts = e.get("timestamp", "")
             try:
@@ -1228,7 +1301,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
                 amt = float(e.get("amount", 0))
                 lines.append(f"  {time_str}  ✅ Paid debtor: {name} ({acct}) — {_fmt(amt)}")
             elif etype == "transfer":
-                drink = str(e.get("drink_name", "?")).title()
+                drink = _esc(str(e.get("drink_name", "?")).title())
                 qty = int(e.get("quantity", 0))
                 lines.append(f"  {time_str}  📦 Transfer: {qty}× {drink} store→bar")
         lines.append("")
