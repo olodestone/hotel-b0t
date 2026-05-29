@@ -1798,6 +1798,20 @@ def _date_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return _calendar_keyboard(prefix, today.year, today.month)
 
 
+def _staff_date_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    """Two-button date picker for staff — today and yesterday only."""
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Today",      callback_data=f"{prefix}:today"),
+        InlineKeyboardButton("⬅️ Yesterday", callback_data=f"{prefix}:{yesterday}"),
+    ]])
+
+
+def _date_keyboard_for(prefix: str, user_id: int) -> InlineKeyboardMarkup:
+    """Full calendar for admins, today/yesterday only for staff."""
+    return _date_keyboard(prefix) if _is_admin(user_id) else _staff_date_keyboard(prefix)
+
+
 async def _cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data.clear()
     if update.message:
@@ -1852,10 +1866,11 @@ async def _sell_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await q.edit_message_text("How many? (type a number)")
         return _SELL_QTY_TEXT
     ctx.user_data["sell_qty"] = int(val)
+    uid = update.effective_user.id
     await q.edit_message_text(
         f"🍺 {val}× {ctx.user_data.get('sell_drink', '').title()} — when?",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_date_keyboard("sdd"),
+        reply_markup=_date_keyboard_for("sdd", uid),
     )
     return _SELL_DATE
 
@@ -1868,10 +1883,11 @@ async def _sell_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return _SELL_QTY_TEXT
     ctx.user_data["sell_qty"] = qty
     drink = ctx.user_data.get("sell_drink", "")
+    uid = update.effective_user.id
     await update.message.reply_text(
         f"🍺 {qty}× {drink.title()} — when?",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_date_keyboard("sdd"),
+        reply_markup=_date_keyboard_for("sdd", uid),
     )
     return _SELL_DATE
 
@@ -1907,6 +1923,14 @@ async def _sell_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     return _SELL_DATE
 
 
+async def _remove_undo_button(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id, message_id = ctx.job.data
+    try:
+        await ctx.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+    except Exception:
+        pass
+
+
 async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: str | None = None) -> int:
     drink = ctx.user_data.pop("sell_drink", "")
     qty   = ctx.user_data.pop("sell_qty", 1)
@@ -1915,7 +1939,16 @@ async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
     ok, msg, alert = logic.process_drink_sale(drink, qty, timestamp=timestamp, recorded_by=recorded_by)
     if timestamp and ok:
         msg += f"\n_(recorded for {timestamp})_"
-    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    if ok:
+        undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo — tap to cancel this entry", callback_data="undo:sell")]])
+        sent = await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=undo_kb)
+        ctx.application.job_queue.run_once(
+            _remove_undo_button, 120,
+            data=(sent.chat_id, sent.message_id),
+            name=f"undo_{sent.message_id}",
+        )
+    else:
+        await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
     if ok and alert:
         for admin_id in ADMIN_IDS:
             if admin_id != user.id:
@@ -2018,10 +2051,11 @@ async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         await q.edit_message_text("How many nights? (type a number)")
         return _BOOK_NIGHTS_TEXT
     ctx.user_data["book_nights"] = int(val)
+    uid = update.effective_user.id
     await q.edit_message_text(
         f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {val} nights — when?",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_date_keyboard("bdd"),
+        reply_markup=_date_keyboard_for("bdd", uid),
     )
     return _BOOK_DATE
 
@@ -2033,10 +2067,11 @@ async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Enter a whole number:")
         return _BOOK_NIGHTS_TEXT
     ctx.user_data["book_nights"] = nights
+    uid = update.effective_user.id
     await update.message.reply_text(
         f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {nights} nights — when?",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_date_keyboard("bdd"),
+        reply_markup=_date_keyboard_for("bdd", uid),
     )
     return _BOOK_DATE
 
@@ -2088,8 +2123,107 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
         )
         return ConversationHandler.END
     ok, msg = logic.process_room_sale(rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
-    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    if ok:
+        undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo — tap to cancel this booking", callback_data="undo:book")]])
+        sent = await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=undo_kb)
+        ctx.application.job_queue.run_once(
+            _remove_undo_button, 120,
+            data=(sent.chat_id, sent.message_id),
+            name=f"undo_{sent.message_id}",
+        )
+    else:
+        await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
+
+
+# ── Inline undo callback ──────────────────────────────────────────────
+
+async def _cb_undo_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = update.effective_user
+    username = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_undo(username)
+    if ok:
+        # Cancel the scheduled button-removal job
+        for job in ctx.application.job_queue.get_jobs_by_name(f"undo_{q.message.message_id}"):
+            job.schedule_removal()
+        await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await q.answer(msg, show_alert=True)
+
+
+# ── History date picker ────────────────────────────────────────────────
+
+@_require_auth
+async def _btn_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📋 *History — which day?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_date_keyboard("hst"),
+    )
+
+
+async def _cb_history_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]  # strip "hst:"
+
+    if val.startswith("cal_p:") or val.startswith("cal_n:"):
+        ym = val[6:]
+        y, m = int(ym[:4]), int(ym[5:7])
+        await q.edit_message_text(
+            "📋 *History — which day?*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_calendar_keyboard("hst", y, m),
+        )
+        return
+
+    if val == "cal_x":
+        return
+
+    from datetime import datetime as _dt
+    date_str = _dt.now().strftime("%Y-%m-%d") if val == "today" else val
+    label = _dt.strptime(date_str, "%Y-%m-%d").strftime("%d %b %Y")
+    entries = db.get_entries_by_date(date_str)
+
+    if not entries:
+        await q.edit_message_text(f"📋 No entries for *{label}*.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    is_admin = _is_admin(q.from_user.id)
+    sales    = [e for e in entries if e["entry_type"] == "sale"]
+    rooms    = [e for e in entries if e["entry_type"] == "room"]
+    expenses = [e for e in entries if e["entry_type"] == "expense"]
+
+    lines = [f"📋 *Entries for {label}*", "─" * 30]
+    if sales:
+        lines.append("🍺 *Sales*")
+        for e in sales:
+            lines.append(
+                f"  `[{e['id']}]` {e['drink_name'].title()} ×{e['quantity']} "
+                f"@ ₦{float(e['selling_price']):,.0f} = ₦{float(e['total_revenue']):,.0f}"
+            )
+    if rooms:
+        lines.append("🛏 *Rooms*")
+        for e in rooms:
+            lines.append(
+                f"  `[{e['id']}]` {e['room_type'].title()} ×{e['quantity']} "
+                f"@ ₦{float(e['price_per_night']):,.0f} ×{e['nights']} nights "
+                f"= ₦{float(e['total_revenue']):,.0f}"
+            )
+    if expenses and is_admin:
+        lines.append("💸 *Expenses*")
+        for e in expenses:
+            note = f" — {e['description']}" if e.get("description") else ""
+            lines.append(
+                f"  `[{e['id']}]` {e['account'].title()} › {e['category'].title()} "
+                f"₦{float(e['amount']):,.0f}{note}"
+            )
+    if is_admin:
+        lines.append("\n_Tap_ ⚙️ *Manage → 🗑 Delete Entry* _to remove._")
+
+    await _reply_long_cb(q, "\n".join(lines))
 
 
 # ── Keyboard shortcut handlers ────────────────────────────────────────
@@ -3721,11 +3855,13 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(MessageHandler(filters.Text(["📋 Report"]) & ~filters.COMMAND, _btn_report))
     app.add_handler(MessageHandler(filters.Text(["💰 Prices"]) & ~filters.COMMAND, cmd_prices))
     app.add_handler(MessageHandler(filters.Text(["📦 Stock"]) & ~filters.COMMAND, _btn_stock))
-    app.add_handler(MessageHandler(filters.Text(["📜 History"]) & ~filters.COMMAND, cmd_history))
+    app.add_handler(MessageHandler(filters.Text(["📜 History"]) & ~filters.COMMAND, _btn_history))
     app.add_handler(MessageHandler(filters.Text(["💳 Debtors"]) & ~filters.COMMAND, _btn_debtors))
     app.add_handler(CallbackQueryHandler(_cb_report_type, pattern="^rep:"))
     app.add_handler(CallbackQueryHandler(_cb_report_date, pattern="^rpd:"))
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
+    app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
+    app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
     app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|settings|staff|addstaff|removestaff)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
