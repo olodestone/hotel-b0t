@@ -283,3 +283,74 @@ def process_transfer(drink: str, qty: int, recorded_by: str = "") -> tuple[bool,
     if result.low_stock_alert:
         msg += f"\n\n{result.low_stock_alert}"
     return result.ok, msg
+
+
+# ── Inventory corrections ─────────────────────────────────────────────
+
+def process_rename_drink(old: str, new: str) -> tuple[bool, str]:
+    """Rename a drink, or merge it into an existing SKU (de-duplicate)."""
+    old_n, new_n = old.strip().lower(), new.strip().lower()
+    if not old_n or not new_n:
+        return False, "❌ Provide both names: `/renamedrink <old> <new>`"
+    if old_n == new_n:
+        return False, "❌ Old and new names are the same — nothing to do."
+    if db.get_drink(old_n) is None:
+        return False, f"❌ *{old.title()}* not found in inventory."
+
+    res = db.rename_or_merge_drink(old_n, new_n)
+    if res is None:
+        return False, f"❌ *{old.title()}* not found in inventory."
+
+    row = res["row"]
+    store, bar = int(row.get("store_stock", 0)), int(row.get("current_stock", 0))
+    if res["merged"]:
+        return True, (
+            f"✅ Merged *{old.title()}* into *{new.title()}*.\n"
+            f"  Moved: {res['moved_store']} store + {res['moved_bar']} bar\n"
+            f"  *{new.title()}* now: {store} store · {bar} bar\n"
+            f"  _Old SKU removed; sales history reattached._"
+        )
+    return True, (
+        f"✅ Renamed *{old.title()}* → *{new.title()}*.\n"
+        f"  {store} store · {bar} bar"
+    )
+
+
+def process_set_stock(drink: str, store: int, bar: int) -> tuple[bool, str]:
+    """Overwrite a drink's store + bar counts (for miscounts/breakage/spoilage)."""
+    name = drink.strip().lower()
+    if not name:
+        return False, "❌ Provide a drink name."
+    if store < 0 or bar < 0:
+        return False, "❌ Stock counts cannot be negative."
+    existing = db.get_drink(name)
+    if existing is None:
+        return False, f"❌ *{drink.title()}* not found in inventory. Run `/restock` first."
+
+    old_store, old_bar = int(existing["store_stock"]), int(existing["current_stock"])
+    db.set_drink_stock(name, store, bar)
+    return True, (
+        f"✅ Stock corrected for *{drink.title()}*\n"
+        f"  Store: {old_store} → *{store}*\n"
+        f"  Bar:   {old_bar} → *{bar}*\n"
+        f"  _Lifetime purchase/sales totals unchanged._"
+    )
+
+
+def process_delete_drink(drink: str, force: bool = False) -> tuple[bool, str]:
+    """Delete an inventory SKU. Refuses if it still holds stock unless forced."""
+    name = drink.strip().lower()
+    if not name:
+        return False, "❌ Provide a drink name."
+    existing = db.get_drink(name)
+    if existing is None:
+        return False, f"❌ *{drink.title()}* not found in inventory."
+
+    store, bar = int(existing["store_stock"]), int(existing["current_stock"])
+    if (store + bar) > 0 and not force:
+        return False, (
+            f"❌ *{drink.title()}* still has stock ({store} store · {bar} bar).\n"
+            f"Zero it first: `/setstock {name} 0 0` — then delete."
+        )
+    db.delete_drink(name)
+    return True, f"🗑 Removed *{drink.title()}* from inventory."

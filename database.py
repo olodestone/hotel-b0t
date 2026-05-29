@@ -734,6 +734,94 @@ def transfer_drink(drink: str, qty: int) -> dict[str, Any]:
     return get_drink(name) or {}
 
 
+# ── Inventory corrections (rename/merge, set stock, delete) ───────────
+
+def rename_or_merge_drink(old: str, new: str) -> dict[str, Any] | None:
+    """Rename a drink, or merge it into an existing one.
+
+    If `new` already exists, sums old's stock + lifetime totals into it
+    (keeping new's cost/selling price + threshold), reassigns old's sales rows
+    to new, then deletes old. Otherwise it is a plain rename. Returns a summary
+    dict, or None if `old` does not exist.
+    """
+    old_n, new_n = old.strip().lower(), new.strip().lower()
+    old_row = get_drink(old_n)
+    if old_row is None:
+        return None
+    target = get_drink(new_n)
+    o_store = int(old_row["store_stock"])
+    o_bar = int(old_row["current_stock"])
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        if target is None:
+            conn.execute(
+                text("UPDATE inventory SET drink_name = :new WHERE lower(drink_name) = :old"),
+                {"new": new_n, "old": old_n},
+            )
+            merged = False
+        else:
+            conn.execute(text("""
+                UPDATE inventory SET
+                    current_stock   = current_stock   + :bar,
+                    store_stock     = store_stock     + :store,
+                    total_purchased = total_purchased + :bought,
+                    total_sold      = total_sold      + :sold
+                WHERE lower(drink_name) = :new
+            """), {
+                "bar": o_bar, "store": o_store,
+                "bought": int(old_row.get("total_purchased") or 0),
+                "sold": int(old_row.get("total_sold") or 0),
+                "new": new_n,
+            })
+            conn.execute(text("DELETE FROM inventory WHERE lower(drink_name) = :old"), {"old": old_n})
+            merged = True
+        # Keep sales history attached to the surviving SKU name.
+        conn.execute(
+            text("UPDATE sales SET drink_name = :new WHERE lower(drink_name) = :old"),
+            {"new": new_n, "old": old_n},
+        )
+        conn.commit()
+
+    return {
+        "merged": merged, "old": old_n, "new": new_n,
+        "moved_store": o_store, "moved_bar": o_bar,
+        "row": get_drink(new_n) or {},
+    }
+
+
+def set_drink_stock(drink: str, store: int, bar: int) -> dict[str, Any] | None:
+    """Overwrite store + bar counts for a drink (lifetime totals untouched).
+
+    Returns the updated row, or None if the drink does not exist.
+    """
+    name = drink.strip().lower()
+    if get_drink(name) is None:
+        return None
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE inventory
+               SET store_stock = :store, current_stock = :bar
+             WHERE lower(drink_name) = :name
+        """), {"store": store, "bar": bar, "name": name})
+        conn.commit()
+    return get_drink(name)
+
+
+def delete_drink(drink: str) -> dict[str, Any] | None:
+    """Delete an inventory row. Returns the deleted row, or None if not found."""
+    name = drink.strip().lower()
+    row = get_drink(name)
+    if row is None:
+        return None
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM inventory WHERE lower(drink_name) = :name"), {"name": name})
+        conn.commit()
+    return row
+
+
 # ── Entry history & deletion ─────────────────────────────────────────
 
 def get_entries_by_date(date_str: str) -> list[dict[str, Any]]:

@@ -376,7 +376,11 @@ def _help_text(is_admin: bool = False) -> str:
         "`/pay_debt <id> [amount]` — pay by debt ID\n"
         "`/set_debt_staff <id> <staff>` — assign staff to a debt\n"
         "`/restock <drink> <qty> <cost_price>`\n"
+        "`/restock_plan` — weekly restock advisor _(transfers, reorder tiers, budget)_\n"
         "`/transfer <drink> <qty>` — move store → bar\n"
+        "`/renamedrink <old> <new>` — rename, or merge duplicate SKUs\n"
+        "`/setstock <drink> <store> <bar>` — correct stock counts\n"
+        "`/deletedrink <drink>` — remove a zero-stock drink\n"
         "`/delete <sale|room|expense> <id>`\n"
         "`/setprice <drink> <price>`\n"
         "`/setroomtype <type> <price>` — set room type preset price\n"
@@ -959,6 +963,80 @@ async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     is_admin = _is_admin(update.effective_user.id)
     text = reports.generate_stock_report(staff_view=not is_admin)
     await _reply_long(update, text)
+
+
+# ── /restock_plan ─────────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_restock_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
+
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_restock_plan(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_restock_plan(for_date=datetime.now().date())
+    elif arg == "all":
+        text = reports.generate_restock_plan(all_time=True)
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_restock_plan(for_date=dt.date())
+        except ValueError:
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_restock_plan(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/restock_plan` | `/restock_plan today` | `/restock_plan YYYY-MM-DD` | `/restock_plan YYYY-MM` | `/restock_plan all`")
+                return
+    await _reply_long(update, text)
+
+
+# ── Inventory corrections (/renamedrink, /setstock, /deletedrink) ─────
+
+@_require_admin
+async def cmd_renamedrink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        await _reply(update,
+            "Usage: `/renamedrink <old> <new>`\n"
+            "Example: `/renamedrink coca-cola cocacola`\n"
+            "_If <new> already exists, the two are merged into one._")
+        return
+    ok, msg = logic.process_rename_drink(args[0], args[1])
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_setstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if len(args) < 3:
+        await _reply(update,
+            "Usage: `/setstock <drink> <store> <bar>`\n"
+            "Example: `/setstock heineken 12 6`\n"
+            "_Corrects counts after a recount/breakage — does not touch sales history._")
+        return
+    try:
+        store, bar = int(args[1]), int(args[2])
+        if store < 0 or bar < 0:
+            raise ValueError
+    except ValueError:
+        await _reply(update, "❌ Store and bar must be whole numbers ≥ 0.")
+        return
+    ok, msg = logic.process_set_stock(args[0], store, bar)
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_deletedrink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(update, "Usage: `/deletedrink <drink>`\n_Only removes a drink with zero stock._")
+        return
+    ok, msg = logic.process_delete_drink(args[0])
+    await _reply(update, msg)
 
 
 # ── /sales_report ─────────────────────────────────────────────────────
@@ -1756,6 +1834,9 @@ _SSET_ROOM_TYPE, _SSET_ROOM_TYPE_TEXT, _SSET_ROOM_AMT = range(45, 48)
 _SSET_THRESH_DRINK, _SSET_THRESH_AMT = range(48, 50)
 _SSET_ALLOC_KEY, _SSET_ALLOC_VAL = range(50, 52)
 _ACT_DATE = 52
+_RNM_OLD, _RNM_NEW = range(53, 55)
+_SST_DRINK, _SST_STORE, _SST_BAR = range(55, 58)
+_DDR_DRINK, _DDR_CONFIRM = range(58, 60)
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2288,9 +2369,33 @@ def _manage_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📊 Allocation",   callback_data="mgr:allocation")],
         [InlineKeyboardButton("🗑 Delete Entry", callback_data="mgr:delete"),
          InlineKeyboardButton("📋 Activity",     callback_data="mgr:activity")],
+        [InlineKeyboardButton("📈 Restock Plan", callback_data="mgr:restock_plan"),
+         InlineKeyboardButton("🛠 Fix Stock",    callback_data="mgr:fixstock")],
         [InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings"),
          InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff")],
     ])
+
+
+def _fixstock_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔀 Rename / Merge", callback_data="fix:rename")],
+        [InlineKeyboardButton("🔢 Set Count",      callback_data="fix:setstock")],
+        [InlineKeyboardButton("🗑 Delete Drink",   callback_data="fix:delete")],
+    ])
+
+
+def _existing_drink_kb(prefix: str) -> InlineKeyboardMarkup:
+    """Keyboard of existing drinks only (no 'new drink' option), 2 per row."""
+    items = inv.get_inventory_summary()
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in items:
+        row.append(InlineKeyboardButton(i["drink"], callback_data=f"{prefix}:{i['drink'].lower()}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _settings_menu_keyboard() -> InlineKeyboardMarkup:
@@ -3123,6 +3228,142 @@ async def _sthr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Fix Stock flows (rename/merge, set count, delete) ──────────────────
+
+async def _rnm_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🔀 *Rename / Merge — which drink?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_existing_drink_kb("rnm_old"),
+    )
+    return _RNM_OLD
+
+
+async def _rnm_pick_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    old = q.data.split(":", 1)[1]
+    ctx.user_data["rnm_old"] = old
+    await q.edit_message_text(
+        f"🔀 Changing *{reports._esc(old.title())}*\n\n"
+        "Type the *new name*, or tap an existing drink to *merge* into it:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_existing_drink_kb("rnm_new"),
+    )
+    return _RNM_NEW
+
+
+async def _rnm_pick_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    new = q.data.split(":", 1)[1]
+    old = ctx.user_data.pop("rnm_old", "")
+    _ok, msg = logic.process_rename_drink(old, new)
+    await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    return ConversationHandler.END
+
+
+async def _rnm_new_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    new = update.message.text.strip()
+    old = ctx.user_data.pop("rnm_old", "")
+    _ok, msg = logic.process_rename_drink(old, new)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+async def _sst_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🔢 *Set Count — which drink?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_existing_drink_kb("sst_dr"),
+    )
+    return _SST_DRINK
+
+
+async def _sst_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data.split(":", 1)[1]
+    ctx.user_data["sst_drink"] = drink
+    row = db.get_drink(drink) or {}
+    store, bar = int(row.get("store_stock", 0)), int(row.get("current_stock", 0))
+    await q.edit_message_text(
+        f"🔢 *{reports._esc(drink.title())}* — now {store} store · {bar} bar\n\n"
+        "New *STORE* count? (whole number)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _SST_STORE
+
+
+async def _sst_store(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("❌ Enter a whole number ≥ 0 for STORE:")
+        return _SST_STORE
+    ctx.user_data["sst_store"] = int(txt)
+    await update.message.reply_text("New *BAR* count? (whole number)", parse_mode=ParseMode.MARKDOWN_V2)
+    return _SST_BAR
+
+
+async def _sst_bar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("❌ Enter a whole number ≥ 0 for BAR:")
+        return _SST_BAR
+    drink = ctx.user_data.pop("sst_drink", "")
+    store = ctx.user_data.pop("sst_store", 0)
+    _ok, msg = logic.process_set_stock(drink, store, int(txt))
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+async def _ddr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🗑 *Delete Drink — which one?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_existing_drink_kb("ddr_dr"),
+    )
+    return _DDR_DRINK
+
+
+async def _ddr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data.split(":", 1)[1]
+    ctx.user_data["ddr_drink"] = drink
+    row = db.get_drink(drink) or {}
+    store, bar = int(row.get("store_stock", 0)), int(row.get("current_stock", 0))
+    warn = "" if (store + bar) == 0 else f"\n⚠️ It still holds *{store} store · {bar} bar* — these will be discarded."
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Delete", callback_data="ddrc:yes"),
+        InlineKeyboardButton("❌ Cancel", callback_data="ddrc:no"),
+    ]])
+    await q.edit_message_text(
+        f"🗑 Delete *{reports._esc(drink.title())}*?{warn}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=kb,
+    )
+    return _DDR_CONFIRM
+
+
+async def _ddr_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = ctx.user_data.pop("ddr_drink", "")
+    if q.data == "ddrc:no" or not drink:
+        await q.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+    _ok, msg = logic.process_delete_drink(drink, force=True)
+    await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    return ConversationHandler.END
+
+
 # ── Set Allocation % flow ──────────────────────────────────────────────
 
 _ALLOC_LABELS = {
@@ -3210,6 +3451,19 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         now = _dt.now()
         text = reports.generate_allocation_report(for_month=(now.year, now.month))
         await _reply_long_cb(q, text)
+
+    elif action == "restock_plan":
+        from datetime import datetime as _dt
+        now = _dt.now()
+        text = reports.generate_restock_plan(for_month=(now.year, now.month))
+        await _reply_long_cb(q, text)
+
+    elif action == "fixstock":
+        await q.edit_message_text(
+            "🛠 *Fix Stock*\n_Correct duplicate SKUs, wrong counts, or remove a drink._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_fixstock_menu_keyboard(),
+        )
 
     elif action == "settings":
         await q.edit_message_text(
@@ -3892,8 +4146,40 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    rnm_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_rnm_start, pattern="^fix:rename$")],
+        states={
+            _RNM_OLD: [CallbackQueryHandler(_rnm_pick_old, pattern="^rnm_old:")],
+            _RNM_NEW: [
+                CallbackQueryHandler(_rnm_pick_new, pattern="^rnm_new:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _rnm_new_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    sst_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_sst_start, pattern="^fix:setstock$")],
+        states={
+            _SST_DRINK: [CallbackQueryHandler(_sst_pick_drink, pattern="^sst_dr:")],
+            _SST_STORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sst_store)],
+            _SST_BAR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sst_bar)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    ddr_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_ddr_start, pattern="^fix:delete$")],
+        states={
+            _DDR_DRINK:   [CallbackQueryHandler(_ddr_pick_drink, pattern="^ddr_dr:")],
+            _DDR_CONFIRM: [CallbackQueryHandler(_ddr_confirm, pattern="^ddrc:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     for conv in (exp_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
-                 del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv):
+                 del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
+                 rnm_conv, sst_conv, ddr_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
@@ -3908,7 +4194,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
     app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
     app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
-    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|settings|staff|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|restock_plan|fixstock|settings|staff|addstaff|removestaff)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))
@@ -3942,9 +4228,13 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("allocation", cmd_allocation))
     app.add_handler(CommandHandler("setallocation", cmd_setallocation))
     app.add_handler(CommandHandler("stock", cmd_stock))
+    app.add_handler(CommandHandler("restock_plan", cmd_restock_plan))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("transfer", cmd_transfer))
+    app.add_handler(CommandHandler("renamedrink", cmd_renamedrink))
+    app.add_handler(CommandHandler("setstock", cmd_setstock))
+    app.add_handler(CommandHandler("deletedrink", cmd_deletedrink))
     app.add_handler(CommandHandler("setthreshold", cmd_setthreshold))
     app.add_handler(CommandHandler("addstaff", cmd_addstaff))
     app.add_handler(CommandHandler("removestaff", cmd_removestaff))
