@@ -6,6 +6,7 @@ All monetary values are in ₦ (Naira) — change the symbol in _fmt() if needed
 from __future__ import annotations
 
 from datetime import datetime, date
+from math import ceil
 from typing import Any
 
 import database as db
@@ -25,10 +26,83 @@ def _fmt(amount: float) -> str:
 
 
 def _esc(text: str) -> str:
-    """Escape MarkdownV1 special characters in user-provided text."""
+    """Escape the MarkdownV2 *markup* delimiters in a single dynamic field.
+
+    Only the characters that escape_markdown_v2() treats as intentional markup
+    (``_ * `` and ``[``) need pre-escaping here, so that literal underscores in
+    a user-typed description/name are not mistaken for italics. Every other V2
+    special character (``. - ( ) ! + = | { } # > ~``) is escaped automatically
+    by escape_markdown_v2() at send time, so it must NOT be doubled here.
+    """
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+# MarkdownV2 characters that must be backslash-escaped outside of code blocks.
+_MD2_SPECIAL = set("_*[]()~`>#+-=|{}.!")
+
+
+def escape_markdown_v2(s: str) -> str:
+    """Escape a fully-assembled message for Telegram MarkdownV2.
+
+    This is a *markup-aware* escaper applied once to the final string at send
+    time. Bare ``*``/``_``/`` ` `` (and ``` ``` ``` fences) are left intact as
+    intentional bold/italic/code markup; every other special character is
+    backslash-escaped so literal dates (``2026-05-05``), amounts, parentheses
+    and punctuation render verbatim. Content inside inline code spans and
+    fenced code blocks is passed through untouched (Telegram only treats
+    backtick/backslash specially there). Sequences already escaped by _esc()
+    (e.g. ``\\_``) are preserved as-is rather than double-escaped.
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    in_block = False   # inside a ``` fenced block
+    in_span = False    # inside an inline `code` span
+    while i < n:
+        # Fenced code block delimiter (only outside an inline span).
+        if not in_span and s.startswith("```", i):
+            in_block = not in_block
+            out.append("```")
+            i += 3
+            continue
+        ch = s[i]
+        if in_block:
+            out.append("\\\\" if ch == "\\" else ch)
+            i += 1
+            continue
+        if ch == "`":
+            in_span = not in_span
+            out.append("`")
+            i += 1
+            continue
+        if in_span:
+            out.append("\\\\" if ch == "\\" else ch)
+            i += 1
+            continue
+        # Outside any code context.
+        if ch == "\\":
+            # Preserve an already-escaped special pair from _esc(); otherwise
+            # escape a literal backslash.
+            if i + 1 < n and s[i + 1] in _MD2_SPECIAL:
+                out.append(s[i:i + 2])
+                i += 2
+            else:
+                out.append("\\\\")
+                i += 1
+            continue
+        if ch in "*_":
+            out.append(ch)            # intentional bold/italic markup
+            i += 1
+            continue
+        if ch in _MD2_SPECIAL:
+            out.append("\\")
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 # ── Core aggregations ─────────────────────────────────────────────────
@@ -491,13 +565,13 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
             lines.append(_SEP)
             lines.append("🏆 *Top Sellers*")
             for drink, qty in top_drinks:
-                lines.append(f"  • {drink}: {qty} units")
+                lines.append(f"  • {_esc(drink)}: {qty} units")
         if outstanding:
             lines.append(_SEP)
             lines.append(f"💳 *Debtors:* {len(outstanding)} outstanding — {_fmt(owed)} owed")
         if low_bar:
             lines.append(_SEP)
-            lines.append(f"⚠️ Low Bar Stock: {', '.join(low_bar)}")
+            lines.append(f"⚠️ Low Bar Stock: {', '.join(_esc(d) for d in low_bar)}")
             lines.append("_Ask admin to transfer from store._")
         lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
@@ -537,7 +611,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
         lines.append(_SEP)
         lines.append("🏆 *Top Sellers*")
         for drink, qty in top_drinks:
-            lines.append(f"  • {drink}: {qty} units")
+            lines.append(f"  • {_esc(drink)}: {qty} units")
 
     if outstanding:
         owed = sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding)
@@ -547,9 +621,9 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
     if low_bar or empty_store:
         lines.append(_SEP)
         if low_bar:
-            lines.append(f"⚠️ Low Bar Stock: {', '.join(low_bar)}")
+            lines.append(f"⚠️ Low Bar Stock: {', '.join(_esc(d) for d in low_bar)}")
         if empty_store:
-            lines.append(f"🔴 Empty Store: {', '.join(empty_store)}")
+            lines.append(f"🔴 Empty Store: {', '.join(_esc(d) for d in empty_store)}")
 
     if total_rev > 0:
         buffer_pct, restock_pct = _get_alloc_pcts()
@@ -659,7 +733,7 @@ def generate_allocation_report(
         for rt in sorted(room_by_type):
             d = room_by_type[rt]
             pct = round(d["revenue"] / room_rev * 100)
-            lines.append(f"    • {rt} ({d['bookings']} bookings): {_fmt(d['revenue'])}  {pct}%")
+            lines.append(f"    • {_esc(rt)} ({d['bookings']} bookings): {_fmt(d['revenue'])}  {pct}%")
 
     lines += [
         _SEP,
@@ -965,7 +1039,7 @@ def generate_stock_report(staff_view: bool = False) -> str:
         if low_bar_items:
             lines.append("⚠️ *Low Bar Stock* — ask admin to transfer:")
             for name in low_bar_items:
-                lines.append(f"  • {name}")
+                lines.append(f"  • {_esc(name)}")
         lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
 
@@ -1016,15 +1090,241 @@ def generate_stock_report(staff_view: bool = False) -> str:
     if low_bar_items:
         lines.append("⚠️ *Low Bar Stock* (transfer from store):")
         for name in low_bar_items:
-            lines.append(f"  • {name}")
+            lines.append(f"  • {_esc(name)}")
 
     if empty_store_items:
         lines.append("🔴 *Store Empty* (needs restock):")
         for name in empty_store_items:
-            lines.append(f"  • {name}")
+            lines.append(f"  • {_esc(name)}")
 
     lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
+
+
+# ── Restock plan (advisory) ───────────────────────────────────────────
+
+# Restock-advisor tuning constants.
+RESTOCK_BUDGET_PCT = 40    # max monthly bar restock as % of bar revenue
+HIGH_MARGIN = 400          # ₦/unit considered "high margin"
+_SLOW_MONTHLY = 5          # sold fewer than this/month = slow mover
+_NOW_WEEKS = 1.75          # store-empty + < this cover = reorder now
+_SOON_WEEKS = 3.5          # store-empty + < this cover = reorder soon
+
+_WEEK_CYCLE = {
+    1: "Week 1 — sell stock, spot fast movers",
+    2: "Week 2 — small targeted reorder",
+    3: "Week 3 — mid-month review, reorder on pace",
+    4: "Week 4 — minimal top-up, protect month-end cash",
+}
+
+
+def _order_range(weekly: float) -> tuple[str, int]:
+    """Return (display range, low-end qty) per the 2-week order guide."""
+    if weekly >= 16:
+        return "24–30", 24
+    if weekly >= 6:
+        return "14–20", 14
+    if weekly >= 1:
+        return "6–10", 6
+    return "6", 6
+
+
+def generate_restock_plan(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """Advisory weekly restock plan: transfers, reorder tiers, budget, warnings.
+
+    Velocity is derived from the period's sales (treated as a 4-week month);
+    defaults to the current month, which is the intended view.
+    """
+    items = inv.get_inventory_summary()
+    if not items:
+        return "📦 Inventory is empty. Use /restock to add drinks first."
+
+    label = _period_label(for_date, for_month, all_time)
+    today = for_date or datetime.now().date()
+    week_no = min((today.day - 1) // 7 + 1, 4)
+
+    # Sales velocity + bar revenue for the period.
+    sales_rows = _apply_filter(_active(db.read_all("sales")), for_date, for_month, all_time)
+    qty_by_drink: dict[str, int] = {}
+    bar_revenue = 0.0
+    for r in sales_rows:
+        nm = str(r["drink_name"]).lower()
+        qty_by_drink[nm] = qty_by_drink.get(nm, 0) + int(r["quantity"])
+        bar_revenue += float(r["total_revenue"])
+
+    # Restock already spent this period (bar / "restock" expenses).
+    exp_rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
+    restock_spent = sum(
+        float(e["amount"]) for e in exp_rows
+        if e.get("account") == "bar" and str(e.get("category", "")).lower() == "restock"
+    )
+
+    stock_value = sum(i["stock_value"] for i in items)
+    budget_cap = round(bar_revenue * RESTOCK_BUDGET_PCT / 100, 2)
+
+    transfers: list[tuple] = []   # (name, move, bar, new_bar, result_cover)
+    now: list[tuple] = []         # (name, monthly, weekly, rng, est, weeks, margin)
+    soon: list[tuple] = []
+    hold: list[tuple] = []        # (name, reason, monthly)
+    pricing: list[tuple] = []     # (name, idle_units, tied_value)
+    stockouts: list[str] = []     # selling items with bar == 0
+
+    for it in items:
+        name, bar, store = it["drink"], it["bar_stock"], it["store_stock"]
+        cost, price, margin = it["cost_price"], it["selling_price"], it["margin"]
+        monthly = qty_by_drink.get(name.lower(), 0)
+        weekly = monthly / 4.0
+        total = bar + store
+
+        # Transfer suggestion (store → bar) when bar cover is thin.
+        # Skip unpriced items — they can't be sold from the bar anyway.
+        move = 0
+        if store > 0 and price > 0:
+            if weekly > 0 and bar / weekly < 1.5:
+                move = min(store, max(0, ceil(weekly * 2) - bar))
+            elif weekly == 0 and bar == 0:
+                move = min(store, 5)   # make a dead-bar item sellable
+        if move > 0:
+            new_bar = bar + move
+            transfers.append((name, move, bar, new_bar, new_bar / weekly if weekly else 999))
+        store_after = store - move
+        weeks = total / weekly if weekly > 0 else float("inf")
+
+        if price <= 0:
+            pricing.append((name, total, round(total * cost, 2)))
+            continue
+        if bar == 0 and monthly > 0:
+            stockouts.append(name)
+
+        rng, low_qty = _order_range(weekly)
+        two_wk = ceil(weekly * 2)
+        note = f" (≈{two_wk}/2wk)" if two_wk > 30 else ""
+        row = (name, monthly, weekly, rng + note, round(low_qty * cost, 2), weeks, margin)
+
+        if monthly < _SLOW_MONTHLY:
+            hold.append((name, "slow mover", monthly))
+        elif store_after > 0:
+            hold.append((name, "store stock left", monthly))
+        elif weeks < _NOW_WEEKS:
+            now.append(row)
+        elif weeks < _SOON_WEEKS:
+            soon.append(row)
+        else:
+            hold.append((name, "ample bar cover", monthly))
+
+    now.sort(key=lambda r: r[5])      # most urgent (least cover) first
+    soon.sort(key=lambda r: r[5])
+    transfers.sort(key=lambda t: t[4])
+    est_now = sum(r[4] for r in now)
+
+    # Possible duplicate SKUs (same alphanumerics, different rows).
+    norm: dict[str, list[str]] = {}
+    for it in items:
+        key = "".join(c for c in it["drink"].lower() if c.isalnum())
+        norm.setdefault(key, []).append(it["drink"])
+    dupes = [v for v in norm.values() if len(v) > 1]
+
+    # ── Stock Turn Ratio ──
+    ratio = bar_revenue / stock_value if stock_value else 0.0
+    if ratio < 2:
+        rating = "🔴 Too much capital in slow stock"
+    elif ratio < 3:
+        rating = "🟡 Acceptable — monitor closely"
+    elif ratio <= 4:
+        rating = "🟢 Healthy"
+    else:
+        rating = "⚠️ Stockout risk — raise order quantities"
+
+    L: list[str] = [
+        f"📦 *{HOTEL_NAME} — Restock Plan*",
+        f"📅 {label} · {_WEEK_CYCLE[week_no]}",
+        _SEP,
+        "*1️⃣ Stock Turn Ratio*",
+        f"  {_fmt(bar_revenue)} ÷ {_fmt(stock_value)} = *{ratio:.2f}x*",
+        f"  {rating}",
+        _SEP,
+        "*2️⃣ Transfers* _store → bar · ₦0 cost_",
+    ]
+    if transfers:
+        for name, mv, b, nb, _cov in transfers:
+            L.append(f"  • *{_esc(name)}*: move *{mv}*  _(bar {b}→{nb})_")
+    else:
+        L.append("  _None needed._")
+
+    L += [_SEP, "*3️⃣ 🔴 Reorder Now* _store empty, running out_"]
+    if now:
+        for name, mo, wk, rng, est, weeks, mg in now:
+            L.append(f"  • *{_esc(name)}* — {weeks:.1f}wk left · {wk:.0f}/wk → *{rng}* ~{_fmt(est)}")
+    else:
+        L.append("  _Nothing critical. 🎉_")
+
+    L += [_SEP, "*4️⃣ 🟡 Reorder Soon*"]
+    if soon:
+        for name, mo, wk, rng, est, weeks, mg in soon:
+            L.append(f"  • *{_esc(name)}* — {weeks:.1f}wk · {wk:.0f}/wk → *{rng}*")
+    else:
+        L.append("  _Nothing pending._")
+
+    L += [_SEP, f"*5️⃣ 🟢 Hold* ({len(hold)} items)"]
+    slow = [n for n, reason, mo in hold if reason == "slow mover" and mo == 0]
+    if slow:
+        L.append(f"  _Not selling (review/promote):_ {', '.join(_esc(n) for n in slow)}")
+    else:
+        L.append("  _Stocked items with adequate cover._")
+
+    L += [_SEP, "*6️⃣ 🚩 Pricing Gaps*"]
+    if pricing:
+        for name, units, tied in pricing:
+            unit_word = "unit" if units == 1 else "units"
+            L.append(f"  • *{_esc(name)}*: no price — {units} {unit_word} idle ({_fmt(tied)})")
+    else:
+        L.append("  _All stocked items are priced. ✅_")
+    for names in dupes:
+        L.append(f"  ⚠️ Possible duplicate SKU: {', '.join(_esc(n) for n in names)}")
+
+    # ── Budget ──
+    spent_pct = (restock_spent / bar_revenue * 100) if bar_revenue else 0
+    L += [
+        _SEP,
+        "*7️⃣ Budget*",
+        f"  {RESTOCK_BUDGET_PCT}% of {_fmt(bar_revenue)} = *{_fmt(budget_cap)}* cap",
+        f"  Restock spent this period: {_fmt(restock_spent)} ({spent_pct:.0f}%)",
+        f"  🔴 Reorder Now (min qty): {_fmt(est_now)}",
+    ]
+
+    # ── Warnings ──
+    warns: list[str] = []
+    if budget_cap and restock_spent > budget_cap:
+        mult = restock_spent / budget_cap
+        warns.append(f"Restock spend {_fmt(restock_spent)} is *{mult:.1f}×* the {RESTOCK_BUDGET_PCT}% cap ({_fmt(budget_cap)}) — {spent_pct:.0f}% of revenue.")
+    if ratio and ratio < 2:
+        warns.append(f"Stock Turn Ratio {ratio:.2f}x is below 2x — too much cash in slow stock.")
+    elif 2 <= ratio < 2.3:
+        warns.append(f"Stock Turn Ratio {ratio:.2f}x is just above the 2x floor — capital tied in slow SKUs.")
+    elif ratio > 4:
+        warns.append(f"Stock Turn Ratio {ratio:.2f}x is above 4x — stockout risk, raise order quantities.")
+    if pricing:
+        warns.append(f"{len(pricing)} item(s) with no price set — cannot earn until priced.")
+    if dupes:
+        warns.append(f"{len(dupes)} possible duplicate SKU(s) splitting stock/sales.")
+    if stockouts:
+        warns.append(f"Complete bar stockout on selling item(s): {', '.join(_esc(n) for n in stockouts)}.")
+    if budget_cap and (restock_spent + est_now) > budget_cap:
+        warns.append(f"Adding 🔴 reorders ({_fmt(est_now)}) pushes spend to {_fmt(restock_spent + est_now)} — over cap. Stagger into weekly batches.")
+
+    L += [_SEP, "*8️⃣ ⚠️ Warnings*"]
+    if warns:
+        L += [f"  • {w}" for w in warns]
+    else:
+        L.append("  _None. ✅_")
+
+    L += [_SEP, "_Tip: do transfers first, then only the 🔴 items this week._",
+          f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_"]
+    return "\n".join(L)
 
 
 # ── Price list ────────────────────────────────────────────────────────
@@ -1062,7 +1362,7 @@ def generate_price_list() -> str:
         "```",
     ]
     if unpriced:
-        lines.append(f"⚠️ No price set for: {', '.join(unpriced)}")
+        lines.append(f"⚠️ No price set for: {', '.join(_esc(u) for u in unpriced)}")
         lines.append("_Admin: use /setprice <drink> <amount> to set._")
 
     room_presets = db.get_all_room_type_prices()
@@ -1095,7 +1395,7 @@ def generate_debtor_history(account: str, name: str) -> str:
         return f"🧾 No debt history for *{_esc(name.title())}* in *{_esc(account.title())}*."
 
     lines = [
-        f"🧾 *Debt History — {name.title()} ({account.title()})*",
+        f"🧾 *Debt History — {_esc(name.title())} ({_esc(account.title())})*",
         _SEP,
     ]
 
@@ -1120,7 +1420,7 @@ def generate_debtor_history(account: str, name: str) -> str:
             pts = str(p.get("timestamp", ""))[:10]
             pamt = float(p["amount"])
             pby = p.get("recorded_by", "")
-            by_note = f" by @{pby}" if pby else ""
+            by_note = f" by @{_esc(pby)}" if pby else ""
             lines.append(f"    💳 {pts}: paid {_fmt(pamt)}{by_note}")
 
         if status == "outstanding":
@@ -1159,7 +1459,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
     except ValueError:
         label = date_str
 
-    filter_note = f" — @{username_filter}" if username_filter else ""
+    filter_note = f" — @{_esc(username_filter)}" if username_filter else ""
 
     if not entries:
         msg = f"No activity recorded for *{_esc(username_filter)}*." if username_filter else "No activity recorded."
@@ -1177,7 +1477,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
     lines = [f"📋 *Activity Log — {label}*{filter_note}", _SEP]
 
     for actor in sorted(by_actor):
-        lines.append(f"👤 *@{actor}*")
+        lines.append(f"👤 *@{_esc(actor)}*")
         for e in by_actor[actor]:
             ts = e.get("timestamp", "")
             try:
@@ -1228,7 +1528,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
                 amt = float(e.get("amount", 0))
                 lines.append(f"  {time_str}  ✅ Paid debtor: {name} ({acct}) — {_fmt(amt)}")
             elif etype == "transfer":
-                drink = str(e.get("drink_name", "?")).title()
+                drink = _esc(str(e.get("drink_name", "?")).title())
                 qty = int(e.get("quantity", 0))
                 lines.append(f"  {time_str}  📦 Transfer: {qty}× {drink} store→bar")
         lines.append("")
