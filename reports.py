@@ -37,14 +37,23 @@ def _sum_revenue(rows: list[dict], key: str = "total_revenue") -> float:
     return sum(float(r[key]) for r in rows)
 
 
+def _parse_ts(raw) -> datetime | None:
+    """Parse a timestamp value that may be a string, pandas Timestamp, or have microseconds."""
+    try:
+        ts_str = str(raw).split(".")[0]  # strip microseconds if present
+        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
 def _filter_by_date(rows: list[dict], target: date) -> list[dict]:
     result = []
     for r in rows:
         try:
-            row_date = datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S").date()
-            if row_date == target:
+            dt = _parse_ts(r["timestamp"])
+            if dt and dt.date() == target:
                 result.append(r)
-        except (ValueError, KeyError):
+        except KeyError:
             pass
     return result
 
@@ -53,10 +62,10 @@ def _filter_by_month(rows: list[dict], year: int, month: int) -> list[dict]:
     result = []
     for r in rows:
         try:
-            dt = datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
-            if dt.year == year and dt.month == month:
+            dt = _parse_ts(r["timestamp"])
+            if dt and dt.year == year and dt.month == month:
                 result.append(r)
-        except (ValueError, KeyError):
+        except KeyError:
             pass
     return result
 
@@ -182,7 +191,7 @@ def generate_full_report(
             cat_totals[cat] = cat_totals.get(cat, 0.0) + float(r["amount"])
         lines.append("  _Other breakdown:_")
         for cat, amt in sorted(cat_totals.items()):
-            lines.append(f"    • {cat}: {_fmt(amt)}")
+            lines.append(f"    • {_esc(cat)}: {_fmt(amt)}")
 
     lines += [
         _SEP,
@@ -200,7 +209,7 @@ def generate_full_report(
             cat_totals[cat] = cat_totals.get(cat, 0.0) + float(r["amount"])
         lines.append("  _Other breakdown:_")
         for cat, amt in sorted(cat_totals.items()):
-            lines.append(f"    • {cat}: {_fmt(amt)}")
+            lines.append(f"    • {_esc(cat)}: {_fmt(amt)}")
 
     lines += [
         _SEP,
@@ -324,13 +333,16 @@ def generate_expense_report(
         out = [title]
         cat_total = 0.0
 
+        def _note(e: dict) -> str:
+            desc = str(e.get("description") or "").strip()
+            return f" _{_esc(desc)}_" if desc else ""
+
         # Salary block first
         if salary_rows:
             out.append(f"  👤 *Salary* — {_fmt(salary_total)}")
             for e in salary_rows:
-                note = f" _{_esc(str(e['description']))}_" if e.get("description") else ""
                 ts = e.get("timestamp", "")[:10]
-                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
+                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{_note(e)}")
             cat_total += salary_total
 
         # Other expenses grouped by category
@@ -342,11 +354,10 @@ def generate_expense_report(
             entries = cat_rows[cat]
             cat_sum = sum(float(e["amount"]) for e in entries)
             cat_total += cat_sum
-            out.append(f"  *{cat}* — {_fmt(cat_sum)}")
+            out.append(f"  *{_esc(cat)}* — {_fmt(cat_sum)}")
             for e in entries:
-                note = f" _{_esc(str(e['description']))}_" if e.get("description") else ""
                 ts = e.get("timestamp", "")[:10]
-                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{note}")
+                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{_note(e)}")
 
         out.append(f"  *Subtotal: {_fmt(cat_total)}*")
         return out
@@ -736,10 +747,12 @@ def generate_allocation_report(
 
 def _debt_age(timestamp_str: str) -> str:
     """Return a human-readable age string and flag for overdue debts."""
+    created = _parse_ts(timestamp_str)
+    if not created:
+        return ""
     try:
-        created = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
         days = (datetime.now() - created).days
-    except (ValueError, TypeError):
+    except Exception:
         return ""
     date_str = created.strftime("%d %b")
     if days == 0:
@@ -771,7 +784,8 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
     def _debt_lines(r: dict) -> list[str]:
         did = r["id"]
         name = _esc(str(r["name"]).title())
-        note = f" — {_esc(str(r['description']))}" if r.get("description") else ""
+        desc = str(r.get("description") or "").strip()
+        note = f" — {_esc(desc)}" if desc else ""
         age = _debt_age(r.get("timestamp", ""))
         staff = r.get("staff_name", "") or ""
         by_tag = f" _(by {_esc(staff.title())})_" if staff.strip() else ""
@@ -796,10 +810,11 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
             lines.extend(_debt_lines(r))
         lines.append(f"  *Total remaining: {_fmt(sum(_remaining(r) for r in room_rows))}*")
 
-    overdue = [r for r in rows if (lambda d: d >= 7)(
-        (datetime.now() - datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")).days
-        if r.get("timestamp") else 0
-    )]
+    def _days_old(r: dict) -> int:
+        dt = _parse_ts(r.get("timestamp"))
+        return (datetime.now() - dt).days if dt else 0
+
+    overdue = [r for r in rows if _days_old(r) >= 7]
     lines.append(_SEP)
     if overdue:
         lines.append(f"⚠️ {len(overdue)} debt(s) outstanding for 7+ days — follow up needed.")
@@ -827,7 +842,8 @@ def generate_debtor_lookup(name: str) -> str:
 
     def _debt_lines(r: dict) -> list[str]:
         did  = r["id"]
-        note = f" — {_esc(str(r['description']))}" if r.get("description") else ""
+        desc = str(r.get("description") or "").strip()
+        note = f" — {_esc(desc)}" if desc else ""
         age  = _debt_age(r.get("timestamp", ""))
         staff = r.get("staff_name", "") or ""
         original = float(r["amount"])
@@ -882,7 +898,8 @@ def generate_staff_debtors(staff_name: str) -> str:
     def _debt_line(r: dict) -> list[str]:
         did      = r["id"]
         customer = _esc(str(r["name"]).title())
-        note     = f" — {_esc(str(r['description']))}" if r.get("description") else ""
+        desc     = str(r.get("description") or "").strip()
+        note     = f" — {_esc(desc)}" if desc else ""
         age      = _debt_age(r.get("timestamp", ""))
         original = float(r["amount"])
         paid     = float(r.get("amount_paid") or 0)
@@ -1075,7 +1092,7 @@ def generate_debtor_history(account: str, name: str) -> str:
     payments_by_id = data["payments"]
 
     if not debts:
-        return f"🧾 No debt history for *{name.title()}* in *{account.title()}*."
+        return f"🧾 No debt history for *{_esc(name.title())}* in *{_esc(account.title())}*."
 
     lines = [
         f"🧾 *Debt History — {name.title()} ({account.title()})*",
@@ -1094,6 +1111,7 @@ def generate_debtor_history(account: str, name: str) -> str:
 
         staff = str(debt.get("staff_name", "") or "").strip()
         icon = "✅" if status == "paid" else "🔴"
+        desc = str(desc).strip()
         desc_note = f" — {_esc(desc)}" if desc else ""
         staff_note = f" _(sold by {_esc(staff.title())})_" if staff else ""
         lines.append(f"{icon} `[#{did}]` Opened {ts}: *{_fmt(original)}*{desc_note}{staff_note}")
@@ -1144,7 +1162,7 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
     filter_note = f" — @{username_filter}" if username_filter else ""
 
     if not entries:
-        msg = f"No activity recorded for *{username_filter}*." if username_filter else "No activity recorded."
+        msg = f"No activity recorded for *{_esc(username_filter)}*." if username_filter else "No activity recorded."
         return f"📋 *Activity Log — {label}*{filter_note}\n\n{msg}"
 
     # Group by actor (recorded_by for most; paid_by for debtor_pay)

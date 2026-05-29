@@ -93,7 +93,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["📊 Summary", "📋 Report"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"]],
+    [["📊 Summary", "📋 Report"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"], ["⚙️ Manage"]],
     resize_keyboard=True,
 )
 
@@ -118,14 +118,20 @@ def _is_authorized(user_id: int) -> bool:
     return user is not None and user.get("role") in ("staff", "admin")
 
 
+async def _access_denied(update: Update, msg: str) -> None:
+    """Send an access-denied message regardless of update type."""
+    if update.callback_query:
+        await update.callback_query.answer(msg, show_alert=True)
+    elif update.message:
+        await update.message.reply_text(msg)
+
+
 def _require_auth(fn):
     """Decorator: reject unregistered users."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         if not _is_authorized(uid):
-            await update.message.reply_text(
-                "🔒 Access denied. Ask an admin to add you with /addstaff."
-            )
+            await _access_denied(update, "🔒 Access denied. Ask an admin to add you with /addstaff.")
             return
         return await fn(update, ctx)
     wrapper.__name__ = fn.__name__
@@ -137,7 +143,7 @@ def _require_admin(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         if not _is_admin(uid):
-            await update.message.reply_text("🔒 This command is admin-only.")
+            await _access_denied(update, "🔒 This command is admin-only.")
             return
         return await fn(update, ctx)
     wrapper.__name__ = fn.__name__
@@ -197,31 +203,47 @@ async def _reply(update: Update, text: str) -> None:
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+async def _send_chunk_cb(q, text: str) -> None:
+    """Send one chunk from a callback context, falling back to plain text if Markdown fails."""
+    try:
+        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await q.message.reply_text(text)
+
+
 async def _reply_long_cb(q, text: str) -> None:
     """Send a long reply from a CallbackQuery context."""
     limit = 4000
     if len(text) <= limit:
-        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await _send_chunk_cb(q, text)
         return
     lines = text.split("\n")
     chunk: list[str] = []
     size = 0
     for line in lines:
         if size + len(line) + 1 > limit and chunk:
-            await q.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+            await _send_chunk_cb(q, "\n".join(chunk))
             chunk = []
             size = 0
         chunk.append(line)
         size += len(line) + 1
     if chunk:
-        await q.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+        await _send_chunk_cb(q, "\n".join(chunk))
+
+
+async def _send_chunk(update: Update, text: str) -> None:
+    """Send one chunk, falling back to plain text if Markdown parsing fails."""
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        await update.message.reply_text(text)
 
 
 async def _reply_long(update: Update, text: str) -> None:
     """Send a message, splitting into ≤4000-char chunks at line boundaries if needed."""
     limit = 4000
     if len(text) <= limit:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await _send_chunk(update, text)
         return
     lines = text.split("\n")
     chunk: list[str] = []
@@ -229,13 +251,13 @@ async def _reply_long(update: Update, text: str) -> None:
     for line in lines:
         # +1 for the newline we'll re-add
         if size + len(line) + 1 > limit and chunk:
-            await update.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+            await _send_chunk(update, "\n".join(chunk))
             chunk = []
             size = 0
         chunk.append(line)
         size += len(line) + 1
     if chunk:
-        await update.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+        await _send_chunk(update, "\n".join(chunk))
 
 
 # ── /start ────────────────────────────────────────────────────────────
@@ -1598,8 +1620,74 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Error handler ─────────────────────────────────────────────────────
 
+def _plain_error(err: Exception) -> str:
+    """Map an exception to a human-readable description for hotel admins."""
+    err_str = str(err).lower()
+    err_type = type(err).__name__
+    if any(k in err_str for k in ("connect", "database", "psycopg", "sqlalchemy", "could not connect")):
+        return "Database connection issue — the database may be temporarily unavailable."
+    if any(k in err_str for k in ("timeout", "timed out")):
+        return "The request timed out — the server may be under load."
+    if any(k in err_str for k in ("permission", "forbidden", "not allowed")):
+        return "Permission error — the bot may lack access to perform this action."
+    if isinstance(err, (KeyError, AttributeError, TypeError)):
+        return "Report generation failed — some data may be missing or in an unexpected format."
+    if isinstance(err, ValueError):
+        return "Invalid data encountered while processing the request."
+    return f"Unexpected error ({err_type}) — check Railway logs for details."
+
+
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception: %s", ctx.error, exc_info=ctx.error)
+
+    # Who triggered it
+    user_id: int | None = None
+    username = "Unknown"
+    trigger = "unknown action"
+    if isinstance(update, Update):
+        user = update.effective_user
+        if user:
+            user_id = user.id
+            username = f"@{user.username}" if user.username else (user.first_name or str(user.id))
+        if update.message and update.message.text:
+            trigger = update.message.text[:80]
+        elif update.callback_query and update.callback_query.data:
+            trigger = f"button: {update.callback_query.data[:60]}"
+
+    plain = _plain_error(ctx.error)
+
+    admin_msg = (
+        f"🚨 *Bot Error*\n"
+        f"👤 Triggered by: {username}\n"
+        f"📌 Action: `{trigger}`\n"
+        f"❌ Problem: {plain}"
+    )
+
+    # Button to open a chat with the staff member who hit the error
+    keyboard = None
+    if user_id:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"Message {username}", url=f"tg://user?id={user_id}")
+        ]])
+
+    # Notify admins (skip if the admin themselves triggered the error)
+    admin_ids = list(_active_admin_ids.get() or ADMIN_IDS)
+    for admin_id in admin_ids:
+        if admin_id == user_id:
+            continue
+        try:
+            await ctx.bot.send_message(
+                admin_id, admin_msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+        except Exception:
+            try:
+                await ctx.bot.send_message(admin_id, admin_msg, reply_markup=keyboard)
+            except Exception:
+                pass
+
+    # Reply to whoever triggered it
     if isinstance(update, Update) and update.message:
         await update.message.reply_text("⚠️ An unexpected error occurred. Please try again.")
 
@@ -1611,6 +1699,17 @@ async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None
 _SELL_DRINK, _SELL_DRINK_TEXT, _SELL_QTY, _SELL_QTY_TEXT, _SELL_DATE, _SELL_DATE_TEXT = range(6)
 _BOOK_TYPE, _BOOK_TYPE_TEXT, _BOOK_QTY, _BOOK_QTY_TEXT, _BOOK_NIGHTS, _BOOK_NIGHTS_TEXT, _BOOK_DATE, _BOOK_DATE_TEXT = range(6, 14)
 _SETUP_NAME, _SETUP_TZ, _SETUP_CONFIRM = range(14, 17)
+_EXP_ACCT, _EXP_CAT, _EXP_CAT_TEXT, _EXP_AMT, _EXP_NOTE, _EXP_DATE = range(17, 23)
+_RST_DRINK, _RST_DRINK_TEXT, _RST_QTY, _RST_QTY_TEXT, _RST_COST = range(23, 28)
+_TFR_DRINK, _TFR_DRINK_TEXT, _TFR_QTY, _TFR_QTY_TEXT = range(28, 32)
+_DEB_ACCT, _DEB_NAME, _DEB_AMT, _DEB_NOTE, _DEB_DATE = range(32, 37)
+_PAY_ACCT, _PAY_NAME, _PAY_AMT = range(37, 40)
+_DEL_TYPE, _DEL_ENTRY, _DEL_CONFIRM = range(40, 43)
+_SSET_PRICE_DRINK, _SSET_PRICE_AMT = range(43, 45)
+_SSET_ROOM_TYPE, _SSET_ROOM_TYPE_TEXT, _SSET_ROOM_AMT = range(45, 48)
+_SSET_THRESH_DRINK, _SSET_THRESH_AMT = range(48, 50)
+_SSET_ALLOC_KEY, _SSET_ALLOC_VAL = range(50, 52)
+_ACT_DATE = 52
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -1994,6 +2093,1058 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
 
 
 # ── Keyboard shortcut handlers ────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════
+# ── Admin ⚙️ Manage flows ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+
+def _manage_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Expense",      callback_data="mgr:expense"),
+         InlineKeyboardButton("📦 Restock",      callback_data="mgr:restock")],
+        [InlineKeyboardButton("🔄 Transfer",     callback_data="mgr:transfer"),
+         InlineKeyboardButton("➕ Add Debtor",   callback_data="mgr:add_debtor")],
+        [InlineKeyboardButton("✅ Pay Debtor",   callback_data="mgr:pay_debtor"),
+         InlineKeyboardButton("📊 Allocation",   callback_data="mgr:allocation")],
+        [InlineKeyboardButton("🗑 Delete Entry", callback_data="mgr:delete"),
+         InlineKeyboardButton("📋 Activity",     callback_data="mgr:activity")],
+        [InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings"),
+         InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff")],
+    ])
+
+
+def _settings_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Drink Prices",    callback_data="sset:price"),
+         InlineKeyboardButton("🛏 Room Types",      callback_data="sset:roomtype")],
+        [InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold"),
+         InlineKeyboardButton("📊 Allocation %",    callback_data="sset:allocation")],
+        [InlineKeyboardButton("📅 Daily Report",    callback_data="sset:dailyreport")],
+    ])
+
+
+def _account_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🍺 Bar",   callback_data=f"{prefix}:bar"),
+        InlineKeyboardButton("🛏 Rooms", callback_data=f"{prefix}:rooms"),
+    ]])
+
+
+def _expense_cat_keyboard() -> InlineKeyboardMarkup:
+    cats = ["Salary", "Utilities", "Maintenance", "Supplies", "Cleaning", "Marketing"]
+    rows = [[
+        InlineKeyboardButton(cats[i],   callback_data=f"exp_cat:{cats[i].lower()}"),
+        InlineKeyboardButton(cats[i+1], callback_data=f"exp_cat:{cats[i+1].lower()}"),
+    ] for i in range(0, len(cats), 2)]
+    rows.append([InlineKeyboardButton("✏️ Other", callback_data="exp_cat:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _all_drink_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    items = inv.get_inventory_summary()
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in items:
+        row.append(InlineKeyboardButton(i["drink"].title(), callback_data=f"{prefix}:{i['drink'].lower()}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ New drink", callback_data=f"{prefix}:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _store_drink_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    items = [i for i in inv.get_inventory_summary() if i["store_stock"] > 0]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in items:
+        label = f"{i['drink'].title()} ({i['store_stock']})"
+        row.append(InlineKeyboardButton(label, callback_data=f"{prefix}:{i['drink'].lower()}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Other drink", callback_data=f"{prefix}:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _restock_qty_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"rst_q:{n}") for n in (12, 24, 48)],
+        [InlineKeyboardButton("✏️ Other", callback_data="rst_q:__other__")],
+    ])
+
+
+def _transfer_qty_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"tfr_q:{n}") for n in (6, 12, 24)],
+        [InlineKeyboardButton("✏️ Other", callback_data="tfr_q:__other__")],
+    ])
+
+
+def _skip_keyboard(cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data=cb)]])
+
+
+@_require_admin
+async def _btn_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "⚙️ *Admin Actions*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_manage_menu_keyboard(),
+    )
+
+
+# ── Expense flow ───────────────────────────────────────────────────────
+
+@_require_admin
+async def _exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "💸 *Record Expense — which account?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_account_keyboard("exp_ac"),
+    )
+    return _EXP_ACCT
+
+
+async def _exp_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["exp_acct"] = q.data.split(":")[1]
+    await q.edit_message_text(
+        "💸 *Category?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_expense_cat_keyboard(),
+    )
+    return _EXP_CAT
+
+
+async def _exp_pick_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[8:]
+    if val == "__other__":
+        await q.edit_message_text("Type the expense category:")
+        return _EXP_CAT_TEXT
+    ctx.user_data["exp_cat"] = val
+    acct = ctx.user_data.get("exp_acct", "")
+    await q.edit_message_text(
+        f"💸 {acct.title()} / {val.title()} — *amount?* (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _EXP_AMT
+
+
+async def _exp_cat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["exp_cat"] = update.message.text.strip().lower()
+    acct = ctx.user_data.get("exp_acct", "")
+    cat = ctx.user_data["exp_cat"]
+    await update.message.reply_text(
+        f"💸 {acct.title()} / {cat.title()} — *amount?* (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _EXP_AMT
+
+
+async def _exp_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    val, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter a valid amount (e.g. 5000):")
+        return _EXP_AMT
+    ctx.user_data["exp_amt"] = val
+    await update.message.reply_text("📝 Any note? (optional)", reply_markup=_skip_keyboard("exp_note:skip"))
+    return _EXP_NOTE
+
+
+async def _exp_note_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["exp_note"] = ""
+    await q.edit_message_text(
+        "📅 *When?*", parse_mode=ParseMode.MARKDOWN, reply_markup=_date_keyboard("exp_d"),
+    )
+    return _EXP_DATE
+
+
+async def _exp_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["exp_note"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📅 *When?*", parse_mode=ParseMode.MARKDOWN, reply_markup=_date_keyboard("exp_d"),
+    )
+    return _EXP_DATE
+
+
+async def _exp_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val.startswith("cal_p:") or val.startswith("cal_n:"):
+        ym = val[6:]
+        y, m = int(ym[:4]), int(ym[5:7])
+        await q.edit_message_text(
+            "📅 *When?*", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_calendar_keyboard("exp_d", y, m),
+        )
+        return _EXP_DATE
+    if val == "cal_x":
+        return _EXP_DATE
+    ts = None if val == "today" else val
+    acct = ctx.user_data.pop("exp_acct", "bar")
+    cat  = ctx.user_data.pop("exp_cat", "")
+    amt  = ctx.user_data.pop("exp_amt", 0.0)
+    note = ctx.user_data.pop("exp_note", "")
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_expense(acct, cat, amt, note, timestamp=ts, recorded_by=recorded_by)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+# ── Restock flow ───────────────────────────────────────────────────────
+
+@_require_admin
+async def _rst_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "📦 *Restock — which drink?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_all_drink_keyboard("rst_dr"),
+    )
+    return _RST_DRINK
+
+
+async def _rst_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data[7:]
+    if drink == "__other__":
+        await q.edit_message_text("Type the drink name:")
+        return _RST_DRINK_TEXT
+    ctx.user_data["rst_drink"] = drink
+    await q.edit_message_text(
+        f"📦 *{drink.title()}* — how many units?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_restock_qty_keyboard(),
+    )
+    return _RST_QTY
+
+
+async def _rst_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["rst_drink"] = update.message.text.strip().lower()
+    drink = ctx.user_data["rst_drink"]
+    await update.message.reply_text(
+        f"📦 *{drink.title()}* — how many units?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_restock_qty_keyboard(),
+    )
+    return _RST_QTY
+
+
+async def _rst_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val == "__other__":
+        await q.edit_message_text("How many units? (type a number)")
+        return _RST_QTY_TEXT
+    ctx.user_data["rst_qty"] = int(val)
+    drink = ctx.user_data.get("rst_drink", "")
+    await q.edit_message_text(
+        f"📦 {val}× {drink.title()} — *cost per unit?* (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _RST_COST
+
+
+async def _rst_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        qty = int(update.message.text.strip())
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number:")
+        return _RST_QTY_TEXT
+    ctx.user_data["rst_qty"] = qty
+    drink = ctx.user_data.get("rst_drink", "")
+    await update.message.reply_text(
+        f"📦 {qty}× {drink.title()} — *cost per unit?* (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _RST_COST
+
+
+async def _rst_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    cost, err = _to_float(update.message.text.strip(), "cost")
+    if err:
+        await update.message.reply_text("❌ Enter a valid cost (e.g. 300):")
+        return _RST_COST
+    drink = ctx.user_data.pop("rst_drink", "")
+    qty   = ctx.user_data.pop("rst_qty", 0)
+    user  = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_restock(drink, qty, cost, recorded_by=recorded_by)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+# ── Transfer flow ──────────────────────────────────────────────────────
+
+@_require_admin
+async def _tfr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    in_store = [i for i in inv.get_inventory_summary() if i["store_stock"] > 0]
+    if not in_store:
+        await q.edit_message_text("📦 Store is empty — nothing to transfer. Use *Restock* first.", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    await q.edit_message_text(
+        "🔄 *Transfer store → bar — which drink?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_store_drink_keyboard("tfr_dr"),
+    )
+    return _TFR_DRINK
+
+
+async def _tfr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data[7:]
+    if drink == "__other__":
+        await q.edit_message_text("Type the drink name:")
+        return _TFR_DRINK_TEXT
+    ctx.user_data["tfr_drink"] = drink
+    await q.edit_message_text(
+        f"🔄 *{drink.title()}* — how many to move to bar?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_transfer_qty_keyboard(),
+    )
+    return _TFR_QTY
+
+
+async def _tfr_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["tfr_drink"] = update.message.text.strip().lower()
+    drink = ctx.user_data["tfr_drink"]
+    await update.message.reply_text(
+        f"🔄 *{drink.title()}* — how many to move to bar?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_transfer_qty_keyboard(),
+    )
+    return _TFR_QTY
+
+
+async def _tfr_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val == "__other__":
+        await q.edit_message_text("How many to transfer? (type a number)")
+        return _TFR_QTY_TEXT
+    drink = ctx.user_data.pop("tfr_drink", "")
+    user  = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_transfer(drink, int(val), recorded_by=recorded_by)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+async def _tfr_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        qty = int(update.message.text.strip())
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number:")
+        return _TFR_QTY_TEXT
+    drink = ctx.user_data.pop("tfr_drink", "")
+    user  = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_transfer(drink, qty, recorded_by=recorded_by)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+# ── Add Debtor flow ────────────────────────────────────────────────────
+
+@_require_admin
+async def _deb_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "➕ *Add Debtor — which account?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_account_keyboard("deb_ac"),
+    )
+    return _DEB_ACCT
+
+
+async def _deb_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["deb_acct"] = q.data.split(":")[1]
+    await q.edit_message_text("👤 Debtor's name?")
+    return _DEB_NAME
+
+
+async def _deb_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["deb_name"] = update.message.text.strip()
+    name = ctx.user_data["deb_name"]
+    await update.message.reply_text(
+        f"💰 *{name.title()}* — how much do they owe? (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _DEB_AMT
+
+
+async def _deb_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    val, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter a valid amount:")
+        return _DEB_AMT
+    ctx.user_data["deb_amt"] = val
+    await update.message.reply_text(
+        "📝 Any note? (optional — e.g. 'tab from Friday')",
+        reply_markup=_skip_keyboard("deb_note:skip"),
+    )
+    return _DEB_NOTE
+
+
+async def _deb_note_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["deb_note"] = ""
+    await q.edit_message_text(
+        "📅 *When?*", parse_mode=ParseMode.MARKDOWN, reply_markup=_date_keyboard("deb_d"),
+    )
+    return _DEB_DATE
+
+
+async def _deb_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["deb_note"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📅 *When?*", parse_mode=ParseMode.MARKDOWN, reply_markup=_date_keyboard("deb_d"),
+    )
+    return _DEB_DATE
+
+
+async def _deb_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val.startswith("cal_p:") or val.startswith("cal_n:"):
+        ym = val[6:]
+        y, m = int(ym[:4]), int(ym[5:7])
+        await q.edit_message_text(
+            "📅 *When?*", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_calendar_keyboard("deb_d", y, m),
+        )
+        return _DEB_DATE
+    if val == "cal_x":
+        return _DEB_DATE
+    ts = None if val == "today" else val
+    acct = ctx.user_data.pop("deb_acct", "bar")
+    name = ctx.user_data.pop("deb_name", "")
+    amt  = ctx.user_data.pop("deb_amt", 0.0)
+    note = ctx.user_data.pop("deb_note", "")
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_add_debtor(acct, name, amt, note, timestamp=ts, recorded_by=recorded_by)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+# ── Pay Debtor flow ────────────────────────────────────────────────────
+
+@_require_admin
+async def _pay_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "✅ *Pay Debtor — which account?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_account_keyboard("pay_ac"),
+    )
+    return _PAY_ACCT
+
+
+async def _pay_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    acct = q.data.split(":")[1]
+    ctx.user_data["pay_acct"] = acct
+    debtors = db.get_debtors(account=acct)
+    if not debtors:
+        await q.edit_message_text(f"✅ No outstanding debtors in *{acct.title()}*.", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    rows = []
+    for d in debtors:
+        rem = round(float(d["amount"]) - float(d.get("amount_paid") or 0), 2)
+        rows.append([InlineKeyboardButton(
+            f"{d['name'].title()} — ₦{rem:,.0f}",
+            callback_data=f"pay_nm:{d['name'].lower()}",
+        )])
+    await q.edit_message_text(
+        "✅ *Who paid?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _PAY_NAME
+
+
+async def _pay_pick_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    name = q.data[7:]
+    ctx.user_data["pay_name"] = name
+    acct = ctx.user_data.get("pay_acct", "bar")
+    debtors = db.get_debtors(account=acct)
+    debtor = next((d for d in debtors if d["name"].lower() == name), None)
+    if debtor:
+        rem = round(float(debtor["amount"]) - float(debtor.get("amount_paid") or 0), 2)
+        await q.edit_message_text(
+            f"💳 *{name.title()}* owes *₦{rem:,.0f}*\nHow much are they paying?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Full — ₦{rem:,.0f}", callback_data="pay_am:full"),
+                InlineKeyboardButton("✏️ Partial amount",      callback_data="pay_am:partial"),
+            ]]),
+        )
+    else:
+        await q.edit_message_text("How much are they paying? (₦)")
+    return _PAY_AMT
+
+
+async def _pay_pick_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if q.data == "pay_am:full":
+        acct = ctx.user_data.pop("pay_acct", "bar")
+        name = ctx.user_data.pop("pay_name", "")
+        user = update.effective_user
+        paid_by = user.username or user.first_name or str(user.id)
+        ok, msg = logic.process_pay_debtor(acct, name, paid_by=paid_by, amount=None)
+        await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+        return ConversationHandler.END
+    await q.edit_message_text("Type the partial amount paid (₦):")
+    return _PAY_AMT
+
+
+async def _pay_amt_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    val, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter a valid amount:")
+        return _PAY_AMT
+    acct = ctx.user_data.pop("pay_acct", "bar")
+    name = ctx.user_data.pop("pay_name", "")
+    user = update.effective_user
+    paid_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_pay_debtor(acct, name, paid_by=paid_by, amount=val)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+# ── Manage menu non-flow callbacks (allocation, staff) ─────────────────
+
+# ── Delete Entry flow ─────────────────────────────────────────────────
+
+def _recent_active(table: str, limit: int = 10) -> list[dict]:
+    rows = [r for r in db.read_all(table) if not r.get("deleted_at")]
+    rows.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
+    return rows[:limit]
+
+
+def _del_entry_label(entry_type: str, r: dict) -> str:
+    ts = str(r.get("timestamp", ""))[:10]
+    if entry_type == "sale":
+        return f"#{r['id']} • {str(r.get('drink_name','')).title()} ×{r.get('quantity','')} — ₦{float(r.get('total_revenue',0)):,.0f} ({ts})"
+    if entry_type == "room":
+        return f"#{r['id']} • {str(r.get('room_type','')).title()} ×{r.get('quantity','')}, {r.get('nights','')}n — ₦{float(r.get('total_revenue',0)):,.0f} ({ts})"
+    return f"#{r['id']} • {str(r.get('account','')).title()}/{str(r.get('category','')).title()} — ₦{float(r.get('amount',0)):,.0f} ({ts})"
+
+
+@_require_admin
+async def _del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🗑 *Delete Entry — what type?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🍺 Sale",    callback_data="del_tp:sale"),
+            InlineKeyboardButton("🛏 Room",    callback_data="del_tp:room"),
+            InlineKeyboardButton("💸 Expense", callback_data="del_tp:expense"),
+        ]]),
+    )
+    return _DEL_TYPE
+
+
+async def _del_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    entry_type = q.data[7:]
+    ctx.user_data["del_type"] = entry_type
+    table = {"sale": "sales", "room": "rooms", "expense": "expenses"}[entry_type]
+    rows = _recent_active(table)
+    if not rows:
+        await q.edit_message_text(f"No recent {entry_type} entries found.")
+        return ConversationHandler.END
+    btns = [[InlineKeyboardButton(
+        _del_entry_label(entry_type, r), callback_data=f"del_en:{r['id']}"
+    )] for r in rows]
+    await q.edit_message_text(
+        f"🗑 *Select {entry_type} to delete:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(btns),
+    )
+    return _DEL_ENTRY
+
+
+async def _del_pick_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    entry_id = int(q.data[7:])
+    ctx.user_data["del_id"] = entry_id
+    entry_type = ctx.user_data.get("del_type", "")
+    table = {"sale": "sales", "room": "rooms", "expense": "expenses"}.get(entry_type, "sales")
+    row = next((r for r in _recent_active(table, 50) if r["id"] == entry_id), None)
+    label = _del_entry_label(entry_type, row) if row else f"#{entry_id}"
+    await q.edit_message_text(
+        f"⚠️ *Confirm delete?*\n\n`{label}`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, delete", callback_data="del_cf:yes"),
+            InlineKeyboardButton("❌ Cancel",       callback_data="del_cf:no"),
+        ]]),
+    )
+    return _DEL_CONFIRM
+
+
+async def _del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if q.data == "del_cf:no":
+        await q.edit_message_text("❌ Cancelled.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    entry_type = ctx.user_data.pop("del_type", "")
+    entry_id   = ctx.user_data.pop("del_id", 0)
+    user = update.effective_user
+    actor = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_delete(entry_type, entry_id, actor=actor)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+# ── Activity Log flow ──────────────────────────────────────────────────
+
+@_require_admin
+async def _act_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "📋 *Activity Log — which day?*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_date_keyboard("act_d"),
+    )
+    return _ACT_DATE
+
+
+async def _act_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val.startswith("cal_p:") or val.startswith("cal_n:"):
+        ym = val[6:]
+        y, m = int(ym[:4]), int(ym[5:7])
+        await q.edit_message_text(
+            "📋 *Activity Log — which day?*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_calendar_keyboard("act_d", y, m),
+        )
+        return _ACT_DATE
+    if val == "cal_x":
+        return _ACT_DATE
+    from datetime import datetime as _dt
+    date_str = _dt.now().strftime("%Y-%m-%d") if val == "today" else val
+    text = reports.generate_activity_log(date_str)
+    await _reply_long_cb(q, text)
+    return ConversationHandler.END
+
+
+# ── Set Drink Price flow ───────────────────────────────────────────────
+
+@_require_admin
+async def _spr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    price_rows = db.get_drink_selling_prices()
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for r in price_rows:
+        price = float(r["selling_price"])
+        label = f"{r['drink_name'].title()} (₦{price:,.0f})" if price > 0 else f"{r['drink_name'].title()} (—)"
+        row.append(InlineKeyboardButton(label, callback_data=f"spr_dr:{r['drink_name'].lower()}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ New drink", callback_data="spr_dr:__other__")])
+    await q.edit_message_text(
+        "💰 *Set Drink Price — which drink?*\n_(current prices shown)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _SSET_PRICE_DRINK
+
+
+async def _spr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data[7:]
+    if drink == "__other__":
+        await q.edit_message_text("Type the drink name:")
+        return _SSET_PRICE_DRINK
+    ctx.user_data["spr_drink"] = drink
+    await q.edit_message_text(
+        f"💰 *{drink.title()}* — new selling price per unit? (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SSET_PRICE_AMT
+
+
+async def _spr_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["spr_drink"] = update.message.text.strip().lower()
+    drink = ctx.user_data["spr_drink"]
+    await update.message.reply_text(
+        f"💰 *{drink.title()}* — new selling price per unit? (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SSET_PRICE_AMT
+
+
+async def _spr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    price, err = _to_float(update.message.text.strip(), "price")
+    if err:
+        await update.message.reply_text("❌ Enter a valid price (e.g. 500):")
+        return _SSET_PRICE_AMT
+    drink = ctx.user_data.pop("spr_drink", "")
+    ok, msg = logic.process_set_price(drink, price)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+# ── Set Room Type flow ─────────────────────────────────────────────────
+
+@_require_admin
+async def _srt_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    presets = db.get_all_room_type_prices()
+    rows = [[InlineKeyboardButton(
+        f"{p['room_type'].title()} — ₦{int(p['price']):,}/night",
+        callback_data=f"srt_tp:{p['room_type'].lower()}",
+    )] for p in presets]
+    rows.append([InlineKeyboardButton("➕ New room type", callback_data="srt_tp:__new__")])
+    await q.edit_message_text(
+        "🛏 *Room Type Prices — tap to update or add new:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _SSET_ROOM_TYPE
+
+
+async def _srt_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[7:]
+    if val == "__new__":
+        await q.edit_message_text("Type the new room type name (e.g. standard, executive, suite):")
+        return _SSET_ROOM_TYPE_TEXT
+    ctx.user_data["srt_type"] = val
+    await q.edit_message_text(
+        f"🛏 *{val.title()}* — new price per night? (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SSET_ROOM_AMT
+
+
+async def _srt_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["srt_type"] = update.message.text.strip().lower()
+    rtype = ctx.user_data["srt_type"]
+    await update.message.reply_text(
+        f"🛏 *{rtype.title()}* — price per night? (₦)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SSET_ROOM_AMT
+
+
+async def _srt_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    price, err = _to_float(update.message.text.strip(), "price")
+    if err:
+        await update.message.reply_text("❌ Enter a valid price (e.g. 15000):")
+        return _SSET_ROOM_AMT
+    rtype = ctx.user_data.pop("srt_type", "")
+    db.set_room_type_price(rtype, price)
+    await update.message.reply_text(
+        f"✅ *{rtype.title()}* set to ₦{price:,.0f}/night.\nStaff can book with: `/room {rtype.lower()} <qty> <nights>`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_get_keyboard(update.effective_user.id),
+    )
+    return ConversationHandler.END
+
+
+# ── Set Low-Stock Threshold flow ───────────────────────────────────────
+
+@_require_admin
+async def _sthr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    items = inv.get_inventory_summary()
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in items:
+        label = f"{i['drink']} (≤{i['threshold']})"
+        row.append(InlineKeyboardButton(label, callback_data=f"sthr_dr:{i['drink'].lower()}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    await q.edit_message_text(
+        "🔔 *Low Stock Alert — which drink?*\n_(current threshold in brackets)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _SSET_THRESH_DRINK
+
+
+async def _sthr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data[8:]
+    ctx.user_data["sthr_drink"] = drink
+    await q.edit_message_text(
+        f"🔔 *{drink.title()}* — alert when bar stock falls to or below? (units)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SSET_THRESH_AMT
+
+
+async def _sthr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    val, err = _to_int(update.message.text.strip(), "threshold")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number (e.g. 6):")
+        return _SSET_THRESH_AMT
+    drink = ctx.user_data.pop("sthr_drink", "")
+    result = inv.set_threshold(drink, val)
+    await update.message.reply_text(result.message, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+# ── Set Allocation % flow ──────────────────────────────────────────────
+
+_ALLOC_LABELS = {
+    "buffer":   "Buffer — % of gross revenue → Savings",
+    "restock":  "Restock — % of gross revenue → Bar Account",
+    "draw":     "Owner Draw — % of leftover profit",
+    "reinvest": "Reinvestment — % of leftover profit",
+    "float":    "Cash Float — % of leftover profit",
+}
+
+
+@_require_admin
+async def _sall_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    from config import (
+        ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
+        ALLOC_DRAW_DEFAULT, ALLOC_REINVEST_DEFAULT, ALLOC_FLOAT_DEFAULT,
+    )
+    defs = {"buffer": ALLOC_BUFFER_DEFAULT, "restock": ALLOC_RESTOCK_DEFAULT,
+            "draw": ALLOC_DRAW_DEFAULT, "reinvest": ALLOC_REINVEST_DEFAULT, "float": ALLOC_FLOAT_DEFAULT}
+    rows = []
+    for k, label in _ALLOC_LABELS.items():
+        current = int(db.get_setting(f"alloc_{k}", str(defs[k])))
+        rows.append([InlineKeyboardButton(f"{label} [{current}%]", callback_data=f"sall_k:{k}")])
+    await q.edit_message_text(
+        "📊 *Allocation % — tap a key to change:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _SSET_ALLOC_KEY
+
+
+async def _sall_pick_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    key = q.data[7:]
+    ctx.user_data["sall_key"] = key
+    label = _ALLOC_LABELS.get(key, key)
+    await q.edit_message_text(
+        f"📊 *{label}*\nNew percentage? (0–100)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return _SSET_ALLOC_VAL
+
+
+async def _sall_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        pct = int(update.message.text.strip())
+        if not (0 <= pct <= 100):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number between 0 and 100:")
+        return _SSET_ALLOC_VAL
+    key = ctx.user_data.pop("sall_key", "")
+    db.set_setting(f"alloc_{key}", str(pct))
+    # Show updated summary using same logic as cmd_setallocation
+    from config import (
+        ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
+        ALLOC_DRAW_DEFAULT, ALLOC_REINVEST_DEFAULT, ALLOC_FLOAT_DEFAULT,
+    )
+    defs = {"buffer": ALLOC_BUFFER_DEFAULT, "restock": ALLOC_RESTOCK_DEFAULT,
+            "draw": ALLOC_DRAW_DEFAULT, "reinvest": ALLOC_REINVEST_DEFAULT, "float": ALLOC_FLOAT_DEFAULT}
+    def _g(k): return int(db.get_setting(f"alloc_{k}", str(defs[k])))
+    buf, rst, drw, rei, flt = _g("buffer"), _g("restock"), _g("draw"), _g("reinvest"), _g("float")
+    msg = (
+        f"✅ *{key.title()}* set to *{pct}%*\n\n"
+        f"*Set-asides* (of gross revenue):\n"
+        f"  Buffer: {buf}%  |  Restock: {rst}%  |  Total: *{buf+rst}%*\n\n"
+        f"*Profit distribution* (of leftover):\n"
+        f"  Draw: {drw}%  |  Reinvest: {rei}%  |  Float: {flt}%  |  Total: *{drw+rei+flt}%*"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    action = q.data[4:]
+    user = update.effective_user
+
+    if action == "allocation":
+        from datetime import datetime as _dt
+        now = _dt.now()
+        text = reports.generate_allocation_report(for_month=(now.year, now.month))
+        await _reply_long_cb(q, text)
+
+    elif action == "settings":
+        await q.edit_message_text(
+            "⚙️ *Settings*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_settings_menu_keyboard(),
+        )
+
+    elif action == "staff":
+        staff_rows = [u for u in db.read_all("users") if u.get("role") == "staff"]
+        lines = ["👥 *Staff*"]
+        for u in staff_rows:
+            lines.append(f"  • {u['username']} (`{u['user_id']}`)")
+        if not staff_rows:
+            lines.append("  _No staff yet._")
+        lines.append("\n_To add: ask staff to send /start, then use /addstaff <id> <name>_")
+        rows = []
+        if staff_rows:
+            rows = [[InlineKeyboardButton(
+                f"🗑 Remove {u['username']}", callback_data=f"mgr_rm:{u['user_id']}"
+            )] for u in staff_rows]
+        await q.edit_message_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+
+    elif action == "addstaff":
+        await q.edit_message_text(
+            "👥 *Add Staff*\n\n"
+            "Ask the staff member to open this bot and send `/start`.\n"
+            "Their user ID will appear in the bot.\n\n"
+            "Then run:\n`/addstaff <user_id> <username>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif action == "removestaff":
+        staff_rows = [u for u in db.read_all("users") if u.get("role") == "staff"]
+        if not staff_rows:
+            await q.edit_message_text("No staff members to remove.")
+            return
+        rows = [[InlineKeyboardButton(
+            f"🗑 {u['username']} ({u['user_id']})",
+            callback_data=f"mgr_rm:{u['user_id']}",
+        )] for u in staff_rows]
+        await q.edit_message_text(
+            "👥 *Remove Staff — tap to remove:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+
+async def _cb_manage_remove_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    uid_str = q.data[7:]
+    try:
+        uid = int(uid_str)
+    except ValueError:
+        await q.edit_message_text("❌ Invalid user ID.")
+        return
+    removed = db.remove_user(uid)
+    if not removed:
+        await q.edit_message_text(f"❌ User `{uid}` not found.", parse_mode=ParseMode.MARKDOWN)
+        return
+    await q.edit_message_text(f"✅ User `{uid}` removed.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def _cb_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current daily report status with a toggle button."""
+    q = update.callback_query
+    await q.answer()
+    jobs = ctx.application.job_queue.get_jobs_by_name("daily_report")
+    is_on = bool(jobs)
+    status = "🔔 *ON*" if is_on else "🔕 *OFF*"
+    toggle_label = "Turn OFF" if is_on else "Turn ON"
+    toggle_cb = "sdr:off" if is_on else "sdr:on"
+    await q.edit_message_text(
+        f"📅 *Daily Report*\nCurrent status: {status}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(toggle_label, callback_data=toggle_cb),
+        ]]),
+    )
+
+
+async def _cb_daily_report_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    action = q.data[4:]  # strip "sdr:"
+    job_name = "daily_report"
+    current_jobs = ctx.application.job_queue.get_jobs_by_name(job_name)
+
+    if action == "off":
+        for job in current_jobs:
+            job.schedule_removal()
+        await q.edit_message_text("🔕 Daily report *disabled*.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if current_jobs:
+        await q.edit_message_text("✅ Daily report is already *enabled*.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    bot_cfg = ctx.application.bot_data
+    from config import REPORT_CHAT_ID, HOTEL_SCHEMA, TIMEZONE, DAILY_REPORT_TIME
+    chat_id = bot_cfg.get("report_chat_id") or REPORT_CHAT_ID or update.effective_chat.id
+    schema   = bot_cfg.get("schema")   or HOTEL_SCHEMA
+    tz_str   = bot_cfg.get("timezone") or TIMEZONE
+    time_str = bot_cfg.get("daily_report_time") or DAILY_REPORT_TIME
+    _schedule_daily_report(ctx.application.job_queue, chat_id, schema, tz_str, time_str)
+    await q.edit_message_text(
+        f"✅ Daily report *enabled* — sends at {time_str} ({tz_str}).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
 
 @_require_auth
 async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2434,6 +3585,138 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     )
     app.add_handler(sell_conv)
     app.add_handler(book_conv)
+
+    # ── Admin manage conversation flows (registered before simple callbacks) ──
+    exp_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_exp_start, pattern="^mgr:expense$")],
+        states={
+            _EXP_ACCT:     [CallbackQueryHandler(_exp_pick_acct, pattern="^exp_ac:")],
+            _EXP_CAT:      [CallbackQueryHandler(_exp_pick_cat,  pattern="^exp_cat:")],
+            _EXP_CAT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _exp_cat_text)],
+            _EXP_AMT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, _exp_amount)],
+            _EXP_NOTE:     [
+                CallbackQueryHandler(_exp_note_skip, pattern="^exp_note:skip$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _exp_note_text),
+            ],
+            _EXP_DATE:     [CallbackQueryHandler(_exp_pick_date, pattern="^exp_d:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    rst_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_rst_start, pattern="^mgr:restock$")],
+        states={
+            _RST_DRINK:      [CallbackQueryHandler(_rst_pick_drink, pattern="^rst_dr:")],
+            _RST_DRINK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _rst_drink_text)],
+            _RST_QTY:        [CallbackQueryHandler(_rst_pick_qty,   pattern="^rst_q:")],
+            _RST_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _rst_qty_text)],
+            _RST_COST:       [MessageHandler(filters.TEXT & ~filters.COMMAND, _rst_cost)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    tfr_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_tfr_start, pattern="^mgr:transfer$")],
+        states={
+            _TFR_DRINK:      [CallbackQueryHandler(_tfr_pick_drink, pattern="^tfr_dr:")],
+            _TFR_DRINK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _tfr_drink_text)],
+            _TFR_QTY:        [CallbackQueryHandler(_tfr_pick_qty,   pattern="^tfr_q:")],
+            _TFR_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _tfr_qty_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    deb_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_deb_start, pattern="^mgr:add_debtor$")],
+        states={
+            _DEB_ACCT:  [CallbackQueryHandler(_deb_pick_acct, pattern="^deb_ac:")],
+            _DEB_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _deb_name)],
+            _DEB_AMT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _deb_amount)],
+            _DEB_NOTE:  [
+                CallbackQueryHandler(_deb_note_skip, pattern="^deb_note:skip$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _deb_note_text),
+            ],
+            _DEB_DATE:  [CallbackQueryHandler(_deb_pick_date, pattern="^deb_d:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    pay_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_pay_start, pattern="^mgr:pay_debtor$")],
+        states={
+            _PAY_ACCT: [CallbackQueryHandler(_pay_pick_acct, pattern="^pay_ac:")],
+            _PAY_NAME: [CallbackQueryHandler(_pay_pick_name, pattern="^pay_nm:")],
+            _PAY_AMT:  [
+                CallbackQueryHandler(_pay_pick_amt,  pattern="^pay_am:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _pay_amt_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    del_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_del_start, pattern="^mgr:delete$")],
+        states={
+            _DEL_TYPE:    [CallbackQueryHandler(_del_pick_type,  pattern="^del_tp:")],
+            _DEL_ENTRY:   [CallbackQueryHandler(_del_pick_entry, pattern="^del_en:")],
+            _DEL_CONFIRM: [CallbackQueryHandler(_del_confirm,    pattern="^del_cf:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    act_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_act_start, pattern="^mgr:activity$")],
+        states={
+            _ACT_DATE: [CallbackQueryHandler(_act_pick_date, pattern="^act_d:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    spr_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_spr_start, pattern="^sset:price$")],
+        states={
+            _SSET_PRICE_DRINK: [
+                CallbackQueryHandler(_spr_pick_drink, pattern="^spr_dr:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _spr_drink_text),
+            ],
+            _SSET_PRICE_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _spr_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    srt_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_srt_start, pattern="^sset:roomtype$")],
+        states={
+            _SSET_ROOM_TYPE:      [CallbackQueryHandler(_srt_pick_type, pattern="^srt_tp:")],
+            _SSET_ROOM_TYPE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _srt_type_text)],
+            _SSET_ROOM_AMT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, _srt_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    sthr_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_sthr_start, pattern="^sset:threshold$")],
+        states={
+            _SSET_THRESH_DRINK: [CallbackQueryHandler(_sthr_pick_drink, pattern="^sthr_dr:")],
+            _SSET_THRESH_AMT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sthr_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    sall_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_sall_start, pattern="^sset:allocation$")],
+        states={
+            _SSET_ALLOC_KEY: [CallbackQueryHandler(_sall_pick_key, pattern="^sall_k:")],
+            _SSET_ALLOC_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sall_value)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    for conv in (exp_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
+                 del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv):
+        app.add_handler(conv)
+
+    app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
     app.add_handler(MessageHandler(filters.Text(["📊 Summary"]) & ~filters.COMMAND, _btn_summary))
     app.add_handler(MessageHandler(filters.Text(["📋 Report"]) & ~filters.COMMAND, _btn_report))
     app.add_handler(MessageHandler(filters.Text(["💰 Prices"]) & ~filters.COMMAND, cmd_prices))
@@ -2443,6 +3726,10 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_report_type, pattern="^rep:"))
     app.add_handler(CallbackQueryHandler(_cb_report_date, pattern="^rpd:"))
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|settings|staff|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
+    app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
+    app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))
 
     app.add_handler(CommandHandler("setup", _cmd_setup))
     app.add_handler(CommandHandler("start", cmd_start))
