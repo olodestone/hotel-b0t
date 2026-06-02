@@ -1837,6 +1837,7 @@ _ACT_DATE = 52
 _RNM_OLD, _RNM_NEW = range(53, 55)
 _SST_DRINK, _SST_STORE, _SST_BAR = range(55, 58)
 _DDR_DRINK, _DDR_CONFIRM = range(58, 60)
+_DEB_STAFF = 60  # add-debtor flow: "who served them?" step (after note, before date)
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2472,6 +2473,24 @@ def _skip_keyboard(cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data=cb)]])
 
 
+def _staff_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    """Tap buttons for known staff + Other/Skip. Used by the Add Debtor flow."""
+    staff_rows = [u for u in db.read_all("users") if u.get("role") == "staff"]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for u in staff_rows:
+        row.append(InlineKeyboardButton(u["username"].title(), callback_data=f"{prefix}:{u['username']}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("✏️ Other", callback_data=f"{prefix}:__other__"),
+        InlineKeyboardButton("⏭ Skip",   callback_data=f"{prefix}:__skip__"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 @_require_admin
 async def _btn_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -2802,13 +2821,39 @@ async def _deb_note_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     ctx.user_data["deb_note"] = ""
     await q.edit_message_text(
+        "🧑‍💼 *Who served them?* (optional)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_staff_keyboard("deb_st"),
+    )
+    return _DEB_STAFF
+
+
+async def _deb_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["deb_note"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🧑‍💼 *Who served them?* (optional)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_staff_keyboard("deb_st"),
+    )
+    return _DEB_STAFF
+
+
+async def _deb_pick_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data.split(":", 1)[1]
+    if val == "__other__":
+        await q.edit_message_text("🧑‍💼 Type the staff member's name:")
+        return _DEB_STAFF
+    ctx.user_data["deb_staff"] = "" if val == "__skip__" else val
+    await q.edit_message_text(
         "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard("deb_d"),
     )
     return _DEB_DATE
 
 
-async def _deb_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data["deb_note"] = update.message.text.strip()
+async def _deb_staff_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["deb_staff"] = update.message.text.strip()
     await update.message.reply_text(
         "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard("deb_d"),
     )
@@ -2830,13 +2875,14 @@ async def _deb_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if val == "cal_x":
         return _DEB_DATE
     ts = None if val == "today" else val
-    acct = ctx.user_data.pop("deb_acct", "bar")
-    name = ctx.user_data.pop("deb_name", "")
-    amt  = ctx.user_data.pop("deb_amt", 0.0)
-    note = ctx.user_data.pop("deb_note", "")
+    acct  = ctx.user_data.pop("deb_acct", "bar")
+    name  = ctx.user_data.pop("deb_name", "")
+    amt   = ctx.user_data.pop("deb_amt", 0.0)
+    note  = ctx.user_data.pop("deb_note", "")
+    staff = ctx.user_data.pop("deb_staff", "")
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_add_debtor(acct, name, amt, note, timestamp=ts, recorded_by=recorded_by)
+    ok, msg = logic.process_add_debtor(acct, name, amt, note, timestamp=ts, recorded_by=recorded_by, staff_name=staff)
     await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
 
@@ -4069,6 +4115,10 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _DEB_NOTE:  [
                 CallbackQueryHandler(_deb_note_skip, pattern="^deb_note:skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _deb_note_text),
+            ],
+            _DEB_STAFF: [
+                CallbackQueryHandler(_deb_pick_staff, pattern="^deb_st:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _deb_staff_text),
             ],
             _DEB_DATE:  [CallbackQueryHandler(_deb_pick_date, pattern="^deb_d:")],
         },
