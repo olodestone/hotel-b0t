@@ -135,7 +135,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["📊 Summary", "📋 Report"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"], ["⚙️ Manage"]],
+    [["📊 Summary", "📋 Report"], ["💰 Prices", "📦 Stock"], ["📜 History", "💳 Debtors"], ["⚙️ Manage", "🧭 Position"]],
     resize_keyboard=True,
 )
 
@@ -1895,6 +1895,7 @@ _RNM_OLD, _RNM_NEW = range(53, 55)
 _SST_DRINK, _SST_STORE, _SST_BAR = range(55, 58)
 _DDR_DRINK, _DDR_CONFIRM = range(58, 60)
 _DEB_STAFF = 60  # add-debtor flow: "who served them?" step (after note, before date)
+_DRW_AMT, _DRW_NOTE = range(61, 63)  # owner-draw flow: amount → optional note
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2425,6 +2426,8 @@ def _manage_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("➕ Add Debtor",   callback_data="mgr:add_debtor")],
         [InlineKeyboardButton("✅ Pay Debtor",   callback_data="mgr:pay_debtor"),
          InlineKeyboardButton("📊 Allocation",   callback_data="mgr:allocation")],
+        [InlineKeyboardButton("🧭 Position",     callback_data="mgr:position"),
+         InlineKeyboardButton("💵 Owner Draw",   callback_data="mgr:draw")],
         [InlineKeyboardButton("🗑 Delete Entry", callback_data="mgr:delete"),
          InlineKeyboardButton("📋 Activity",     callback_data="mgr:activity")],
         [InlineKeyboardButton("📈 Restock Plan", callback_data="mgr:restock_plan"),
@@ -2662,6 +2665,49 @@ async def _exp_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ok, msg = logic.process_expense(acct, cat, amt, note, timestamp=ts, recorded_by=recorded_by)
     await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
+
+
+# ── Owner-draw flow ────────────────────────────────────────────────────
+
+@_require_admin
+async def _drw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "💵 *Owner Draw — how much?* (₦)\n"
+        "_Money you're taking out of the business. It reduces cash, not profit._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _DRW_AMT
+
+
+async def _drw_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    val, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter a valid amount (e.g. 50000):")
+        return _DRW_AMT
+    ctx.user_data["drw_amt"] = val
+    await update.message.reply_text("📝 Any note? (optional)", reply_markup=_skip_keyboard("drw_note:skip"))
+    return _DRW_NOTE
+
+
+async def _drw_finalize(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str) -> int:
+    amt = ctx.user_data.pop("drw_amt", 0.0)
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_draw(amt, note, recorded_by=recorded_by)
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+async def _drw_note_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    return await _drw_finalize(update, ctx, "")
+
+
+async def _drw_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _drw_finalize(update, ctx, update.message.text.strip())
 
 
 # ── Restock flow ───────────────────────────────────────────────────────
@@ -3555,6 +3601,9 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         text = reports.generate_allocation_report(for_month=(now.year, now.month))
         await _reply_long_cb(q, text)
 
+    elif action == "position":
+        await _reply_long_cb(q, reports.generate_position_report())
+
     elif action == "restock_plan":
         from datetime import datetime as _dt
         now = _dt.now()
@@ -3885,6 +3934,11 @@ async def _btn_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_report_date_keyboard("summary", today.year, today.month),
     )
+
+
+@_require_admin
+async def _btn_position(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reply_long(update, reports.generate_position_report())
 
 
 @_require_auth
@@ -4284,12 +4338,25 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
-    for conv in (exp_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
+    drw_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_drw_start, pattern="^mgr:draw$")],
+        states={
+            _DRW_AMT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _drw_amount)],
+            _DRW_NOTE: [
+                CallbackQueryHandler(_drw_note_skip, pattern="^drw_note:skip$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _drw_note_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
                  rnm_conv, sst_conv, ddr_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
+    app.add_handler(MessageHandler(filters.Text(["🧭 Position"]) & ~filters.COMMAND, _btn_position))
     app.add_handler(MessageHandler(filters.Text(["📊 Summary"]) & ~filters.COMMAND, _btn_summary))
     app.add_handler(MessageHandler(filters.Text(["📋 Report"]) & ~filters.COMMAND, _btn_report))
     app.add_handler(MessageHandler(filters.Text(["💰 Prices"]) & ~filters.COMMAND, cmd_prices))
@@ -4301,7 +4368,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
     app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
     app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
-    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|restock_plan|fixstock|settings|staff|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|restock_plan|fixstock|settings|staff|addstaff|removestaff)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))
