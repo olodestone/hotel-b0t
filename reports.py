@@ -5,7 +5,7 @@ All monetary values are in ₦ (Naira) — change the symbol in _fmt() if needed
 """
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from math import ceil
 from typing import Any
 
@@ -1246,6 +1246,7 @@ HIGH_MARGIN = 400          # ₦/unit considered "high margin"
 _SLOW_MONTHLY = 5          # sold fewer than this/month = slow mover
 _NOW_WEEKS = 1.75          # store-empty + < this cover = reorder now
 _SOON_WEEKS = 3.5          # store-empty + < this cover = reorder soon
+_VELOCITY_WINDOW_DAYS = 30 # default rolling window for velocity/turn/budget
 
 _WEEK_CYCLE = {
     1: "Week 1 — sell stock, spot fast movers",
@@ -1266,6 +1267,29 @@ def _order_range(weekly: float) -> tuple[str, int]:
     return "6", 6
 
 
+def _in_date_window(rows: list[dict], start: date, end: date) -> list[dict]:
+    """Rows whose timestamp falls within [start, end] inclusive."""
+    out = []
+    for r in rows:
+        dt = _parse_ts(r.get("timestamp"))
+        if dt and start <= dt.date() <= end:
+            out.append(r)
+    return out
+
+
+def _days_covered(rows: list[dict], end: date, window: int) -> int:
+    """Days of history the window actually spans (1..window).
+
+    Anchored to the earliest sale inside the window, so a bar younger than
+    `window` days isn't divided by the full window (which would understate
+    velocity)."""
+    dates = [dt.date() for dt in (_parse_ts(r.get("timestamp")) for r in rows) if dt]
+    if not dates:
+        return window
+    span = (end - min(dates)).days + 1
+    return max(1, min(window, span))
+
+
 def generate_restock_plan(
     for_date: date | None = None,
     for_month: tuple[int, int] | None = None,
@@ -1273,19 +1297,38 @@ def generate_restock_plan(
 ) -> str:
     """Advisory weekly restock plan: transfers, reorder tiers, budget, warnings.
 
-    Velocity is derived from the period's sales (treated as a 4-week month);
-    defaults to the current month, which is the intended view.
+    Default view uses a rolling trailing-30-day window for velocity, revenue,
+    turn ratio and budget — so the plan doesn't collapse in the first days of a
+    new month (it leans on the prior month's sales until the new month fills
+    in). An explicit period (for_date/for_month/all_time) instead filters to
+    that span and treats it as a 4-week month, for historical look-back.
     """
     items = inv.get_inventory_summary()
     if not items:
         return "📦 Inventory is empty. Use /restock to add drinks first."
 
-    label = _period_label(for_date, for_month, all_time)
+    # No explicit period → rolling trailing-30-day window (the intended view).
+    rolling = for_date is None and for_month is None and not all_time
     today = for_date or datetime.now().date()
     week_no = min((today.day - 1) // 7 + 1, 4)
 
-    # Sales velocity + bar revenue for the period.
-    sales_rows = _apply_filter(_active(db.read_all("sales")), for_date, for_month, all_time)
+    all_sales = _active(db.read_all("sales"))
+    all_exp   = _active(db.read_all("expenses"))
+    if rolling:
+        cutoff = today - timedelta(days=_VELOCITY_WINDOW_DAYS - 1)
+        sales_rows = _in_date_window(all_sales, cutoff, today)
+        exp_rows   = _in_date_window(all_exp, cutoff, today)
+        days_covered = _days_covered(sales_rows, today, _VELOCITY_WINDOW_DAYS)
+        weeks_in_period = days_covered / 7.0
+        label = (f"last {_VELOCITY_WINDOW_DAYS} days" if days_covered >= _VELOCITY_WINDOW_DAYS
+                 else f"last {days_covered} days (limited history)")
+    else:
+        sales_rows = _apply_filter(all_sales, for_date, for_month, all_time)
+        exp_rows   = _apply_filter(all_exp, for_date, for_month, all_time)
+        weeks_in_period = 4.0   # month ≈ 4 weeks (legacy basis for explicit periods)
+        label = _period_label(for_date, for_month, all_time)
+
+    # Sales velocity + bar revenue for the window/period.
     qty_by_drink: dict[str, int] = {}
     bar_revenue = 0.0
     for r in sales_rows:
@@ -1293,8 +1336,7 @@ def generate_restock_plan(
         qty_by_drink[nm] = qty_by_drink.get(nm, 0) + int(r["quantity"])
         bar_revenue += float(r["total_revenue"])
 
-    # Restock already spent this period (bar / "restock" expenses).
-    exp_rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
+    # Restock already spent in the window/period (bar / "restock" expenses).
     restock_spent = sum(
         float(e["amount"]) for e in exp_rows
         if e.get("account") == "bar" and str(e.get("category", "")).lower() == "restock"
@@ -1313,8 +1355,9 @@ def generate_restock_plan(
     for it in items:
         name, bar, store = it["drink"], it["bar_stock"], it["store_stock"]
         cost, price, margin = it["cost_price"], it["selling_price"], it["margin"]
-        monthly = qty_by_drink.get(name.lower(), 0)
-        weekly = monthly / 4.0
+        units = qty_by_drink.get(name.lower(), 0)
+        weekly = units / weeks_in_period if weeks_in_period else 0.0
+        monthly = round(weekly * 4)   # 4-week-equivalent rate (slow-mover basis)
         total = bar + store
 
         # Transfer suggestion (store → bar) when bar cover is thin.
