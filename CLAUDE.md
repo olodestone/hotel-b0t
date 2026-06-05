@@ -43,7 +43,7 @@ config.py  (imported by all layers)
 
 **`database.py`** — PostgreSQL persistence via SQLAlchemy + pandas. All queries use parameterised statements. `read_all(table)` returns `list[dict]` using `pd.read_sql`. The `upsert_drink()` function does an atomic `INSERT ... ON CONFLICT DO UPDATE`. `get_setting()`/`set_setting()` manage the `settings` table for configurable percentages.
 
-**`reports.py`** — Pure formatting: reads data from `database.py`/`inventory.py`, builds Telegram Markdown strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses *current* cost price (not historical per-sale cost). Salary expenses are always split out separately from other expenses.
+**`reports.py`** — Pure formatting: reads data from `database.py`/`inventory.py`, builds Telegram Markdown strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses *current* cost price (not historical per-sale cost). Salary expenses are always split out separately from other expenses. Profit calcs exclude `restock` (inventory purchase) and owner draws — see "Profit vs Cash vs Stock" below.
 
 **`config.py`** — All env var loading via `python-dotenv`. Also holds allocation defaults (`ALLOC_*`) used as fallback when DB settings are not yet set.
 
@@ -81,14 +81,16 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 |---|---|
 | `/sales_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Drink-level sales breakdown with cost & profit |
 | `/expense_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Expense breakdown by category |
-| `/expense <room\|bar> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages |
+| `/expense <room\|bar> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages. Draw-like categories (`drawings`, `owner`, `withdrawal`, …) are rejected and routed to `/draw` |
+| `/draw <amount> [note] [YYYY-MM-DD]` | Record an owner withdrawal (equity draw). **Not** an expense — reduces cash, never profit |
 | `/add_debtor <room\|bar> <name> <amount> [note] [YYYY-MM-DD]` | Log debtor |
 | `/pay_debtor <room\|bar> <name> [amount]` | Full or partial debt payment |
 | `/debtor_history <bar\|rooms> <name>` | Full payment timeline for a debtor |
-| `/restock <drink> <qty> <cost_price>` | Add inventory to store |
+| `/restock <drink> <qty> <cost_price>` | Add inventory to store. Logged as a `restock` expense row but treated as a cash→stock movement, **not** a P&L cost |
 | `/transfer <drink> <qty>` | Move store → bar |
-| `/delete <sale\|room\|expense> <id>` | Remove an entry |
+| `/delete <sale\|room\|expense\|draw> <id>` | Remove an entry |
 | `/staff_report [today\|YYYY-MM-DD\|YYYY-MM]` | Sales per staff member |
+| `/position [set <amount>]` | Profit vs cash vs stock-value snapshot. `set` anchors the cash estimate to your real bank balance |
 | `/allocation [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Revenue allocation + profit distribution |
 | `/setallocation <key> <percent>` | Adjust allocation percentages (see below) |
 | `/setthreshold <drink> <amount>` | Low-stock alert threshold |
@@ -114,8 +116,19 @@ All date-filtered reports accept the same arguments:
 | `generate_staff_report()` | `/staff_report` |
 | `generate_daily_summary()` | `/summary` + scheduled daily report |
 | `generate_allocation_report()` | `/allocation` |
+| `generate_position_report()` | `/position` |
 | `generate_stock_report()` | `/stock` |
 | `generate_debtors_report()` | `/debtors` |
+
+### Profit vs Cash vs Stock (accounting model)
+
+Three figures are tracked separately and must never be conflated:
+
+1. **Profit (performance)** — `revenue − cost-of-stock-sold (COGS) − operating expenses`. **Owner draws and inventory purchases (`restock`) are excluded.** Buying stock converts cash into a stock asset; its cost only hits the P&L as COGS when the drink is *sold*. Counting the restock purchase as an expense too would double-count it. `reports._operating_expenses()` strips `restock` (the `NON_PNL_CATEGORIES` set) from every profit calc (`generate_full_report`, `generate_daily_summary`, `generate_expense_report`, `generate_allocation_report`).
+2. **Cash in bank (estimate)** — running balance: `opening + collected sales − operating expenses − stock purchases − owner draws`. Draws and restock **do** reduce cash. Set the opening balance with `/position set <amount>`. Assumes sales are cash unless an outstanding debtor exists.
+3. **Stock value on hand (asset)** — `Σ (store + bar units) × cost_price`. Shown as `TOTAL VALUE` in `/stock` and line ③ of `/position`.
+
+`/position` shows all three side by side plus outstanding receivables. Owner draws live in the dedicated `owner_draws` table, never in `expenses`, so they can never touch profit.
 
 ### Salary expenses
 Record with category `salary`:
@@ -192,11 +205,12 @@ Detection: `_extract_date(args)` in `bot.py` checks if the last arg matches `^\d
 | `sales` | `id`, `timestamp`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by` |
 | `rooms` | `id`, `timestamp`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue` |
 | `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description` |
+| `owner_draws` | `id`, `timestamp`, `amount`, `account`, `description`, `recorded_by`, `deleted_by`, `deleted_at` — owner equity withdrawals, deliberately separate from `expenses` |
 | `debtors` | `id`, `timestamp`, `account`, `name`, `amount`, `amount_paid`, `description`, `status`, `paid_at` |
 | `debtor_payments` | `id`, `debtor_id`, `timestamp`, `amount`, `recorded_by` — one row per payment event |
 | `inventory` | `drink_name`, `current_stock`, `store_stock`, `total_purchased`, `total_sold`, `cost_price`, `low_stock_threshold` |
 | `users` | `user_id`, `username`, `role`, `added_at` |
-| `settings` | `key`, `value` — stores allocation percentages |
+| `settings` | `key`, `value` — stores allocation percentages and `cash_opening` (opening bank balance for `/position`) |
 
 All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases upgrade safely on next startup.
 

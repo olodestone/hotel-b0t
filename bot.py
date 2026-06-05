@@ -371,6 +371,7 @@ def _help_text(is_admin: bool = False) -> str:
     admin_cmds = (
         "\n\n*🔧 Admin Commands*\n"
         "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
+        "`/draw <amount> [note] [YYYY-MM-DD]` — owner withdrawal _(not an expense)_\n"
         "`/add_debtor <room|bar> <name> <amount> [note] [by:<staff>] [YYYY-MM-DD]`\n"
         "`/pay_debtor <room|bar> <name> [amount]`\n"
         "`/pay_debt <id> [amount]` — pay by debt ID\n"
@@ -381,10 +382,11 @@ def _help_text(is_admin: bool = False) -> str:
         "`/renamedrink <old> <new>` — rename, or merge duplicate SKUs\n"
         "`/setstock <drink> <store> <bar>` — correct stock counts\n"
         "`/deletedrink <drink>` — remove a zero-stock drink\n"
-        "`/delete <sale|room|expense> <id>`\n"
+        "`/delete <sale|room|expense|draw> <id>`\n"
         "`/setprice <drink> <price>`\n"
         "`/setroomtype <type> <price>` — set room type preset price\n"
         "`/report` | `/report today` | `/report YYYY-MM` | `/report all`\n"
+        "`/position` — profit vs cash vs stock snapshot _(/position set <amount>)_\n"
         "`/sales_report` | `/expense_report` | `/staff_report` | `/allocation`\n"
         "`/setallocation <key> <percent>`\n"
         "`/setthreshold <drink> <amount>`\n"
@@ -625,6 +627,34 @@ async def cmd_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
     ok, msg = logic.process_expense(account, category, amount, description, timestamp=ts, recorded_by=recorded_by)
+    await _reply(update, msg)
+
+
+# ── /draw (owner withdrawal) ──────────────────────────────────────────
+
+@_require_admin
+async def cmd_draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args, ts = _extract_date(_parse_args(ctx))
+    if not args:
+        await _reply(
+            update,
+            "Usage: `/draw <amount> [note] [YYYY-MM-DD]`\n"
+            "Example: `/draw 50000 owner monthly take`\n\n"
+            "_An owner draw is money you take out of the business. It reduces "
+            "cash, not profit — so it's logged here, never as an expense._\n"
+            "_See /position for the full picture._",
+        )
+        return
+
+    amount, err = _to_float(args[0], "amount")
+    if err:
+        await _reply(update, err)
+        return
+    description = " ".join(args[1:]) if len(args) > 1 else ""
+
+    user = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_draw(amount, description, timestamp=ts, recorded_by=recorded_by)
     await _reply(update, msg)
 
 
@@ -940,7 +970,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     if len(args) < 2:
-        await _reply(update, "Usage: `/delete <sale|room|expense> <id>`\nExample: `/delete sale 12`")
+        await _reply(update, "Usage: `/delete <sale|room|expense|draw> <id>`\nExample: `/delete sale 12`")
         return
 
     entry_type = args[0].lower()
@@ -1146,6 +1176,31 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     staff_view = not _is_admin(update.effective_user.id)
     text = reports.generate_daily_summary(target=None, staff_view=staff_view)
     await _reply_long(update, text)
+
+
+# ── /position (admin) ─────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_position(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = _parse_args(ctx)
+    # `/position set <amount>` anchors the cash estimate to your real bank balance.
+    if args and args[0].lower() == "set":
+        if len(args) < 2:
+            await _reply(update, "Usage: `/position set <amount>` — your current real bank balance.")
+            return
+        amount, err = _to_float(args[1], "amount")
+        if err:
+            await _reply(update, err)
+            return
+        db.set_setting(reports.CASH_OPENING_KEY, str(round(amount, 2)))
+        await _reply(
+            update,
+            f"✅ Opening cash balance set to ₦{amount:,.2f}.\n"
+            "_The cash estimate now builds on this figure. Run /position to see it._",
+        )
+        return
+
+    await _reply_long(update, reports.generate_position_report())
 
 
 # ── /allocation (admin) ──────────────────────────────────────────────
@@ -1684,7 +1739,7 @@ async def cmd_unsuspend(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── /export (admin) ───────────────────────────────────────────────────
 
 _EXPORT_TABLES = [
-    "sales", "rooms", "expenses", "debtors", "debtor_payments",
+    "sales", "rooms", "expenses", "owner_draws", "debtors", "debtor_payments",
     "inventory", "transfers", "users", "settings",
 ]
 
@@ -1704,7 +1759,9 @@ def _build_export_excel(schema: str) -> io.BytesIO:
 
             rows.append(("Bar Revenue (₦)",      _q("SELECT COALESCE(SUM(total_revenue),0) FROM sales WHERE deleted_at='' OR deleted_at IS NULL")))
             rows.append(("Rooms Revenue (₦)",    _q("SELECT COALESCE(SUM(total_revenue),0) FROM rooms WHERE deleted_at='' OR deleted_at IS NULL")))
-            rows.append(("Total Expenses (₦)",   _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE deleted_at='' OR deleted_at IS NULL")))
+            rows.append(("Operating Expenses (₦)", _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE category<>'restock' AND (deleted_at='' OR deleted_at IS NULL)")))
+            rows.append(("Stock Purchases / Restock (₦)", _q("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE category='restock' AND (deleted_at='' OR deleted_at IS NULL)")))
+            rows.append(("Owner Draws (₦)",      _q("SELECT COALESCE(SUM(amount),0) FROM owner_draws WHERE deleted_at='' OR deleted_at IS NULL")))
             rows.append(("Outstanding Debt (₦)", _q("SELECT COALESCE(SUM(amount - amount_paid),0) FROM debtors WHERE status='outstanding'")))
             rows.append(("Bar Stock Value (₦)",  _q("SELECT COALESCE(SUM(current_stock * cost_price),0) FROM inventory")))
             rows.append(("Store Stock Value (₦)",_q("SELECT COALESCE(SUM(store_stock * cost_price),0) FROM inventory")))
@@ -4260,6 +4317,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("restock", cmd_restock))
     app.add_handler(CommandHandler("room", cmd_room))
     app.add_handler(CommandHandler("expense", cmd_expense))
+    app.add_handler(CommandHandler("draw", cmd_draw))
     app.add_handler(CommandHandler("add_debtor", cmd_add_debtor))
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
     app.add_handler(CommandHandler("pay_debt", cmd_pay_debt))
@@ -4275,6 +4333,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("activity", cmd_activity))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("position", cmd_position))
     app.add_handler(CommandHandler("allocation", cmd_allocation))
     app.add_handler(CommandHandler("setallocation", cmd_setallocation))
     app.add_handler(CommandHandler("stock", cmd_stock))

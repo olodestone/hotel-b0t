@@ -79,17 +79,55 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
 VALID_ACCOUNTS = ("rooms", "bar")
 
 
+# Categories that describe the owner taking money out, not a business cost.
+# These don't reduce profit — they reduce cash and owner's equity — so they
+# must be logged with /draw, never as an expense.
+_DRAW_LIKE_CATEGORIES = {
+    "draw", "draws", "drawing", "drawings", "withdraw", "withdrawal",
+    "withdrawals", "owner", "owners", "personal", "dividend", "dividends",
+}
+
+
 def process_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
+    if category.strip().lower() in _DRAW_LIKE_CATEGORIES:
+        return False, (
+            f"❌ *{category.title()}* is an owner withdrawal, not a business expense.\n"
+            "Money you take out doesn't reduce profit — log it with:\n"
+            f"`/draw {amount:.0f}{(' ' + description) if description else ''}`\n"
+            "See /position for how draws, profit and cash are tracked separately."
+        )
 
     db.record_expense(account.strip(), category.strip(), amount, description.strip(), timestamp=timestamp, recorded_by=recorded_by)
     date_note = f"\nDate: {timestamp}" if timestamp else ""
     return True, (
         f"✅ Expense recorded.\n"
         f"Account: *{account.title()}* | Category: *{category.title()}* | Amount: ₦{amount:,.2f}"
+        + (f"\nNote: {description}" if description else "")
+        + date_note
+    )
+
+
+# ── Owner draws ───────────────────────────────────────────────────────
+
+def process_draw(amount: float, description: str = "", account: str = "", timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
+    """Record an owner withdrawal. This is an equity draw, not an expense — it
+    reduces cash and owner's equity but never the business's profit."""
+    if amount <= 0:
+        return False, "❌ Amount must be a positive number."
+    if account and account.lower() not in VALID_ACCOUNTS:
+        return False, f"❌ Account must be *rooms* or *bar* (or leave blank). Got: `{account}`"
+
+    db.record_draw(amount, description.strip(), account.strip(), timestamp=timestamp, recorded_by=recorded_by)
+    date_note = f"\nDate: {timestamp}" if timestamp else ""
+    acct_note = f"\nFrom: *{account.title()}* account" if account.strip() else ""
+    return True, (
+        f"💸 Owner draw recorded: ₦{amount:,.2f}\n"
+        "_Recorded as an equity withdrawal — it reduces cash, not profit._"
+        + acct_note
         + (f"\nNote: {description}" if description else "")
         + date_note
     )
@@ -199,12 +237,12 @@ def process_restock(drink: str, qty: int, cost_price: float, recorded_by: str = 
 
 # ── Entry deletion ───────────────────────────────────────────────────
 
-_VALID_ENTRY_TYPES = ("sale", "room", "expense")
+_VALID_ENTRY_TYPES = ("sale", "room", "expense", "draw")
 
 
 def process_delete(entry_type: str, entry_id: int, actor: str = "") -> tuple[bool, str]:
     if entry_type not in _VALID_ENTRY_TYPES:
-        return False, f"❌ Type must be *sale*, *room*, or *expense*. Got: `{entry_type}`"
+        return False, f"❌ Type must be *sale*, *room*, *expense*, or *draw*. Got: `{entry_type}`"
 
     if entry_type == "sale":
         row = db.void_sale(entry_id, actor=actor)
@@ -225,6 +263,13 @@ def process_delete(entry_type: str, entry_id: int, actor: str = "") -> tuple[boo
         if not found:
             return False, f"❌ Room entry `#{entry_id}` not found (or already voided)."
         return True, f"✅ Room entry `#{entry_id}` voided."
+
+    if entry_type == "draw":
+        row = db.void_draw(entry_id, actor=actor)
+        if row is None:
+            return False, f"❌ Draw entry `#{entry_id}` not found (or already voided)."
+        amount = float(row["amount"])
+        return True, f"✅ Owner draw `#{entry_id}` voided — ₦{amount:,.2f} added back to cash."
 
     # expense
     found = db.void_expense(entry_id, actor=actor)

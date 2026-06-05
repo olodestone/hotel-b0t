@@ -177,6 +177,28 @@ def _active(rows: list[dict]) -> list[dict]:
     return [r for r in rows if not r.get("deleted_at")]
 
 
+# Expense categories that are cash/stock movements, NOT P&L operating costs.
+# Buying inventory (restock) converts cash into a stock asset; that cost only
+# reaches the P&L as cost-of-goods-sold when the drink is actually sold.
+# Counting the restock purchase as an expense too would double-count it
+# against profit, so it is stripped out of every profit calculation below.
+NON_PNL_CATEGORIES = {"restock"}
+
+
+def _operating_expenses(rows: list[dict]) -> list[dict]:
+    """Keep only P&L operating-expense rows (excludes restock / stock purchases)."""
+    return [r for r in rows if str(r.get("category", "")).lower() not in NON_PNL_CATEGORIES]
+
+
+def _restock_spend(rows: list[dict]) -> float:
+    """Total inventory-purchase (restock) cash outflow — a cash movement, not a P&L cost."""
+    return round(
+        sum(float(r["amount"]) for r in rows
+            if str(r.get("category", "")).lower() == "restock"),
+        2,
+    )
+
+
 def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
     """Match each sale to its current cost price from inventory."""
     total = 0.0
@@ -207,8 +229,11 @@ def generate_full_report(
     expense_rows = _apply_filter(expense_rows, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
-    bar_expenses = [r for r in expense_rows if r.get("account", "bar") == "bar"]
-    room_expenses = [r for r in expense_rows if r.get("account", "rooms") == "rooms"]
+    # Only P&L operating expenses count toward profit — restock (inventory
+    # purchase) is a cash/stock movement and is reported separately below.
+    bar_expenses = _operating_expenses([r for r in expense_rows if r.get("account", "bar") == "bar"])
+    room_expenses = _operating_expenses([r for r in expense_rows if r.get("account", "rooms") == "rooms"])
+    restock_total = _restock_spend(expense_rows)
 
     drink_revenue = _sum_revenue(sales_rows)
     room_revenue = _sum_revenue(room_rows)
@@ -251,11 +276,11 @@ def generate_full_report(
         f"📅 Period: {label}",
         _SEP,
         "🍺 *BAR ACCOUNT*",
-        f"  Revenue:       {_fmt(drink_revenue)}",
-        f"  Cost of Stock: {_fmt(cost_of_drinks)}",
-        f"  Salaries:      {_fmt(bar_salary_total)}",
-        f"  Other Expenses:{_fmt(_sum_revenue(bar_other, key='amount'))}",
-        f"  {bar_emoji} Profit:      *{_fmt(bar_profit)}*",
+        f"  Revenue: {_fmt(drink_revenue)}",
+        f"  Cost of Stock Sold: {_fmt(cost_of_drinks)}",
+        f"  Salaries: {_fmt(bar_salary_total)}",
+        f"  Other Expenses: {_fmt(_sum_revenue(bar_other, key='amount'))}",
+        f"  {bar_emoji} *Profit: {_fmt(bar_profit)}*",
     ]
 
     if bar_other:
@@ -270,10 +295,10 @@ def generate_full_report(
     lines += [
         _SEP,
         "🛏 *ROOMS ACCOUNT*",
-        f"  Revenue:       {_fmt(room_revenue)}",
-        f"  Salaries:      {_fmt(room_salary_total)}",
-        f"  Other Expenses:{_fmt(_sum_revenue(room_other, key='amount'))}",
-        f"  {room_emoji} Profit:      *{_fmt(room_profit)}*",
+        f"  Revenue: {_fmt(room_revenue)}",
+        f"  Salaries: {_fmt(room_salary_total)}",
+        f"  Other Expenses: {_fmt(_sum_revenue(room_other, key='amount'))}",
+        f"  {room_emoji} *Profit: {_fmt(room_profit)}*",
     ]
 
     if room_other:
@@ -293,6 +318,13 @@ def generate_full_report(
         f"  {net_emoji} *Net Profit:    {_fmt(net_profit)}*",
         _SEP,
     ]
+
+    if restock_total > 0:
+        lines += [
+            f"📦 Stock purchased: {_fmt(restock_total)}",
+            "  _Inventory buy — cash → stock, not a profit cost. See /position._",
+            _SEP,
+        ]
 
     outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
     if outstanding:
@@ -396,6 +428,10 @@ def generate_expense_report(
     if not expense_rows:
         return f"💸 *Expense Report — {label}*\n\nNo expenses recorded for this period."
 
+    # Restock (inventory purchases) is a cash → stock movement, not an operating
+    # expense — shown separately so it never inflates the expense total.
+    restock_total = _restock_spend(expense_rows)
+    expense_rows = _operating_expenses(expense_rows)
     bar_expenses = [r for r in expense_rows if r.get("account") == "bar"]
     room_expenses = [r for r in expense_rows if r.get("account") == "rooms"]
 
@@ -451,8 +487,10 @@ def generate_expense_report(
         *room_section,
         _SEP,
         f"*Grand Total: {_fmt(grand_total)}*",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
     ]
+    if restock_total > 0:
+        lines.append(f"📦 Stock purchased: {_fmt(restock_total)} _(inventory buy — not an operating expense)_")
+    lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -583,8 +621,10 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
     room_rev = _sum_revenue(room_rows)
     total_rev = bar_rev + room_rev
 
-    bar_exp = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "bar")
-    room_exp = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "rooms")
+    # Restock (inventory purchase) is a cash/stock movement, not a P&L cost.
+    op_expenses = _operating_expenses(expense_rows)
+    bar_exp = sum(float(r["amount"]) for r in op_expenses if r.get("account") == "bar")
+    room_exp = sum(float(r["amount"]) for r in op_expenses if r.get("account") == "rooms")
     cost_drinks = _cost_of_drinks_sold(sales_rows)
     total_out = bar_exp + room_exp + cost_drinks
     net = total_rev - total_out
@@ -682,16 +722,22 @@ def generate_allocation_report(
     room_rev = _sum_revenue(room_rows)
     total_rev = bar_rev + room_rev
 
-    bar_salary_rows,  bar_other_rows  = _split_salary([r for r in expense_rows if r.get("account") == "bar"])
-    room_salary_rows, room_other_rows = _split_salary([r for r in expense_rows if r.get("account") == "rooms"])
+    # Operating expenses only — restock (inventory purchase) is cash → stock,
+    # and the cost of stock reaches the P&L as cost-of-stock-sold below.
+    op_expense_rows = _operating_expenses(expense_rows)
+    bar_salary_rows,  bar_other_rows  = _split_salary([r for r in op_expense_rows if r.get("account") == "bar"])
+    room_salary_rows, room_other_rows = _split_salary([r for r in op_expense_rows if r.get("account") == "rooms"])
 
     bar_salary_amt  = sum(float(r["amount"]) for r in bar_salary_rows)
     room_salary_amt = sum(float(r["amount"]) for r in room_salary_rows)
     total_salary    = bar_salary_amt + room_salary_amt
 
-    bar_exp  = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "bar")
-    room_exp = sum(float(r["amount"]) for r in expense_rows if r.get("account") == "rooms")
-    total_exp = bar_exp + room_exp
+    bar_exp  = sum(float(r["amount"]) for r in op_expense_rows if r.get("account") == "bar")
+    room_exp = sum(float(r["amount"]) for r in op_expense_rows if r.get("account") == "rooms")
+    total_exp = bar_exp + room_exp                       # operating expenses (excl restock)
+    cost_of_drinks  = _cost_of_drinks_sold(sales_rows)   # COGS — the real P&L stock cost
+    restock_total   = _restock_spend(expense_rows)       # cash spent buying inventory
+    total_outgoings = cost_of_drinks + total_exp         # true P&L cost base
 
     buffer_pct, restock_pct = _get_alloc_pcts()
     total_pct = buffer_pct + restock_pct
@@ -705,7 +751,7 @@ def generate_allocation_report(
     room_share = round(total_save * (room_rev / total_rev), 2) if total_rev else 0.0
 
     other_exp     = total_exp - total_salary
-    working_capital = total_rev - total_exp
+    working_capital = total_rev - total_outgoings   # = net profit (revenue − COGS − operating exp)
     after_setaside  = working_capital - total_save
     burn_rate = (total_exp / total_rev * 100) if total_rev else 0.0
 
@@ -751,18 +797,22 @@ def generate_allocation_report(
         f"  From Bar Account:   {_fmt(bar_share)}",
         f"  From Rooms Account: {_fmt(room_share)}",
         _SEP,
-        "💸 *ACTUAL EXPENSES*",
+        "💸 *COSTS* _(what reduces profit)_",
+        f"  🍺 Cost of stock sold: {_fmt(cost_of_drinks)}",
         f"  👤 Salaries:       {_fmt(total_salary)}",
         f"    🍺 Bar staff:    {_fmt(bar_salary_amt)}",
         f"    🛏 Rooms staff:  {_fmt(room_salary_amt)}",
         f"  🔧 Other:          {_fmt(other_exp)}",
-        f"  *Total:           {_fmt(total_exp)}*",
+        f"  *Total:           {_fmt(total_outgoings)}*",
         _SEP,
         "📈 *NET POSITION*",
-        f"  After expenses:   {_fmt(working_capital)}",
+        f"  Net profit:       {_fmt(working_capital)}",
         f"  After set-asides: *{_fmt(after_setaside)}*  ← safe to use",
         f"  Burn rate:        {_burn_rate_label(burn_rate)}",
     ]
+
+    if restock_total > 0:
+        lines.append(f"  📦 Stock purchased: {_fmt(restock_total)} _(cash → stock, not a cost)_")
 
     if total_salary > after_setaside:
         lines.append(f"  ⚠️ Salary bill ({_fmt(total_salary)}) exceeds safe amount — review set-aside %")
@@ -814,6 +864,93 @@ def generate_allocation_report(
     if not total_rev:
         return f"📊 *Allocation Report — {label}*\n\nNo revenue recorded for this period."
 
+    return "\n".join(lines)
+
+
+# ── Position report (profit vs cash vs stock) ─────────────────────────
+
+CASH_OPENING_KEY = "cash_opening"
+
+
+def _net_profit(sales_rows: list[dict], room_rows: list[dict], expense_rows: list[dict]) -> tuple[float, float, float, float]:
+    """Return (revenue, cogs, operating_expenses, net_profit) for the given active rows."""
+    revenue = _sum_revenue(sales_rows) + _sum_revenue(room_rows)
+    cogs = _cost_of_drinks_sold(sales_rows)
+    op_exp = round(sum(float(r["amount"]) for r in _operating_expenses(expense_rows)), 2)
+    return round(revenue, 2), cogs, op_exp, round(revenue - cogs - op_exp, 2)
+
+
+def generate_position_report() -> str:
+    """The three figures that should never be mixed: profit, cash, stock value.
+
+    - Profit is a *period* figure (performance); owner draws never reduce it.
+    - Cash in bank is a *running balance* estimate; draws and restock DO reduce it.
+    - Stock value and receivables are point-in-time assets.
+    """
+    sales_all   = _active(db.read_all("sales"))
+    rooms_all   = _active(db.read_all("rooms"))
+    expense_all = _active(db.read_all("expenses"))
+    draws_all   = _active(db.read_all("owner_draws"))
+    debtor_rows = db.read_all("debtors")
+    now = datetime.now()
+
+    # ① Profit — this month and all-time
+    month_sales = _filter_by_month(sales_all, now.year, now.month)
+    month_rooms = _filter_by_month(rooms_all, now.year, now.month)
+    month_exp   = _filter_by_month(expense_all, now.year, now.month)
+    *_, month_profit = _net_profit(month_sales, month_rooms, month_exp)
+    rev_all, _cogs_all, opex_all, profit_all = _net_profit(sales_all, rooms_all, expense_all)
+
+    # ③ Stock value on hand (asset)
+    stock_value = round(sum(i["stock_value"] for i in inv.get_inventory_summary()), 2)
+
+    # Receivables — revenue earned but not yet collected as cash
+    outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
+    receivables = round(sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding), 2)
+
+    # ② Cash in bank (estimate)
+    try:
+        opening = float(db.get_setting(CASH_OPENING_KEY, "0") or 0)
+    except (TypeError, ValueError):
+        opening = 0.0
+    restock_all = _restock_spend(expense_all)
+    draws_total = round(sum(float(r["amount"]) for r in draws_all), 2)
+    collected   = round(rev_all - receivables, 2)   # assume cash unless an outstanding debtor exists
+    cash = round(opening + collected - opex_all - restock_all - draws_total, 2)
+
+    m_emoji = "📈" if month_profit >= 0 else "📉"
+    a_emoji = "📈" if profit_all >= 0 else "📉"
+
+    lines = [
+        f"🧭 *{HOTEL_NAME} — Position*",
+        f"📅 As of {now.strftime('%d %b %Y %H:%M')}",
+        _SEP,
+        "① 📊 *PROFIT* _(performance)_",
+        f"  {m_emoji} This month:  *{_fmt(month_profit)}*",
+        f"  {a_emoji} All-time:    {_fmt(profit_all)}",
+        "  _Revenue − cost of stock sold − expenses._",
+        "  _Owner draws are NOT subtracted here._",
+        _SEP,
+        "② 🏦 *CASH IN BANK* _(estimate)_",
+        f"  Opening balance:    {_fmt(opening)}",
+        f"  + Collected sales:  {_fmt(collected)}",
+        f"  − Expenses:         {_fmt(opex_all)}",
+        f"  − Stock purchases:  {_fmt(restock_all)}",
+        f"  − Owner draws:      {_fmt(draws_total)}",
+        f"  = *Cash on hand:    {_fmt(cash)}*",
+        "  _Assumes sales are cash unless logged as a debtor._",
+        _SEP,
+        "③ 📦 *STOCK VALUE ON HAND* _(asset)_",
+        f"  Bar + store @ cost:  *{_fmt(stock_value)}*",
+        _SEP,
+        "💳 *OWED TO US* _(receivables)_",
+        f"  Outstanding debtors: {_fmt(receivables)}  ({len(outstanding)} owing)",
+        _SEP,
+        "_Profit ≠ cash ≠ stock — keep them separate._",
+        "_Owner draws reduce cash, never profit. Log them with /draw._",
+        "_Set your real starting balance: /position set <amount>_",
+        f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
+    ]
     return "\n".join(lines)
 
 
