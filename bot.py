@@ -1004,8 +1004,7 @@ async def cmd_restock_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     arg = args[0].lower() if args else ""
 
     if not arg:
-        now = datetime.now()
-        text = reports.generate_restock_plan(for_month=(now.year, now.month))
+        text = reports.generate_restock_plan()   # rolling trailing-30-day view
     elif arg == "today":
         text = reports.generate_restock_plan(for_date=datetime.now().date())
     elif arg == "all":
@@ -3605,10 +3604,7 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply_long_cb(q, reports.generate_position_report())
 
     elif action == "restock_plan":
-        from datetime import datetime as _dt
-        now = _dt.now()
-        text = reports.generate_restock_plan(for_month=(now.year, now.month))
-        await _reply_long_cb(q, text)
+        await _reply_long_cb(q, reports.generate_restock_plan())
 
     elif action == "fixstock":
         await q.edit_message_text(
