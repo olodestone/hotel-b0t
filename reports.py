@@ -1247,6 +1247,8 @@ _SLOW_MONTHLY = 5          # sold fewer than this/month = slow mover
 _NOW_WEEKS = 1.75          # store-empty + < this cover = reorder now
 _SOON_WEEKS = 3.5          # store-empty + < this cover = reorder soon
 _VELOCITY_WINDOW_DAYS = 30 # default rolling window for velocity/turn/budget
+_TREND_WINDOW_DAYS = 7     # recent window compared against the 30-day pace
+_TREND_WEIGHT = 0.6        # how hard to lean on the recent pace when accelerating
 
 _WEEK_CYCLE = {
     1: "Week 1 — sell stock, spot fast movers",
@@ -1314,6 +1316,8 @@ def generate_restock_plan(
 
     all_sales = _active(db.read_all("sales"))
     all_exp   = _active(db.read_all("expenses"))
+    qty_recent: dict[str, int] = {}   # units sold in the trailing _TREND_WINDOW_DAYS
+    recent_weeks = 0.0                # set only in rolling mode
     if rolling:
         cutoff = today - timedelta(days=_VELOCITY_WINDOW_DAYS - 1)
         sales_rows = _in_date_window(all_sales, cutoff, today)
@@ -1322,6 +1326,12 @@ def generate_restock_plan(
         weeks_in_period = days_covered / 7.0
         label = (f"last {_VELOCITY_WINDOW_DAYS} days" if days_covered >= _VELOCITY_WINDOW_DAYS
                  else f"last {days_covered} days (limited history)")
+        # Recent pace, to lean orders ahead of an accelerating (e.g. festive) trend.
+        recent_cut = today - timedelta(days=_TREND_WINDOW_DAYS - 1)
+        recent_weeks = min(_TREND_WINDOW_DAYS, days_covered) / 7.0
+        for r in _in_date_window(sales_rows, recent_cut, today):
+            nm = str(r["drink_name"]).lower()
+            qty_recent[nm] = qty_recent.get(nm, 0) + int(r["quantity"])
     else:
         sales_rows = _apply_filter(all_sales, for_date, for_month, all_time)
         exp_rows   = _apply_filter(all_exp, for_date, for_month, all_time)
@@ -1346,7 +1356,7 @@ def generate_restock_plan(
     budget_cap = round(bar_revenue * RESTOCK_BUDGET_PCT / 100, 2)
 
     transfers: list[tuple] = []   # (name, move, bar, new_bar, result_cover)
-    now: list[tuple] = []         # (name, monthly, weekly, rng, est, weeks, margin)
+    now: list[tuple] = []         # (name, monthly, weekly, rng, est, weeks, margin, trend_up)
     soon: list[tuple] = []
     hold: list[tuple] = []        # (name, reason, monthly)
     pricing: list[tuple] = []     # (name, idle_units, tied_value)
@@ -1356,7 +1366,17 @@ def generate_restock_plan(
         name, bar, store = it["drink"], it["bar_stock"], it["store_stock"]
         cost, price, margin = it["cost_price"], it["selling_price"], it["margin"]
         units = qty_by_drink.get(name.lower(), 0)
-        weekly = units / weeks_in_period if weeks_in_period else 0.0
+        base_weekly = units / weeks_in_period if weeks_in_period else 0.0
+        # Trend-aware lean: when the recent week is outpacing the 30-day average
+        # (demand accelerating into a season), order ahead of the curve instead
+        # of trailing it. Decelerating items just ride the steadier 30-day pace.
+        weekly = base_weekly
+        trend_up = False
+        if rolling and recent_weeks:
+            recent_weekly = qty_recent.get(name.lower(), 0) / recent_weeks
+            if recent_weekly > base_weekly:
+                weekly = base_weekly + _TREND_WEIGHT * (recent_weekly - base_weekly)
+                trend_up = recent_weekly > base_weekly * 1.25
         monthly = round(weekly * 4)   # 4-week-equivalent rate (slow-mover basis)
         total = bar + store
 
@@ -1383,7 +1403,7 @@ def generate_restock_plan(
         rng, low_qty = _order_range(weekly)
         two_wk = ceil(weekly * 2)
         note = f" (≈{two_wk}/2wk)" if two_wk > 30 else ""
-        row = (name, monthly, weekly, rng + note, round(low_qty * cost, 2), weeks, margin)
+        row = (name, monthly, weekly, rng + note, round(low_qty * cost, 2), weeks, margin, trend_up)
 
         if monthly < _SLOW_MONTHLY:
             hold.append((name, "slow mover", monthly))
@@ -1437,15 +1457,17 @@ def generate_restock_plan(
 
     L += [_SEP, "*3️⃣ 🔴 Reorder Now* _store empty, running out_"]
     if now:
-        for name, mo, wk, rng, est, weeks, mg in now:
-            L.append(f"  • *{_esc(name)}* — {weeks:.1f}wk left · {wk:.0f}/wk → *{rng}* ~{_fmt(est)}")
+        for name, mo, wk, rng, est, weeks, mg, tr in now:
+            mark = " 📈" if tr else ""
+            L.append(f"  • *{_esc(name)}* — {weeks:.1f}wk left · {wk:.0f}/wk → *{rng}* ~{_fmt(est)}{mark}")
     else:
         L.append("  _Nothing critical. 🎉_")
 
     L += [_SEP, "*4️⃣ 🟡 Reorder Soon*"]
     if soon:
-        for name, mo, wk, rng, est, weeks, mg in soon:
-            L.append(f"  • *{_esc(name)}* — {weeks:.1f}wk · {wk:.0f}/wk → *{rng}*")
+        for name, mo, wk, rng, est, weeks, mg, tr in soon:
+            mark = " 📈" if tr else ""
+            L.append(f"  • *{_esc(name)}* — {weeks:.1f}wk · {wk:.0f}/wk → *{rng}*{mark}")
     else:
         L.append("  _Nothing pending._")
 
@@ -1502,8 +1524,10 @@ def generate_restock_plan(
     else:
         L.append("  _None. ✅_")
 
-    L += [_SEP, "_Tip: do transfers first, then only the 🔴 items this week._",
-          f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_"]
+    L += [_SEP, "_Tip: do transfers first, then only the 🔴 items this week._"]
+    if any(r[7] for r in now) or any(r[7] for r in soon):
+        L.append("_📈 = selling faster than its 30-day pace; order leans on the recent week._")
+    L.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(L)
 
 
