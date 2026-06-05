@@ -237,6 +237,22 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
                 value   TEXT NOT NULL
             )
         """))
+        # Owner draws (equity withdrawals) — money the owner takes out of the
+        # business. Deliberately NOT in the `expenses` table: a draw reduces
+        # cash and owner's equity but is not a P&L cost, so it must never enter
+        # the profit calculation.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS owner_draws (
+                id          SERIAL PRIMARY KEY,
+                timestamp   TEXT,
+                amount      FLOAT,
+                account     TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                recorded_by TEXT DEFAULT '',
+                deleted_by  TEXT DEFAULT '',
+                deleted_at  TEXT DEFAULT ''
+            )
+        """))
         conn.commit()
 
 
@@ -419,6 +435,23 @@ def record_expense(account: str, category: str, amount: float, description: str 
             "ts": _ts(timestamp), "account": account.lower(),
             "category": category.lower(),
             "amount": round(amount, 2), "desc": description,
+            "recorded_by": recorded_by,
+        })
+        conn.commit()
+
+
+# ── Owner-draw record ─────────────────────────────────────────────────
+
+def record_draw(amount: float, description: str = "", account: str = "", timestamp: str | None = None, recorded_by: str = "") -> None:
+    """Record an owner withdrawal (equity draw). Never an expense — see owner_draws table comment."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO owner_draws (timestamp, amount, account, description, recorded_by)
+            VALUES (:ts, :amount, :account, :desc, :recorded_by)
+        """), {
+            "ts": _ts(timestamp), "amount": round(amount, 2),
+            "account": account.lower(), "desc": description,
             "recorded_by": recorded_by,
         })
         conn.commit()
@@ -886,6 +919,23 @@ def void_expense(entry_id: int, actor: str = "") -> bool:
         )
         conn.commit()
         return result.rowcount > 0
+
+
+def void_draw(entry_id: int, actor: str = "") -> dict[str, Any] | None:
+    """Soft-void an owner-draw row. Returns the row or None if not found/already voided."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("""
+                UPDATE owner_draws SET deleted_by = :actor, deleted_at = :ts
+                WHERE id = :id AND (deleted_at = '' OR deleted_at IS NULL)
+                RETURNING *
+            """),
+            {"id": entry_id, "actor": actor, "ts": now_str()},
+        )
+        conn.commit()
+        row = result.fetchone()
+        return dict(row._mapping) if row else None
 
 
 # ── Transfer log ─────────────────────────────────────────────────────
