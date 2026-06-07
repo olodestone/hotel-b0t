@@ -870,6 +870,11 @@ def generate_allocation_report(
 # ── Position report (profit vs cash vs stock) ─────────────────────────
 
 CASH_OPENING_KEY = "cash_opening"
+# Optional "as of" anchor date (stored "YYYY-MM-DD 00:00:00"). When set, the cash
+# estimate counts only flows on/after this date — opening is your real balance on
+# that day, so earlier months are ignored (already baked into it). Lets you
+# re-anchor safely each period without double-counting history. Empty = all-time.
+CASH_OPENING_DATE_KEY = "cash_opening_date"
 
 
 def _net_profit(sales_rows: list[dict], room_rows: list[dict], expense_rows: list[dict]) -> tuple[float, float, float, float]:
@@ -881,11 +886,13 @@ def _net_profit(sales_rows: list[dict], room_rows: list[dict], expense_rows: lis
 
 
 def generate_position_report() -> str:
-    """The three figures that should never be mixed: profit, cash, stock value.
+    """What you have right now — cash first. Profit is a one-line footnote.
 
-    - Profit is a *period* figure (performance); owner draws never reduce it.
-    - Cash in bank is a *running balance* estimate; draws and restock DO reduce it.
-    - Stock value and receivables are point-in-time assets.
+    Three figures that must never be conflated:
+    - Cash at hand — a *running balance* estimate; draws and restock DO reduce it.
+    - Stock value and receivables — point-in-time assets.
+    - Profit — a *performance* figure (revenue − COGS − expenses); draws/restock
+      are excluded. Shown small at the bottom; it is NOT money in your pocket.
     """
     sales_all   = _active(db.read_all("sales"))
     rooms_all   = _active(db.read_all("rooms"))
@@ -894,62 +901,119 @@ def generate_position_report() -> str:
     debtor_rows = db.read_all("debtors")
     now = datetime.now()
 
-    # ① Profit — this month and all-time
-    month_sales = _filter_by_month(sales_all, now.year, now.month)
-    month_rooms = _filter_by_month(rooms_all, now.year, now.month)
-    month_exp   = _filter_by_month(expense_all, now.year, now.month)
-    *_, month_profit = _net_profit(month_sales, month_rooms, month_exp)
-    rev_all, _cogs_all, opex_all, profit_all = _net_profit(sales_all, rooms_all, expense_all)
-
-    # ③ Stock value on hand (asset)
+    # Stock value on hand (asset)
     stock_value = round(sum(i["stock_value"] for i in inv.get_inventory_summary()), 2)
 
-    # Receivables — revenue earned but not yet collected as cash
+    # Receivables — revenue earned but not yet collected as cash (all outstanding).
     outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
     receivables = round(sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding), 2)
 
-    # ② Cash in bank (estimate)
+    # Cash at hand (estimate). If an anchor date is set, count only flows on/after
+    # it — `opening` is the real balance on that day, so earlier history is ignored.
     try:
         opening = float(db.get_setting(CASH_OPENING_KEY, "0") or 0)
     except (TypeError, ValueError):
         opening = 0.0
-    restock_all = _restock_spend(expense_all)
-    draws_total = round(sum(float(r["amount"]) for r in draws_all), 2)
-    collected   = round(rev_all - receivables, 2)   # assume cash unless an outstanding debtor exists
-    cash = round(opening + collected - opex_all - restock_all - draws_total, 2)
+    anchor_dt = _parse_ts(db.get_setting(CASH_OPENING_DATE_KEY, "") or "")
 
-    m_emoji = "📈" if month_profit >= 0 else "📉"
-    a_emoji = "📈" if profit_all >= 0 else "📉"
+    def _since(rows: list[dict]) -> list[dict]:
+        if not anchor_dt:
+            return rows
+        return [r for r in rows if (_parse_ts(r.get("timestamp")) or datetime.min) >= anchor_dt]
+
+    cash_sales, cash_rooms, cash_exp, cash_draws = _since(sales_all), _since(rooms_all), _since(expense_all), _since(draws_all)
+    rev_cash     = _sum_revenue(cash_sales) + _sum_revenue(cash_rooms)
+    opex_cash    = _sum_revenue(_operating_expenses(cash_exp), key="amount")
+    restock_cash = _restock_spend(cash_exp)
+    draws_cash   = round(sum(float(r["amount"]) for r in cash_draws), 2)
+    # Only subtract debts CREATED in the counted window — pre-anchor debts were
+    # never collected and aren't part of the anchored opening balance either.
+    recv_cash = round(sum(
+        float(r["amount"]) - float(r.get("amount_paid") or 0)
+        for r in _since(outstanding)), 2)
+    collected = round(rev_cash - recv_cash, 2)      # assume cash unless an outstanding debtor exists
+    cash = round(opening + collected - opex_cash - restock_cash - draws_cash, 2)
+
+    # Profit footnote — performance, always this-month + all-time (anchor-independent).
+    _rev_all, _cogs_all, _opex_all, profit_all = _net_profit(sales_all, rooms_all, expense_all)
+    month_sales = _filter_by_month(sales_all, now.year, now.month)
+    month_rooms = _filter_by_month(rooms_all, now.year, now.month)
+    month_exp   = _filter_by_month(expense_all, now.year, now.month)
+    *_, month_profit = _net_profit(month_sales, month_rooms, month_exp)
+
+    if anchor_dt:
+        open_label = f"  Balance on {anchor_dt.strftime('%d %b %Y')}: {_fmt(opening)}"
+        since_note = [f"  _Counting everything since {anchor_dt.strftime('%d %b %Y')}._"]
+    else:
+        open_label = f"  Opening balance:    {_fmt(opening)}"
+        since_note = []
 
     lines = [
-        f"🧭 *{HOTEL_NAME} — Position*",
+        f"🧭 *{HOTEL_NAME} — What You Have*",
         f"📅 As of {now.strftime('%d %b %Y %H:%M')}",
         _SEP,
-        "① 📊 *PROFIT* _(performance)_",
-        f"  {m_emoji} This month:  *{_fmt(month_profit)}*",
-        f"  {a_emoji} All-time:    {_fmt(profit_all)}",
-        "  _Revenue − cost of stock sold − expenses._",
-        "  _Owner draws are NOT subtracted here._",
-        _SEP,
-        "② 🏦 *CASH IN BANK* _(estimate)_",
-        f"  Opening balance:    {_fmt(opening)}",
+        "🏦 *CASH AT HAND* _(estimate)_",
+        *since_note,
+        open_label,
         f"  + Collected sales:  {_fmt(collected)}",
-        f"  − Expenses:         {_fmt(opex_all)}",
-        f"  − Stock purchases:  {_fmt(restock_all)}",
-        f"  − Owner draws:      {_fmt(draws_total)}",
-        f"  = *Cash on hand:    {_fmt(cash)}*",
-        "  _Assumes sales are cash unless logged as a debtor._",
+        f"  − Expenses:         {_fmt(opex_cash)}",
+        f"  − Stock purchases:  {_fmt(restock_cash)}",
+        f"  − Owner draws:      {_fmt(draws_cash)}",
+        f"  = *💰 {_fmt(cash)}*",
+        "  _Money in, minus stock bought, expenses & draws._",
         _SEP,
-        "③ 📦 *STOCK VALUE ON HAND* _(asset)_",
-        f"  Bar + store @ cost:  *{_fmt(stock_value)}*",
-        _SEP,
+        "📦 *STOCK VALUE ON HAND* _(asset)_",
+        f"  Bar + store @ cost:  {_fmt(stock_value)}",
         "💳 *OWED TO US* _(receivables)_",
         f"  Outstanding debtors: {_fmt(receivables)}  ({len(outstanding)} owing)",
         _SEP,
-        "_Profit ≠ cash ≠ stock — keep them separate._",
-        "_Owner draws reduce cash, never profit. Log them with /draw._",
-        "_Set your real starting balance: /position set <amount>_",
+        f"📊 _Profit (not cash): this month {_fmt(month_profit)} · all-time {_fmt(profit_all)}_",
+        "_Performance only — owner draws & stock buys are excluded from profit._",
+        _SEP,
+        "_Anchor cash to a real balance: /position set <amount> <YYYY-MM-DD>_",
         f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+def generate_draws_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """List owner draws (equity withdrawals) for a period, newest first, with IDs.
+
+    Draws are deliberately NOT expenses — they reduce cash, never profit. This
+    report is the audit trail: every withdrawal, who recorded it, and the total.
+    """
+    draw_rows = _active(db.read_all("owner_draws"))
+    draw_rows = _apply_filter(draw_rows, for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+
+    if not draw_rows:
+        return (
+            f"💵 *Owner Draws — {label}*\n\n"
+            "No owner draws recorded for this period.\n"
+            "_Log one with_ `/draw <amount> [note]`."
+        )
+
+    draw_rows = sorted(draw_rows, key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+    total = sum(float(r["amount"]) for r in draw_rows)
+
+    lines = [f"💵 *Owner Draws — {label}*", _SEP]
+    for r in draw_rows:
+        ts = str(r.get("timestamp") or "")[:10]
+        desc = str(r.get("description") or "").strip()
+        by = str(r.get("recorded_by") or "").strip()
+        tail = f" _{_esc(desc)}_" if desc else ""
+        if by:
+            tail += f" _(by {_esc(by)})_"
+        lines.append(f"`[{r['id']}]` {ts}  {_fmt(float(r['amount']))}{tail}")
+    lines += [
+        _SEP,
+        f"*Total drawn: {_fmt(total)}*  ({len(draw_rows)} draw{'s' if len(draw_rows) != 1 else ''})",
+        "_Owner draws reduce cash, never profit. Remove one with_ `/delete draw <id>`.",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
