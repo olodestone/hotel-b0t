@@ -372,6 +372,7 @@ def _help_text(is_admin: bool = False) -> str:
         "\n\n*🔧 Admin Commands*\n"
         "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
         "`/draw <amount> [note] [YYYY-MM-DD]` — owner withdrawal _(not an expense)_\n"
+        "`/draws` | `/draws YYYY-MM` | `/draws all` — list owner draws\n"
         "`/add_debtor <room|bar> <name> <amount> [note] [by:<staff>] [YYYY-MM-DD]`\n"
         "`/pay_debtor <room|bar> <name> [amount]`\n"
         "`/pay_debt <id> [amount]` — pay by debt ID\n"
@@ -386,7 +387,8 @@ def _help_text(is_admin: bool = False) -> str:
         "`/setprice <drink> <price>`\n"
         "`/setroomtype <type> <price>` — set room type preset price\n"
         "`/report` | `/report today` | `/report YYYY-MM` | `/report all`\n"
-        "`/position` — profit vs cash vs stock snapshot _(/position set <amount>)_\n"
+        "`/position` — what you have: cash, stock & receivables\n"
+        "`/position set <amount> <YYYY-MM-DD>` — anchor cash to your real balance on that day _(counts from then; re-anchor anytime)_\n"
         "`/sales_report` | `/expense_report` | `/staff_report` | `/allocation`\n"
         "`/setallocation <key> <percent>`\n"
         "`/setthreshold <drink> <amount>`\n"
@@ -1126,6 +1128,35 @@ async def cmd_expense_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await _reply_long(update, text)
 
 
+# ── /draws (admin) ────────────────────────────────────────────────────
+
+@_require_admin
+async def cmd_draws(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    from datetime import datetime
+    args = _parse_args(ctx)
+    arg = args[0].lower() if args else ""
+
+    if not arg:
+        now = datetime.now()
+        text = reports.generate_draws_report(for_month=(now.year, now.month))
+    elif arg == "today":
+        text = reports.generate_draws_report(for_date=datetime.now().date())
+    elif arg == "all":
+        text = reports.generate_draws_report(all_time=True)
+    else:
+        try:
+            dt = datetime.strptime(arg, "%Y-%m-%d")
+            text = reports.generate_draws_report(for_date=dt.date())
+        except ValueError:
+            try:
+                dt = datetime.strptime(arg, "%Y-%m")
+                text = reports.generate_draws_report(for_month=(dt.year, dt.month))
+            except ValueError:
+                await _reply(update, "Usage: `/draws` | `/draws today` | `/draws YYYY-MM-DD` | `/draws YYYY-MM` | `/draws all`")
+                return
+    await _reply_long(update, text)
+
+
 # ── /staff_report (admin) ─────────────────────────────────────────────
 
 @_require_admin
@@ -1182,21 +1213,63 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_require_admin
 async def cmd_position(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
-    # `/position set <amount>` anchors the cash estimate to your real bank balance.
+    # `/position set <amount> [YYYY-MM-DD]` anchors cash to a real balance.
+    #   • With a date → opening is your balance ON that day; only flows on/after it
+    #     are counted. Earlier months are ignored. Safe to re-anchor each period.
+    #   • Without a date → opening is your balance before the FIRST entry; every
+    #     recorded flow is added on top, so set it once (never to today's balance).
     if args and args[0].lower() == "set":
-        if len(args) < 2:
-            await _reply(update, "Usage: `/position set <amount>` — your current real bank balance.")
+        set_args, anchor = _extract_date(args[1:])   # peel off optional trailing YYYY-MM-DD
+        if not set_args:
+            await _reply(
+                update,
+                "Usage: `/position set <amount> [YYYY-MM-DD]`\n\n"
+                "*With a date* _(recommended)_ — your real bank balance ON that day. "
+                "The bot counts only sales/expenses/draws from that day on, ignoring "
+                "earlier months. You can re-anchor any time, e.g. the 1st of each month:\n"
+                "`/position set 500000 2026-06-01`\n\n"
+                "*Without a date* — your balance before your *first ever* entry. Every "
+                "recorded flow is added on top, so set it once — never to today's balance.",
+            )
             return
-        amount, err = _to_float(args[1], "amount")
+        amount, err = _to_float(set_args[0], "amount")
         if err:
             await _reply(update, err)
             return
+        # Validate the anchor date BEFORE writing anything — `_extract_date` only
+        # checks the YYYY-MM-DD *shape*, so a calendar-invalid date (e.g.
+        # 2026-13-40) reaches here and must be rejected, not persisted.
+        from datetime import datetime
+        anchor_dt = None
+        if anchor:
+            try:
+                anchor_dt = datetime.strptime(anchor, "%Y-%m-%d")
+            except ValueError:
+                await _reply(update, f"❌ `{anchor}` isn't a real date. Use *YYYY-MM-DD*, e.g. `2026-06-01`.")
+                return
         db.set_setting(reports.CASH_OPENING_KEY, str(round(amount, 2)))
-        await _reply(
-            update,
-            f"✅ Opening cash balance set to ₦{amount:,.2f}.\n"
-            "_The cash estimate now builds on this figure. Run /position to see it._",
-        )
+        if anchor_dt:
+            db.set_setting(reports.CASH_OPENING_DATE_KEY, anchor_dt.strftime("%Y-%m-%d 00:00:00"))
+            nice = anchor_dt.strftime("%d %b %Y")
+            await _reply(
+                update,
+                f"✅ Cash anchored to ₦{amount:,.2f} as of *{nice}*.\n"
+                f"_From now on, /position counts only sales, expenses, stock buys and "
+                f"draws on or after {nice}. Earlier months are ignored — they're already "
+                "in this balance._\n"
+                "_You can re-anchor any time (e.g. the 1st of next month) with a new date._",
+            )
+        else:
+            db.set_setting(reports.CASH_OPENING_DATE_KEY, "")   # clear → all-time
+            await _reply(
+                update,
+                f"✅ Starting balance set to ₦{amount:,.2f} _(all-time)_.\n"
+                "_This is your balance before your first recorded entry; every flow is "
+                "added on top._\n"
+                "_⚠️ Set this once. To anchor to a real balance on a specific day instead "
+                "(and re-anchor safely), use:_ `/position set <amount> YYYY-MM-DD`\n"
+                "_Run /position to see your cash at hand._",
+            )
         return
 
     await _reply_long(update, reports.generate_position_report())
@@ -2427,12 +2500,13 @@ def _manage_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📊 Allocation",   callback_data="mgr:allocation")],
         [InlineKeyboardButton("🧭 Position",     callback_data="mgr:position"),
          InlineKeyboardButton("💵 Owner Draw",   callback_data="mgr:draw")],
-        [InlineKeyboardButton("🗑 Delete Entry", callback_data="mgr:delete"),
-         InlineKeyboardButton("📋 Activity",     callback_data="mgr:activity")],
-        [InlineKeyboardButton("📈 Restock Plan", callback_data="mgr:restock_plan"),
-         InlineKeyboardButton("🛠 Fix Stock",    callback_data="mgr:fixstock")],
-        [InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings"),
-         InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff")],
+        [InlineKeyboardButton("🧾 List Draws",   callback_data="mgr:draws"),
+         InlineKeyboardButton("🗑 Delete Entry", callback_data="mgr:delete")],
+        [InlineKeyboardButton("📋 Activity",     callback_data="mgr:activity"),
+         InlineKeyboardButton("📈 Restock Plan", callback_data="mgr:restock_plan")],
+        [InlineKeyboardButton("🛠 Fix Stock",    callback_data="mgr:fixstock"),
+         InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings")],
+        [InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff")],
     ])
 
 
@@ -3603,6 +3677,11 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     elif action == "position":
         await _reply_long_cb(q, reports.generate_position_report())
 
+    elif action == "draws":
+        from datetime import datetime as _dt
+        now = _dt.now()
+        await _reply_long_cb(q, reports.generate_draws_report(for_month=(now.year, now.month)))
+
     elif action == "restock_plan":
         await _reply_long_cb(q, reports.generate_restock_plan())
 
@@ -4364,7 +4443,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
     app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
     app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
-    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|restock_plan|fixstock|settings|staff|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|addstaff|removestaff)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))
@@ -4381,6 +4460,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("room", cmd_room))
     app.add_handler(CommandHandler("expense", cmd_expense))
     app.add_handler(CommandHandler("draw", cmd_draw))
+    app.add_handler(CommandHandler("draws", cmd_draws))
     app.add_handler(CommandHandler("add_debtor", cmd_add_debtor))
     app.add_handler(CommandHandler("pay_debtor", cmd_pay_debtor))
     app.add_handler(CommandHandler("pay_debt", cmd_pay_debt))

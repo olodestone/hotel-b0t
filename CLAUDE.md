@@ -83,6 +83,7 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/expense_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Expense breakdown by category |
 | `/expense <room\|bar> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages. Draw-like categories (`drawings`, `owner`, `withdrawal`, …) are rejected and routed to `/draw` |
 | `/draw <amount> [note] [YYYY-MM-DD]` | Record an owner withdrawal (equity draw). **Not** an expense — reduces cash, never profit |
+| `/draws [today\|YYYY-MM-DD\|YYYY-MM\|all]` | List owner draws for a period (newest first, with IDs) and the total drawn |
 | `/add_debtor <room\|bar> <name> <amount> [note] [YYYY-MM-DD]` | Log debtor |
 | `/pay_debtor <room\|bar> <name> [amount]` | Full or partial debt payment |
 | `/debtor_history <bar\|rooms> <name>` | Full payment timeline for a debtor |
@@ -90,7 +91,7 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/transfer <drink> <qty>` | Move store → bar |
 | `/delete <sale\|room\|expense\|draw> <id>` | Remove an entry |
 | `/staff_report [today\|YYYY-MM-DD\|YYYY-MM]` | Sales per staff member |
-| `/position [set <amount>]` | Profit vs cash vs stock-value snapshot. `set` anchors the cash estimate to your real bank balance |
+| `/position [set <amount> [YYYY-MM-DD]]` | "What you have" snapshot — cash at hand (headline), stock value & receivables, profit as a one-line footnote. `set <amount> <YYYY-MM-DD>` anchors cash to your real bank balance **on that day**; only flows on/after it are counted, so earlier months are ignored and you can **re-anchor safely each period**. `set <amount>` without a date = all-time starting balance (before the first entry) — set once, never to a current balance |
 | `/allocation [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Revenue allocation + profit distribution |
 | `/setallocation <key> <percent>` | Adjust allocation percentages (see below) |
 | `/setthreshold <drink> <amount>` | Low-stock alert threshold |
@@ -117,6 +118,7 @@ All date-filtered reports accept the same arguments:
 | `generate_daily_summary()` | `/summary` + scheduled daily report |
 | `generate_allocation_report()` | `/allocation` |
 | `generate_position_report()` | `/position` |
+| `generate_draws_report()` | `/draws` |
 | `generate_stock_report()` | `/stock` |
 | `generate_debtors_report()` | `/debtors` |
 
@@ -125,7 +127,7 @@ All date-filtered reports accept the same arguments:
 Three figures are tracked separately and must never be conflated:
 
 1. **Profit (performance)** — `revenue − cost-of-stock-sold (COGS) − operating expenses`. **Owner draws and inventory purchases (`restock`) are excluded.** Buying stock converts cash into a stock asset; its cost only hits the P&L as COGS when the drink is *sold*. Counting the restock purchase as an expense too would double-count it. `reports._operating_expenses()` strips `restock` (the `NON_PNL_CATEGORIES` set) from every profit calc (`generate_full_report`, `generate_daily_summary`, `generate_expense_report`, `generate_allocation_report`).
-2. **Cash in bank (estimate)** — running balance: `opening + collected sales − operating expenses − stock purchases − owner draws`. Draws and restock **do** reduce cash. Set the opening balance with `/position set <amount>`. Assumes sales are cash unless an outstanding debtor exists.
+2. **Cash in bank (estimate)** — running balance: `opening + collected sales − operating expenses − stock purchases − owner draws`. Draws and restock **do** reduce cash. The `opening` anchor works two ways: with an **anchor date** (`/position set <amount> <YYYY-MM-DD>`, stored in `cash_opening_date`) only flows on/after that day are counted — `opening` is your real balance on that day, earlier months are ignored, and you can re-anchor each period without double-counting. Without a date, `opening` is the all-time starting balance before the first entry and every flow is added on top (set once; never to a current balance). Assumes sales are cash unless an outstanding debtor exists.
 3. **Stock value on hand (asset)** — `Σ (store + bar units) × cost_price`. Shown as `TOTAL VALUE` in `/stock` and line ③ of `/position`.
 
 `/position` shows all three side by side plus outstanding receivables. Owner draws live in the dedicated `owner_draws` table, never in `expenses`, so they can never touch profit.
@@ -210,7 +212,7 @@ Detection: `_extract_date(args)` in `bot.py` checks if the last arg matches `^\d
 | `debtor_payments` | `id`, `debtor_id`, `timestamp`, `amount`, `recorded_by` — one row per payment event |
 | `inventory` | `drink_name`, `current_stock`, `store_stock`, `total_purchased`, `total_sold`, `cost_price`, `low_stock_threshold` |
 | `users` | `user_id`, `username`, `role`, `added_at` |
-| `settings` | `key`, `value` — stores allocation percentages and `cash_opening` (opening bank balance for `/position`) |
+| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`) and `cash_opening_date` (optional anchor date; cash counts only flows on/after it) |
 
 All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases upgrade safely on next startup.
 
