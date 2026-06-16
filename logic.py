@@ -382,6 +382,30 @@ def process_set_stock(drink: str, store: int, bar: int) -> tuple[bool, str]:
     )
 
 
+def process_set_cost(drink: str, cost_price: float) -> tuple[bool, str]:
+    """Overwrite a drink's cost price (for wrong/changed purchase costs).
+
+    Cost price drives COGS and stock-value figures, so correcting it here
+    avoids having to do a dummy restock just to fix the number.
+    """
+    name = drink.strip().lower()
+    if not name:
+        return False, "❌ Provide a drink name."
+    if cost_price <= 0:
+        return False, "❌ Cost price must be a positive number."
+    existing = db.get_drink(name)
+    if existing is None:
+        return False, f"❌ *{drink.title()}* not found in inventory. Run `/restock` first."
+
+    old_cost = float(existing["cost_price"])
+    db.set_drink_cost(name, cost_price)
+    return True, (
+        f"✅ Cost price corrected for *{drink.title()}*\n"
+        f"  Cost: ₦{old_cost:,.2f} → *₦{cost_price:,.2f}* per unit\n"
+        f"  _Stock counts & lifetime totals unchanged._"
+    )
+
+
 def process_delete_drink(drink: str, force: bool = False) -> tuple[bool, str]:
     """Delete an inventory SKU. Refuses if it still holds stock unless forced."""
     name = drink.strip().lower()

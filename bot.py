@@ -1968,6 +1968,7 @@ _SST_DRINK, _SST_STORE, _SST_BAR = range(55, 58)
 _DDR_DRINK, _DDR_CONFIRM = range(58, 60)
 _DEB_STAFF = 60  # add-debtor flow: "who served them?" step (after note, before date)
 _DRW_AMT, _DRW_NOTE = range(61, 63)  # owner-draw flow: amount → optional note
+_SCS_DRINK, _SCS_COST = range(63, 65)  # set-cost flow: pick drink → new cost price
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2514,6 +2515,7 @@ def _fixstock_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔀 Rename / Merge", callback_data="fix:rename")],
         [InlineKeyboardButton("🔢 Set Count",      callback_data="fix:setstock")],
+        [InlineKeyboardButton("💰 Set Cost Price", callback_data="fix:setcost")],
         [InlineKeyboardButton("🗑 Delete Drink",   callback_data="fix:delete")],
     ])
 
@@ -3543,6 +3545,43 @@ async def _sst_bar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def _scs_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "💰 *Set Cost Price — which drink?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_existing_drink_kb("scs_dr"),
+    )
+    return _SCS_DRINK
+
+
+async def _scs_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data.split(":", 1)[1]
+    ctx.user_data["scs_drink"] = drink
+    row = db.get_drink(drink) or {}
+    cost = float(row.get("cost_price", 0) or 0)
+    await q.edit_message_text(
+        f"💰 *{reports._esc(drink.title())}* — cost now ₦{cost:,.2f}/unit\n\n"
+        "New *cost price* per unit? (₦)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _SCS_COST
+
+
+async def _scs_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    cost, err = _to_float(update.message.text.strip(), "cost")
+    if err:
+        await update.message.reply_text("❌ Enter a valid cost (e.g. 300):")
+        return _SCS_COST
+    drink = ctx.user_data.pop("scs_drink", "")
+    _ok, msg = logic.process_set_cost(drink, cost)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
 async def _ddr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
@@ -4404,6 +4443,15 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    scs_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_scs_start, pattern="^fix:setcost$")],
+        states={
+            _SCS_DRINK: [CallbackQueryHandler(_scs_pick_drink, pattern="^scs_dr:")],
+            _SCS_COST:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _scs_cost)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     ddr_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_ddr_start, pattern="^fix:delete$")],
         states={
@@ -4427,7 +4475,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     )
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
-                 rnm_conv, sst_conv, ddr_conv):
+                 rnm_conv, sst_conv, scs_conv, ddr_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))

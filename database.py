@@ -842,6 +842,25 @@ def set_drink_stock(drink: str, store: int, bar: int) -> dict[str, Any] | None:
     return get_drink(name)
 
 
+def set_drink_cost(drink: str, cost_price: float) -> dict[str, Any] | None:
+    """Overwrite a drink's cost price (lifetime totals & stock untouched).
+
+    Returns the updated row, or None if the drink does not exist.
+    """
+    name = drink.strip().lower()
+    if get_drink(name) is None:
+        return None
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE inventory
+               SET cost_price = :cost
+             WHERE lower(drink_name) = :name
+        """), {"cost": round(cost_price, 2), "name": name})
+        conn.commit()
+    return get_drink(name)
+
+
 def delete_drink(drink: str) -> dict[str, Any] | None:
     """Delete an inventory row. Returns the deleted row, or None if not found."""
     name = drink.strip().lower()
