@@ -10,6 +10,7 @@ import re
 
 import database as db
 import inventory as inv
+import reports
 from inventory import StockResult
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -359,6 +360,29 @@ def process_rename_drink(old: str, new: str) -> tuple[bool, str]:
         f"✅ Renamed *{old.title()}* → *{new.title()}*.\n"
         f"  {store} store · {bar} bar"
     )
+
+
+def process_merge_staff(old: str, new: str) -> tuple[bool, str]:
+    """Reconcile two staff names into one (relabel, never delete)."""
+    old_s, new_s = old.strip(), new.strip()
+    if not old_s or not new_s:
+        return False, "❌ Provide both names: the duplicate, then the name to keep."
+    if old_s == new_s:
+        return False, "❌ Both names are the same — nothing to reconcile."
+
+    counts = db.merge_recorded_by(old_s, new_s)
+    moved = sum(v for k, v in counts.items() if k != "users")
+    old_e, new_e = reports._esc(old_s), reports._esc(new_s)
+    if not counts:
+        return False, f"❌ No records found under *{old_e}* — nothing changed."
+
+    lines = [f"✅ Reconciled *{old_e}* → *{new_e}*."]
+    if moved:
+        lines.append(f"  {moved} record{'s' if moved != 1 else ''} relabelled (totals unchanged).")
+    if counts.get("users"):
+        lines.append("  Access-list name updated to match.")
+    lines.append("  _Both names now show as one in the staff report._")
+    return True, "\n".join(lines)
 
 
 def process_set_stock(drink: str, store: int, bar: int) -> tuple[bool, str]:

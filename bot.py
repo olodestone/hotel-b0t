@@ -1475,7 +1475,7 @@ async def cmd_removestaff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if not removed:
         await _reply(update, f"❌ User `{uid}` not found.")
         return
-    await _reply(update, f"✅ User `{uid}` removed.")
+    await _reply(update, f"✅ Bot access revoked for `{uid}`.\n_Their past sales & revenue stay in the records and reports._")
 
 
 # ── /dailyreport (admin) ──────────────────────────────────────────────
@@ -1969,6 +1969,7 @@ _DDR_DRINK, _DDR_CONFIRM = range(58, 60)
 _DEB_STAFF = 60  # add-debtor flow: "who served them?" step (after note, before date)
 _DRW_AMT, _DRW_NOTE = range(61, 63)  # owner-draw flow: amount → optional note
 _SCS_DRINK, _SCS_COST = range(63, 65)  # set-cost flow: pick drink → new cost price
+_SMN_OLD, _SMN_NEW = range(65, 67)  # staff-merge flow: pick duplicate → name to keep
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -3497,6 +3498,77 @@ async def _rnm_new_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Staff name reconcile flow ─────────────────────────────────────────
+# Names are referenced by index into a list stashed in user_data — staff
+# names (first-name fallbacks) can contain spaces/colons, so they cannot ride
+# safely in callback_data the way single-token drink names do.
+
+def _staff_name_kb(names: list[str], prefix: str, skip: str | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(n, callback_data=f"{prefix}:{i}")]
+        for i, n in enumerate(names) if n != skip
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+@_require_admin
+async def _smn_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    _access, report_names = _staff_overview()
+    names = [r["name"] for r in report_names]
+    if len(names) < 2:
+        await q.edit_message_text("Need at least two recorded names to reconcile.")
+        return ConversationHandler.END
+    ctx.user_data["smn_names"] = names
+    await q.edit_message_text(
+        "🔀 *Reconcile Staff Names*\n\nTap the *duplicate* name to merge away:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_staff_name_kb(names, "smn_old"),
+    )
+    return _SMN_OLD
+
+
+async def _smn_pick_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    names = ctx.user_data.get("smn_names", [])
+    idx = int(q.data.split(":", 1)[1])
+    if idx >= len(names):
+        await q.edit_message_text("❌ Selection expired — open Staff again.")
+        return ConversationHandler.END
+    old = names[idx]
+    ctx.user_data["smn_old"] = old
+    await q.edit_message_text(
+        f"🔀 Merging *{reports._esc(old)}* into…\n\nTap the name to *keep*, or type a new name:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_staff_name_kb(names, "smn_new", skip=old),
+    )
+    return _SMN_NEW
+
+
+async def _smn_pick_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    names = ctx.user_data.get("smn_names", [])
+    idx = int(q.data.split(":", 1)[1])
+    new = names[idx] if idx < len(names) else ""
+    old = ctx.user_data.pop("smn_old", "")
+    ctx.user_data.pop("smn_names", None)
+    _ok, msg = logic.process_merge_staff(old, new)
+    await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    return ConversationHandler.END
+
+
+async def _smn_new_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    new = update.message.text.strip()
+    old = ctx.user_data.pop("smn_old", "")
+    ctx.user_data.pop("smn_names", None)
+    _ok, msg = logic.process_merge_staff(old, new)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
 async def _sst_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
@@ -3701,6 +3773,35 @@ async def _sall_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+def _staff_overview() -> tuple[list[dict], list[dict]]:
+    """Two views of "staff" for the management screen.
+
+    Returns ``(access_users, report_names)``:
+    - ``access_users`` — rows in the ``users`` table with role ``staff``
+      (people who can log into the bot).
+    - ``report_names`` — one dict per distinct ``recorded_by`` name stamped on a
+      non-deleted sale or room (the names that show in /staff_report), each with
+      a txn count and whether that name also has bot access. Sorted busiest-first.
+    """
+    access_users = [u for u in db.read_all("users") if u.get("role") == "staff"]
+    access_names = {str(u.get("username") or "").strip() for u in access_users}
+
+    counts: dict[str, int] = {}
+    for table in ("sales", "rooms"):
+        for r in db.read_all(table):
+            if r.get("deleted_at"):
+                continue
+            name = (r.get("recorded_by") or "").strip()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+
+    report_names = [
+        {"name": n, "txns": c, "has_access": n in access_names}
+        for n, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+    ]
+    return access_users, report_names
+
+
 async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
@@ -3739,18 +3840,34 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     elif action == "staff":
-        staff_rows = [u for u in db.read_all("users") if u.get("role") == "staff"]
-        lines = ["👥 *Staff*"]
-        for u in staff_rows:
-            lines.append(f"  • {u['username']} (`{u['user_id']}`)")
-        if not staff_rows:
-            lines.append("  _No staff yet._")
-        lines.append("\n_To add: ask staff to send /start, then use /addstaff <id> <name>_")
-        rows = []
-        if staff_rows:
-            rows = [[InlineKeyboardButton(
-                f"🗑 Remove {u['username']}", callback_data=f"mgr_rm:{u['user_id']}"
-            )] for u in staff_rows]
+        access_users, report_names = _staff_overview()
+        lines = ["👥 *Staff*", "", "*Bot access* _(can log sales)_:"]
+        if access_users:
+            for u in access_users:
+                lines.append(f"  • {reports._esc(str(u['username']))} (`{u['user_id']}`)")
+        else:
+            lines.append("  _No staff added yet._")
+
+        lines.append("")
+        lines.append("*Names in staff report* _(who recorded sales)_:")
+        if report_names:
+            for r in report_names:
+                tag = "" if r["has_access"] else "  ⚠️ _no bot access_"
+                lines.append(f"  • {reports._esc(r['name'])} — {r['txns']} txn{tag}")
+        else:
+            lines.append("  _No recorded activity yet._")
+
+        if len(report_names) >= 2:
+            lines.append("\n_Same person under two names? Tap Reconcile to merge them into one._")
+        lines.append("\n_Add staff: ask them to /start, then use /addstaff <id> <name>_")
+
+        rows: list[list[InlineKeyboardButton]] = []
+        if len(report_names) >= 2:
+            rows.append([InlineKeyboardButton("🔀 Reconcile Names", callback_data="staff:merge")])
+        for u in access_users:
+            rows.append([InlineKeyboardButton(
+                f"🗑 Remove access: {u['username']}", callback_data=f"mgr_rm:{u['user_id']}"
+            )])
         await q.edit_message_text(
             "\n".join(lines),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -3795,7 +3912,10 @@ async def _cb_manage_remove_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not removed:
         await q.edit_message_text(f"❌ User `{uid}` not found.", parse_mode=ParseMode.MARKDOWN_V2)
         return
-    await q.edit_message_text(f"✅ User `{uid}` removed.", parse_mode=ParseMode.MARKDOWN_V2)
+    await q.edit_message_text(
+        f"✅ Bot access revoked for `{uid}`.\n_Their past sales & revenue stay in the records and reports._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 
 async def _cb_settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4433,6 +4553,18 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    smn_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_smn_start, pattern="^staff:merge$")],
+        states={
+            _SMN_OLD: [CallbackQueryHandler(_smn_pick_old, pattern="^smn_old:")],
+            _SMN_NEW: [
+                CallbackQueryHandler(_smn_pick_new, pattern="^smn_new:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _smn_new_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     sst_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_sst_start, pattern="^fix:setstock$")],
         states={
@@ -4475,7 +4607,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     )
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
-                 rnm_conv, sst_conv, scs_conv, ddr_conv):
+                 rnm_conv, smn_conv, sst_conv, scs_conv, ddr_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
