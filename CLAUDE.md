@@ -198,7 +198,9 @@ Detection: `_extract_date(args)` in `bot.py` checks if the last arg matches `^\d
 
 ## Staff Tracking (`recorded_by`)
 
-`/sell_drink` records the Telegram username of whoever entered the sale in the `recorded_by` column of the `sales` table. `/staff_report` groups sales by this field. Room bookings do not yet track `recorded_by`.
+`/sell_drink` and `/room` record the Telegram username of whoever entered the entry in the `recorded_by` column (`user.username or user.first_name or str(user.id)`). `/staff_report` groups drink **and** room activity by this field.
+
+**Reconciling duplicate names.** Because `recorded_by` is whatever string Telegram gave at entry time, the *same person* can appear under two names (a username change, or a fall-back to first-name/ID on some entries). Admins fix this from **⚙️ Manage → 👥 Staff**, which shows two linked views: the **bot-access list** (`users` table, with remove buttons) and the **report names** (distinct `recorded_by` values with txn counts; names lacking bot access are flagged ⚠️). **🔀 Reconcile Names** runs a merge flow — pick the duplicate, then pick (or type) the name to keep — and `db.merge_recorded_by()` relabels `recorded_by` across every activity table (`sales`, `rooms`, `expenses`, `owner_draws`, `debtors`, `debtor_payments`, `transfers`) plus `users.username`. It is **relabel-only**: no rows are deleted, so revenue/profit totals are unchanged — the two names simply collapse into one. To *remove* a staff name, revoke bot access from the same screen (or `/removestaff <id>`); historical records keep their `recorded_by` name. Logic lives in `logic.process_merge_staff()`; staff names are escaped with `reports._esc()` before going into MarkdownV2 (Telegram usernames routinely contain `_`).
 
 ## Database Tables
 

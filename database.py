@@ -1195,3 +1195,44 @@ def remove_user(user_id: int) -> bool:
         )
         conn.commit()
         return result.rowcount > 0
+
+
+# Tables that stamp the actor who entered a row in a `recorded_by` column.
+# Merging a staff name relabels the actor across every one of them so the
+# whole audit trail (not just the staff report) reconciles to one name.
+_RECORDED_BY_TABLES = (
+    "sales", "rooms", "expenses", "owner_draws",
+    "debtors", "debtor_payments", "transfers",
+)
+
+
+def merge_recorded_by(old: str, new: str) -> dict[str, int]:
+    """Relabel one staff name to another everywhere it appears.
+
+    Updates the `recorded_by` actor on every record across all activity
+    tables, and the access-list label (`users.username`), from `old` to `new`.
+    Nothing is deleted — totals are untouched; the two names simply collapse
+    into one in the staff report. Match is on the exact stored string.
+
+    Returns a per-target row count, e.g. {"sales": 12, "users": 1, ...}.
+    """
+    old, new = old.strip(), new.strip()
+    counts: dict[str, int] = {}
+    engine = get_engine()
+    with engine.connect() as conn:
+        for table in _RECORDED_BY_TABLES:
+            result = conn.execute(
+                text(f"UPDATE {table} SET recorded_by = :new WHERE recorded_by = :old"),
+                {"new": new, "old": old},
+            )
+            if result.rowcount:
+                counts[table] = result.rowcount
+        # Keep the access-list label in step with the report name (the "link").
+        result = conn.execute(
+            text("UPDATE users SET username = :new WHERE username = :old"),
+            {"new": new, "old": old},
+        )
+        if result.rowcount:
+            counts["users"] = result.rowcount
+        conn.commit()
+    return counts
