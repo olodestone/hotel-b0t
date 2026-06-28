@@ -1152,13 +1152,25 @@ def get_all_room_type_prices() -> list[dict[str, Any]]:
 # ── User management ───────────────────────────────────────────────────
 
 def get_all_staff() -> list[str]:
-    """Return distinct staff names that have outstanding debts assigned to them."""
+    """Distinct staff names that have outstanding debts assigned to them.
+
+    De-duplicated case-insensitively (and trimmed) so the same person stored
+    under different capitalisation — e.g. ``Aisha`` vs ``aisha`` — collapses to
+    one entry. The lookup (`get_debts_by_staff`) is already case-insensitive, so
+    any representative spelling resolves to all of that person's debts; we keep
+    the first spelling seen as the display label.
+    """
     engine = get_engine()
     df = pd.read_sql(
-        "SELECT DISTINCT staff_name FROM debtors WHERE status = 'outstanding' AND staff_name IS NOT NULL AND staff_name <> '' ORDER BY staff_name ASC",
+        "SELECT DISTINCT staff_name FROM debtors WHERE status = 'outstanding' AND staff_name IS NOT NULL AND staff_name <> ''",
         engine,
     )
-    return [row["staff_name"] for row in df.to_dict(orient="records")]
+    seen: dict[str, str] = {}
+    for row in df.to_dict(orient="records"):
+        raw = str(row["staff_name"]).strip()
+        if raw:
+            seen.setdefault(raw.lower(), raw)
+    return sorted(seen.values(), key=str.lower)
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:
