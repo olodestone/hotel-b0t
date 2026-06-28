@@ -28,3 +28,8 @@ backups/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local planning/proposal scratch — not part of the bot
+generate_plan.py
+generate_solar_proposal.py
+hotel85_scale_plan.pdf
