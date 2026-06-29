@@ -1,0 +1,22 @@
+🧭 *Hotel 85 — What You Have*
+📅 As of 29 Jun 2026 14:30
+──────────────────────────────
+🏦 *CASH AT HAND* _(estimate)_
+  Opening balance:    ₦0
+  + Collected sales:  ₦130,000
+  − Expenses:         ₦120,999
+  − Stock purchases:  ₦30,000
+  − Owner draws:      ₦40,000
+  = *💰 ₦-60,999*
+  _Money in, minus stock bought, expenses & draws._
+──────────────────────────────
+📦 *STOCK VALUE ON HAND* _(asset)_
+  Bar + store @ cost:  ₦11,160
+💳 *OWED TO US* _(receivables)_
+  Outstanding debtors: ₦33,000  (2 owing)
+──────────────────────────────
+📊 _Profit (not cash): this month ₦31,800 · all-time ₦37,201_
+_Performance only — owner draws & stock buys are excluded from profit._
+──────────────────────────────
+_Anchor cash to a real balance: /position set <amount> <YYYY-MM-DD>_
+_Generated 29 Jun 2026 14:30_

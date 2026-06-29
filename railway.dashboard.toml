@@ -1,0 +1,29 @@
+# Railway config for the READ-ONLY WEB DASHBOARD.
+#
+# Deploy this as a SECOND service in the same Railway project as the bot,
+# pointed at the SAME PostgreSQL. The bot service keeps using the default
+# railway.toml (python bot.py) — this file is only for the dashboard service.
+#
+# Setup (once):
+#   1. Railway project → New service → deploy from this same repo.
+#   2. Service → Settings → Config-as-code path: railway.dashboard.toml
+#   3. Service → Variables: set DATABASE_URL (reference the Postgres plugin),
+#      HOTEL_SCHEMA, BOT_TOKEN, DASHBOARD_SECRET, DASHBOARD_LOGIN_BOT_USERNAME.
+#   4. BotFather → /setdomain → the dashboard service's public domain.
+#
+# Keeping it a separate service means a web crash can never take the bot down.
+
+[build]
+builder = "nixpacks"
+# requirements-web.txt pulls in requirements.txt too, so this installs everything.
+buildCommand = "pip install -r requirements-web.txt"
+
+[deploy]
+startCommand = "uvicorn dashboard.app:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/healthz"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+[environments.production]
+[environments.production.variables]
+PYTHONUNBUFFERED = "1"

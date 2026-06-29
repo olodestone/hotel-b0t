@@ -1,0 +1,9 @@
+🏨 *Hotel 85 — Revenue Summary*
+📅 Period: ALL-TIME
+──────────────────────────────
+🍺 Bar Sales:      ₦8,000  (4 transactions)
+🛏 Room Bookings:  ₦155,000  (3 bookings)
+──────────────────────────────
+*Total Revenue:   ₦163,000*
+──────────────────────────────
+_Generated 29 Jun 2026 14:30_

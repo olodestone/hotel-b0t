@@ -1,0 +1,7 @@
+💵 *Owner Draws — ALL-TIME*
+──────────────────────────────
+`[1]` 2026-06-25  ₦40,000 _owner withdrawal_ _(by john)_
+──────────────────────────────
+*Total drawn: ₦40,000*  (1 draw)
+_Owner draws reduce cash, never profit. Remove one with_ `/delete draw <id>`.
+_Generated 29 Jun 2026 14:30_

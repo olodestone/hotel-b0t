@@ -1,0 +1,24 @@
+📋 *Daily Summary — Friday, 05 Jun 2026*
+──────────────────────────────
+💰 *Revenue*
+  🍺 Bar Sales:   ₦0  (0 txns)
+  🛏 Room Sales:  ₦90,000  (1 bookings)
+  *Total:        ₦90,000*
+──────────────────────────────
+💸 *Outgoings*
+  Drink Cost:    ₦0
+  Bar Expenses:  ₦0
+  Room Expenses: ₦0
+  *Total:        ₦0*
+──────────────────────────────
+📈 *Net for Today:  ₦90,000*
+──────────────────────────────
+💳 Outstanding Debtors: 2 (₦33,000 owed)
+──────────────────────────────
+⚠️ Low Bar Stock: Coke
+🔴 Empty Store: Coke
+──────────────────────────────
+🏦 Set aside today: *₦9,000* (10% of ₦90,000)
+_Run /allocation for full breakdown_
+
+_Generated 29 Jun 2026 14:30_

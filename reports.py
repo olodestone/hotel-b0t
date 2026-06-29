@@ -11,6 +11,19 @@ from typing import Any
 
 import database as db
 import inventory as inv
+import metrics
+from metrics import (
+    NON_PNL_CATEGORIES,
+    sum_revenue as _sum_revenue,
+    parse_ts as _parse_ts,
+    filter_by_date as _filter_by_date,
+    filter_by_month as _filter_by_month,
+    apply_filter as _apply_filter,
+    split_salary as _split_salary,
+    active as _active,
+    operating_expenses as _operating_expenses,
+    restock_spend as _restock_spend,
+)
 from config import (
     HOTEL_NAME,
     ALLOC_BUFFER_DEFAULT, ALLOC_RESTOCK_DEFAULT,
@@ -105,44 +118,12 @@ def escape_markdown_v2(s: str) -> str:
     return "".join(out)
 
 
-# ── Core aggregations ─────────────────────────────────────────────────
-
-def _sum_revenue(rows: list[dict], key: str = "total_revenue") -> float:
-    return sum(float(r[key]) for r in rows)
-
-
-def _parse_ts(raw) -> datetime | None:
-    """Parse a timestamp value that may be a string, pandas Timestamp, or have microseconds."""
-    try:
-        ts_str = str(raw).split(".")[0]  # strip microseconds if present
-        return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        return None
-
-
-def _filter_by_date(rows: list[dict], target: date) -> list[dict]:
-    result = []
-    for r in rows:
-        try:
-            dt = _parse_ts(r["timestamp"])
-            if dt and dt.date() == target:
-                result.append(r)
-        except KeyError:
-            pass
-    return result
-
-
-def _filter_by_month(rows: list[dict], year: int, month: int) -> list[dict]:
-    result = []
-    for r in rows:
-        try:
-            dt = _parse_ts(r["timestamp"])
-            if dt and dt.year == year and dt.month == month:
-                result.append(r)
-        except KeyError:
-            pass
-    return result
-
+# ── Presentation helpers ──────────────────────────────────────────────
+# The pure data/aggregation helpers (_sum_revenue, _parse_ts, _filter_*,
+# _apply_filter, _active, _operating_expenses, _restock_spend, _split_salary,
+# NON_PNL_CATEGORIES) now live in metrics.py and are imported above, so the
+# Telegram bot and the web dashboard share one implementation. Only
+# presentation/formatting helpers remain in this module.
 
 def _period_label(for_date: date | None, for_month: tuple[int, int] | None, all_time: bool) -> str:
     now = datetime.now()
@@ -155,60 +136,14 @@ def _period_label(for_date: date | None, for_month: tuple[int, int] | None, all_
     return f"{label} (current month)" if (year, month) == (now.year, now.month) else label
 
 
-def _apply_filter(rows: list[dict], for_date: date | None, for_month: tuple[int, int] | None, all_time: bool) -> list[dict]:
-    now = datetime.now()
-    if for_date:
-        return _filter_by_date(rows, for_date)
-    if all_time:
-        return rows
-    year, month = for_month if for_month else (now.year, now.month)
-    return _filter_by_month(rows, year, month)
-
-
-def _split_salary(expense_rows: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split expense rows into (salary_rows, other_rows)."""
-    salary = [r for r in expense_rows if r.get("category", "").lower() == "salary"]
-    other  = [r for r in expense_rows if r.get("category", "").lower() != "salary"]
-    return salary, other
-
-
-def _active(rows: list[dict]) -> list[dict]:
-    """Exclude soft-voided/deleted rows from financial aggregations."""
-    return [r for r in rows if not r.get("deleted_at")]
-
-
-# Expense categories that are cash/stock movements, NOT P&L operating costs.
-# Buying inventory (restock) converts cash into a stock asset; that cost only
-# reaches the P&L as cost-of-goods-sold when the drink is actually sold.
-# Counting the restock purchase as an expense too would double-count it
-# against profit, so it is stripped out of every profit calculation below.
-NON_PNL_CATEGORIES = {"restock"}
-
-
-def _operating_expenses(rows: list[dict]) -> list[dict]:
-    """Keep only P&L operating-expense rows (excludes restock / stock purchases)."""
-    return [r for r in rows if str(r.get("category", "")).lower() not in NON_PNL_CATEGORIES]
-
-
-def _restock_spend(rows: list[dict]) -> float:
-    """Total inventory-purchase (restock) cash outflow — a cash movement, not a P&L cost."""
-    return round(
-        sum(float(r["amount"]) for r in rows
-            if str(r.get("category", "")).lower() == "restock"),
-        2,
-    )
+def _cost_price_map() -> dict[str, float]:
+    """Current cost price per drink (lower-cased name → cost) from inventory."""
+    return {r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")}
 
 
 def _cost_of_drinks_sold(sales_rows: list[dict]) -> float:
-    """Match each sale to its current cost price from inventory."""
-    total = 0.0
-    inventory_rows = {r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")}
-    for row in sales_rows:
-        name = row["drink_name"].lower()
-        qty = int(row["quantity"])
-        cost = inventory_rows.get(name, 0.0)
-        total += qty * cost
-    return round(total, 2)
+    """Match each sale to its *current* cost price from inventory (delegates to metrics)."""
+    return metrics.cost_of_drinks_sold(sales_rows, _cost_price_map())
 
 
 # ── Full financial report ─────────────────────────────────────────────
@@ -219,127 +154,90 @@ def generate_full_report(
     all_time: bool = False,
     staff_view: bool = False,
 ) -> str:
-    sales_rows = _active(db.read_all("sales"))
-    room_rows = _active(db.read_all("rooms"))
-    expense_rows = _active(db.read_all("expenses"))
+    sales_rows = _apply_filter(_active(db.read_all("sales")), for_date, for_month, all_time)
+    room_rows = _apply_filter(_active(db.read_all("rooms")), for_date, for_month, all_time)
+    expense_rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
     debtor_rows = db.read_all("debtors")
-
-    sales_rows = _apply_filter(sales_rows, for_date, for_month, all_time)
-    room_rows = _apply_filter(room_rows, for_date, for_month, all_time)
-    expense_rows = _apply_filter(expense_rows, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
-    # Only P&L operating expenses count toward profit — restock (inventory
-    # purchase) is a cash/stock movement and is reported separately below.
-    bar_expenses = _operating_expenses([r for r in expense_rows if r.get("account", "bar") == "bar"])
-    room_expenses = _operating_expenses([r for r in expense_rows if r.get("account", "rooms") == "rooms"])
-    restock_total = _restock_spend(expense_rows)
-
-    drink_revenue = _sum_revenue(sales_rows)
-    room_revenue = _sum_revenue(room_rows)
-    total_revenue = drink_revenue + room_revenue
+    # All P&L arithmetic (Bar/Rooms split, COGS, restock exclusion) lives in
+    # metrics.compute_pnl — the single source of truth shared with the dashboard.
+    pnl = metrics.compute_pnl(sales_rows, room_rows, expense_rows, _cost_price_map())
+    bar, rooms = pnl.bar, pnl.rooms
 
     if staff_view:
         lines = [
             f"🏨 *{HOTEL_NAME} — Revenue Summary*",
             f"📅 Period: {label}",
             _SEP,
-            f"🍺 Bar Sales:      {_fmt(drink_revenue)}  ({len(sales_rows)} transactions)",
-            f"🛏 Room Bookings:  {_fmt(room_revenue)}  ({len(room_rows)} bookings)",
+            f"🍺 Bar Sales:      {_fmt(bar.revenue)}  ({pnl.sales_count} transactions)",
+            f"🛏 Room Bookings:  {_fmt(rooms.revenue)}  ({pnl.rooms_count} bookings)",
             _SEP,
-            f"*Total Revenue:   {_fmt(total_revenue)}*",
+            f"*Total Revenue:   {_fmt(pnl.total_revenue)}*",
             _SEP,
             f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
         ]
         return "\n".join(lines)
 
-    cost_of_drinks = _cost_of_drinks_sold(sales_rows)
-    bar_expense_total = _sum_revenue(bar_expenses, key="amount")
-    bar_profit = drink_revenue - cost_of_drinks - bar_expense_total
-
-    room_expense_total = _sum_revenue(room_expenses, key="amount")
-    room_profit = room_revenue - room_expense_total
-    total_outgoings = cost_of_drinks + bar_expense_total + room_expense_total
-    net_profit = total_revenue - total_outgoings
-
-    bar_emoji = "📈" if bar_profit >= 0 else "📉"
-    room_emoji = "📈" if room_profit >= 0 else "📉"
-    net_emoji = "📈" if net_profit >= 0 else "📉"
-
-    bar_salary, bar_other = _split_salary(bar_expenses)
-    room_salary, room_other = _split_salary(room_expenses)
-    bar_salary_total  = sum(float(r["amount"]) for r in bar_salary)
-    room_salary_total = sum(float(r["amount"]) for r in room_salary)
+    bar_emoji = "📈" if bar.profit >= 0 else "📉"
+    room_emoji = "📈" if rooms.profit >= 0 else "📉"
+    net_emoji = "📈" if pnl.net_profit >= 0 else "📉"
 
     lines = [
         f"🏨 *{HOTEL_NAME} — Financial Report*",
         f"📅 Period: {label}",
         _SEP,
         "🍺 *BAR ACCOUNT*",
-        f"  Revenue: {_fmt(drink_revenue)}",
-        f"  Cost of Stock Sold: {_fmt(cost_of_drinks)}",
-        f"  Salaries: {_fmt(bar_salary_total)}",
-        f"  Other Expenses: {_fmt(_sum_revenue(bar_other, key='amount'))}",
-        f"  {bar_emoji} *Profit: {_fmt(bar_profit)}*",
+        f"  Revenue: {_fmt(bar.revenue)}",
+        f"  Cost of Stock Sold: {_fmt(bar.cogs)}",
+        f"  Salaries: {_fmt(bar.salary)}",
+        f"  Other Expenses: {_fmt(bar.other_expense)}",
+        f"  {bar_emoji} *Profit: {_fmt(bar.profit)}*",
     ]
 
-    if bar_other:
-        cat_totals: dict[str, float] = {}
-        for r in bar_other:
-            cat = r["category"].title()
-            cat_totals[cat] = cat_totals.get(cat, 0.0) + float(r["amount"])
+    if bar.other_breakdown:
         lines.append("  _Other breakdown:_")
-        for cat, amt in sorted(cat_totals.items()):
+        for cat, amt in sorted(bar.other_breakdown.items()):
             lines.append(f"    • {_esc(cat)}: {_fmt(amt)}")
 
     lines += [
         _SEP,
         "🛏 *ROOMS ACCOUNT*",
-        f"  Revenue: {_fmt(room_revenue)}",
-        f"  Salaries: {_fmt(room_salary_total)}",
-        f"  Other Expenses: {_fmt(_sum_revenue(room_other, key='amount'))}",
-        f"  {room_emoji} *Profit: {_fmt(room_profit)}*",
+        f"  Revenue: {_fmt(rooms.revenue)}",
+        f"  Salaries: {_fmt(rooms.salary)}",
+        f"  Other Expenses: {_fmt(rooms.other_expense)}",
+        f"  {room_emoji} *Profit: {_fmt(rooms.profit)}*",
     ]
 
-    if room_other:
-        cat_totals = {}
-        for r in room_other:
-            cat = r["category"].title()
-            cat_totals[cat] = cat_totals.get(cat, 0.0) + float(r["amount"])
+    if rooms.other_breakdown:
         lines.append("  _Other breakdown:_")
-        for cat, amt in sorted(cat_totals.items()):
+        for cat, amt in sorted(rooms.other_breakdown.items()):
             lines.append(f"    • {_esc(cat)}: {_fmt(amt)}")
 
     lines += [
         _SEP,
         "📊 *COMBINED*",
-        f"  Total Revenue:   {_fmt(total_revenue)}",
-        f"  Total Outgoings: {_fmt(total_outgoings)}",
-        f"  {net_emoji} *Net Profit:    {_fmt(net_profit)}*",
+        f"  Total Revenue:   {_fmt(pnl.total_revenue)}",
+        f"  Total Outgoings: {_fmt(pnl.total_outgoings)}",
+        f"  {net_emoji} *Net Profit:    {_fmt(pnl.net_profit)}*",
         _SEP,
     ]
 
-    if restock_total > 0:
+    if pnl.restock_spend > 0:
         lines += [
-            f"📦 Stock purchased: {_fmt(restock_total)}",
+            f"📦 Stock purchased: {_fmt(pnl.restock_spend)}",
             "  _Inventory buy — cash → stock, not a profit cost. See /position._",
             _SEP,
         ]
 
-    outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
-    if outstanding:
-        def _rem(r: dict) -> float:
-            return round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
-        bar_debtors = [r for r in outstanding if r["account"] == "bar"]
-        room_debtors = [r for r in outstanding if r["account"] == "rooms"]
-        bar_owed = sum(_rem(r) for r in bar_debtors)
-        room_owed = sum(_rem(r) for r in room_debtors)
+    od = metrics.summarize_outstanding(debtor_rows)
+    if od.outstanding_count:
         lines.append("💳 *OUTSTANDING DEBTORS*")
-        if bar_debtors:
-            lines.append(f"  🍺 Bar ({len(bar_debtors)}):    {_fmt(bar_owed)}")
-        if room_debtors:
-            lines.append(f"  🛏 Rooms ({len(room_debtors)}):  {_fmt(room_owed)}")
-        lines.append(f"  Total Owed:    {_fmt(bar_owed + room_owed)}")
+        if od.bar_count:
+            lines.append(f"  🍺 Bar ({od.bar_count}):    {_fmt(od.bar_owed)}")
+        if od.rooms_count:
+            lines.append(f"  🛏 Rooms ({od.rooms_count}):  {_fmt(od.rooms_owed)}")
+        lines.append(f"  Total Owed:    {_fmt(od.total_owed)}")
         lines.append(_SEP)
 
     lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
@@ -718,51 +616,29 @@ def generate_allocation_report(
     expense_rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
-    bar_rev  = _sum_revenue(sales_rows)
-    room_rev = _sum_revenue(room_rows)
-    total_rev = bar_rev + room_rev
-
-    # Operating expenses only — restock (inventory purchase) is cash → stock,
-    # and the cost of stock reaches the P&L as cost-of-stock-sold below.
-    op_expense_rows = _operating_expenses(expense_rows)
-    bar_salary_rows,  bar_other_rows  = _split_salary([r for r in op_expense_rows if r.get("account") == "bar"])
-    room_salary_rows, room_other_rows = _split_salary([r for r in op_expense_rows if r.get("account") == "rooms"])
-
-    bar_salary_amt  = sum(float(r["amount"]) for r in bar_salary_rows)
-    room_salary_amt = sum(float(r["amount"]) for r in room_salary_rows)
-    total_salary    = bar_salary_amt + room_salary_amt
-
-    bar_exp  = sum(float(r["amount"]) for r in op_expense_rows if r.get("account") == "bar")
-    room_exp = sum(float(r["amount"]) for r in op_expense_rows if r.get("account") == "rooms")
-    total_exp = bar_exp + room_exp                       # operating expenses (excl restock)
-    cost_of_drinks  = _cost_of_drinks_sold(sales_rows)   # COGS — the real P&L stock cost
-    restock_total   = _restock_spend(expense_rows)       # cash spent buying inventory
-    total_outgoings = cost_of_drinks + total_exp         # true P&L cost base
-
+    # All allocation arithmetic lives in metrics.compute_allocation (shared with
+    # the dashboard); the percentages come from DB settings.
     buffer_pct, restock_pct = _get_alloc_pcts()
-    total_pct = buffer_pct + restock_pct
-
-    buffer_amt  = round(total_rev * buffer_pct / 100, 2)
-    restock_amt = round(total_rev * restock_pct / 100, 2)
-    total_save  = buffer_amt + restock_amt
-
-    # Bar and Rooms share of set-aside (proportional to their revenue)
-    bar_share  = round(total_save * (bar_rev / total_rev), 2) if total_rev else 0.0
-    room_share = round(total_save * (room_rev / total_rev), 2) if total_rev else 0.0
-
-    other_exp     = total_exp - total_salary
-    working_capital = total_rev - total_outgoings   # = net profit (revenue − COGS − operating exp)
-    after_setaside  = working_capital - total_save
-    burn_rate = (total_exp / total_rev * 100) if total_rev else 0.0
-
-    # Room type breakdown
-    room_by_type: dict[str, dict] = {}
-    for r in room_rows:
-        rt = r["room_type"].title()
-        if rt not in room_by_type:
-            room_by_type[rt] = {"bookings": 0, "revenue": 0.0}
-        room_by_type[rt]["bookings"] += int(r["quantity"])
-        room_by_type[rt]["revenue"] += float(r["total_revenue"])
+    draw_pct, reinvest_pct, float_pct = _get_profit_dist_pcts()
+    alloc = metrics.compute_allocation(
+        sales_rows, room_rows, expense_rows, _cost_price_map(),
+        buffer_pct=buffer_pct, restock_pct=restock_pct,
+        draw_pct=draw_pct, reinvest_pct=reinvest_pct, float_pct=float_pct,
+        pit_low_rate=PIT_LOW_RATE, pit_high_rate=PIT_HIGH_RATE,
+    )
+    bar_rev, room_rev, total_rev = alloc.bar_rev, alloc.room_rev, alloc.total_rev
+    room_by_type = alloc.room_by_type
+    total_pct = alloc.total_pct
+    buffer_amt, restock_amt, total_save = alloc.buffer_amt, alloc.restock_amt, alloc.total_save
+    bar_share, room_share = alloc.bar_share, alloc.room_share
+    cost_of_drinks = alloc.cost_of_drinks
+    total_salary, bar_salary_amt, room_salary_amt = alloc.total_salary, alloc.bar_salary_amt, alloc.room_salary_amt
+    other_exp, total_outgoings = alloc.other_exp, alloc.total_outgoings
+    working_capital, after_setaside, burn_rate = alloc.working_capital, alloc.after_setaside, alloc.burn_rate
+    restock_total = alloc.restock_total
+    dist_total_pct = alloc.dist_total_pct
+    draw_amt, reinvest_amt, float_amt, unallocated = alloc.draw_amt, alloc.reinvest_amt, alloc.float_amt, alloc.unallocated
+    pit_low, pit_high = alloc.pit_low_amt, alloc.pit_high_amt
 
     lines = [
         f"📊 *{HOTEL_NAME} — Allocation Report*",
@@ -817,16 +693,8 @@ def generate_allocation_report(
     if total_salary > after_setaside:
         lines.append(f"  ⚠️ Salary bill ({_fmt(total_salary)}) exceeds safe amount — review set-aside %")
 
-    # Profit distribution
-    draw_pct, reinvest_pct, float_pct = _get_profit_dist_pcts()
-    dist_total_pct = draw_pct + reinvest_pct + float_pct
-
+    # Profit distribution — amounts precomputed in metrics.compute_allocation.
     if after_setaside > 0 and dist_total_pct > 0:
-        draw_amt     = round(after_setaside * draw_pct / 100, 2)
-        reinvest_amt = round(after_setaside * reinvest_pct / 100, 2)
-        float_amt    = round(after_setaside * float_pct / 100, 2)
-        unallocated  = round(after_setaside - draw_amt - reinvest_amt - float_amt, 2)
-
         lines += [
             _SEP,
             f"💼 *PROFIT DISTRIBUTION* _of {_fmt(after_setaside)} safe profit_",
@@ -838,8 +706,6 @@ def generate_allocation_report(
             lines.append(f"  Unallocated:          {_fmt(unallocated)}")
 
         if draw_amt > 0:
-            pit_low  = round(draw_amt * PIT_LOW_RATE / 100, 2)
-            pit_high = round(draw_amt * PIT_HIGH_RATE / 100, 2)
             lines += [
                 _SEP,
                 "ℹ️ *PERSONAL INCOME TAX (estimate)*",
@@ -877,14 +743,6 @@ CASH_OPENING_KEY = "cash_opening"
 CASH_OPENING_DATE_KEY = "cash_opening_date"
 
 
-def _net_profit(sales_rows: list[dict], room_rows: list[dict], expense_rows: list[dict]) -> tuple[float, float, float, float]:
-    """Return (revenue, cogs, operating_expenses, net_profit) for the given active rows."""
-    revenue = _sum_revenue(sales_rows) + _sum_revenue(room_rows)
-    cogs = _cost_of_drinks_sold(sales_rows)
-    op_exp = round(sum(float(r["amount"]) for r in _operating_expenses(expense_rows)), 2)
-    return round(revenue, 2), cogs, op_exp, round(revenue - cogs - op_exp, 2)
-
-
 def generate_position_report() -> str:
     """What you have right now — cash first. Profit is a one-line footnote.
 
@@ -893,6 +751,8 @@ def generate_position_report() -> str:
     - Stock value and receivables — point-in-time assets.
     - Profit — a *performance* figure (revenue − COGS − expenses); draws/restock
       are excluded. Shown small at the bottom; it is NOT money in your pocket.
+
+    All arithmetic lives in metrics.compute_cash_position (shared with the dashboard).
     """
     sales_all   = _active(db.read_all("sales"))
     rooms_all   = _active(db.read_all("rooms"))
@@ -901,45 +761,19 @@ def generate_position_report() -> str:
     debtor_rows = db.read_all("debtors")
     now = datetime.now()
 
-    # Stock value on hand (asset)
+    # Stock value on hand (asset), plus the cash anchor (opening balance + date).
     stock_value = round(sum(i["stock_value"] for i in inv.get_inventory_summary()), 2)
-
-    # Receivables — revenue earned but not yet collected as cash (all outstanding).
-    outstanding = [r for r in debtor_rows if r["status"] == "outstanding"]
-    receivables = round(sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in outstanding), 2)
-
-    # Cash at hand (estimate). If an anchor date is set, count only flows on/after
-    # it — `opening` is the real balance on that day, so earlier history is ignored.
     try:
         opening = float(db.get_setting(CASH_OPENING_KEY, "0") or 0)
     except (TypeError, ValueError):
         opening = 0.0
     anchor_dt = _parse_ts(db.get_setting(CASH_OPENING_DATE_KEY, "") or "")
 
-    def _since(rows: list[dict]) -> list[dict]:
-        if not anchor_dt:
-            return rows
-        return [r for r in rows if (_parse_ts(r.get("timestamp")) or datetime.min) >= anchor_dt]
-
-    cash_sales, cash_rooms, cash_exp, cash_draws = _since(sales_all), _since(rooms_all), _since(expense_all), _since(draws_all)
-    rev_cash     = _sum_revenue(cash_sales) + _sum_revenue(cash_rooms)
-    opex_cash    = _sum_revenue(_operating_expenses(cash_exp), key="amount")
-    restock_cash = _restock_spend(cash_exp)
-    draws_cash   = round(sum(float(r["amount"]) for r in cash_draws), 2)
-    # Only subtract debts CREATED in the counted window — pre-anchor debts were
-    # never collected and aren't part of the anchored opening balance either.
-    recv_cash = round(sum(
-        float(r["amount"]) - float(r.get("amount_paid") or 0)
-        for r in _since(outstanding)), 2)
-    collected = round(rev_cash - recv_cash, 2)      # assume cash unless an outstanding debtor exists
-    cash = round(opening + collected - opex_cash - restock_cash - draws_cash, 2)
-
-    # Profit footnote — performance, always this-month + all-time (anchor-independent).
-    _rev_all, _cogs_all, _opex_all, profit_all = _net_profit(sales_all, rooms_all, expense_all)
-    month_sales = _filter_by_month(sales_all, now.year, now.month)
-    month_rooms = _filter_by_month(rooms_all, now.year, now.month)
-    month_exp   = _filter_by_month(expense_all, now.year, now.month)
-    *_, month_profit = _net_profit(month_sales, month_rooms, month_exp)
+    pos = metrics.compute_cash_position(
+        sales_all, rooms_all, expense_all, draws_all, debtor_rows,
+        stock_value=stock_value, opening=opening, anchor_dt=anchor_dt,
+        cost_map=_cost_price_map(), now=now,
+    )
 
     if anchor_dt:
         open_label = f"  Balance on {anchor_dt.strftime('%d %b %Y')}: {_fmt(opening)}"
@@ -955,19 +789,19 @@ def generate_position_report() -> str:
         "🏦 *CASH AT HAND* _(estimate)_",
         *since_note,
         open_label,
-        f"  + Collected sales:  {_fmt(collected)}",
-        f"  − Expenses:         {_fmt(opex_cash)}",
-        f"  − Stock purchases:  {_fmt(restock_cash)}",
-        f"  − Owner draws:      {_fmt(draws_cash)}",
-        f"  = *💰 {_fmt(cash)}*",
+        f"  + Collected sales:  {_fmt(pos.collected)}",
+        f"  − Expenses:         {_fmt(pos.opex_cash)}",
+        f"  − Stock purchases:  {_fmt(pos.restock_cash)}",
+        f"  − Owner draws:      {_fmt(pos.draws_cash)}",
+        f"  = *💰 {_fmt(pos.cash)}*",
         "  _Money in, minus stock bought, expenses & draws._",
         _SEP,
         "📦 *STOCK VALUE ON HAND* _(asset)_",
-        f"  Bar + store @ cost:  {_fmt(stock_value)}",
+        f"  Bar + store @ cost:  {_fmt(pos.stock_value)}",
         "💳 *OWED TO US* _(receivables)_",
-        f"  Outstanding debtors: {_fmt(receivables)}  ({len(outstanding)} owing)",
+        f"  Outstanding debtors: {_fmt(pos.receivables)}  ({pos.outstanding_count} owing)",
         _SEP,
-        f"📊 _Profit (not cash): this month {_fmt(month_profit)} · all-time {_fmt(profit_all)}_",
+        f"📊 _Profit (not cash): this month {_fmt(pos.month_profit)} · all-time {_fmt(pos.profit_all)}_",
         "_Performance only — owner draws & stock buys are excluded from profit._",
         _SEP,
         "_Anchor cash to a real balance: /position set <amount> <YYYY-MM-DD>_",

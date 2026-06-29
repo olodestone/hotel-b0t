@@ -1,0 +1,27 @@
+🏨 *Hotel 85 — Financial Report*
+📅 Period: 05 Jun 2026
+──────────────────────────────
+🍺 *BAR ACCOUNT*
+  Revenue: ₦0
+  Cost of Stock Sold: ₦0
+  Salaries: ₦0
+  Other Expenses: ₦0
+  📈 *Profit: ₦0*
+──────────────────────────────
+🛏 *ROOMS ACCOUNT*
+  Revenue: ₦90,000
+  Salaries: ₦0
+  Other Expenses: ₦0
+  📈 *Profit: ₦90,000*
+──────────────────────────────
+📊 *COMBINED*
+  Total Revenue:   ₦90,000
+  Total Outgoings: ₦0
+  📈 *Net Profit:    ₦90,000*
+──────────────────────────────
+💳 *OUTSTANDING DEBTORS*
+  🍺 Bar (1):    ₦3,000
+  🛏 Rooms (1):  ₦30,000
+  Total Owed:    ₦33,000
+──────────────────────────────
+_Generated 29 Jun 2026 14:30_

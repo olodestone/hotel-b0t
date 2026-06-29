@@ -1,0 +1,21 @@
+💸 *Expense Report — ALL-TIME*
+──────────────────────────────
+🍺 *BAR EXPENSES*
+  👤 *Salary* — ₦50,000
+    `[1]` 2026-06-03  ₦50,000 _bar wages_
+  *Utilities* — ₦19,999
+    `[3]` 2026-06-07  ₦8,000 _electricity_
+    `[6]` 2026-06-18  ₦2,000 _water_
+    `[7]` 2026-05-25  ₦9,999 _prior month_
+  *Subtotal: ₦69,999*
+──────────────────────────────
+🛏 *ROOMS EXPENSES*
+  👤 *Salary* — ₦45,000
+    `[2]` 2026-06-04  ₦45,000 _rooms wages_
+  *Laundry* — ₦6,000
+    `[4]` 2026-06-09  ₦6,000 _linens_
+  *Subtotal: ₦51,000*
+──────────────────────────────
+*Grand Total: ₦120,999*
+📦 Stock purchased: ₦30,000 _(inventory buy — not an operating expense)_
+_Generated 29 Jun 2026 14:30_

@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}{{ hotel_name }} · {{ view.period_label }}{% endblock %}
+{% block head %}
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+{% endblock %}
+
+{% macro qp(period) %}/?period={{ period }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
+{% macro ex(kind) %}/export/{{ kind }}.csv?period={{ current_period }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
+
+{% block content %}
+{% set pos = view.position %}
+
+<section class="card position">
+  <h2>What you have now <span class="muted small">· as of today</span></h2>
+  <div class="position-grid">
+    <div class="cash-block">
+      <div class="label">💰 Cash at hand <span class="muted">(estimate)</span></div>
+      <div class="value {{ 'pos' if pos.cash >= 0 else 'neg' }}">{{ pos.cash | naira }}</div>
+      <table class="tbl mini">
+        <tbody>
+          {% if pos.anchor_dt %}
+            <tr><td>Balance on {{ pos.anchor_dt.strftime('%d %b %Y') }}</td><td class="num">{{ pos.opening | naira }}</td></tr>
+          {% else %}
+            <tr><td>Opening balance</td><td class="num">{{ pos.opening | naira }}</td></tr>
+          {% endif %}
+          <tr><td>+ Collected sales</td><td class="num">{{ pos.collected | naira }}</td></tr>
+          <tr><td>− Expenses</td><td class="num">{{ pos.opex_cash | naira }}</td></tr>
+          <tr><td>− Stock purchases</td><td class="num">{{ pos.restock_cash | naira }}</td></tr>
+          <tr><td>− Owner draws</td><td class="num">{{ pos.draws_cash | naira }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="side">
+      <div class="mini-stat"><span class="muted">📦 Stock value</span><b>{{ pos.stock_value | naira }}</b></div>
+      <div class="mini-stat"><span class="muted">💳 Owed to us</span><b>{{ pos.receivables | naira }} <small>({{ pos.outstanding_count }})</small></b></div>
+      <div class="mini-stat"><span class="muted">📊 Profit — this month</span><b>{{ pos.month_profit | naira }}</b></div>
+      <div class="mini-stat"><span class="muted">📊 Profit — all-time</span><b>{{ pos.profit_all | naira }}</b></div>
+    </div>
+  </div>
+  <p class="muted small">Cash is an estimate (money in, minus stock bought, expenses &amp; draws). Profit excludes owner draws &amp; stock buys — it is performance, not cash in pocket.</p>
+</section>
+
+<div class="period-bar">
+  <span class="muted">Period:</span>
+  <a class="chip {% if current_period == '' %}active{% endif %}" href="{{ qp('') }}">This month</a>
+  <a class="chip {% if current_period == 'today' %}active{% endif %}" href="{{ qp('today') }}">Today</a>
+  <a class="chip {% if current_period == 'all' %}active{% endif %}" href="{{ qp('all') }}">All-time</a>
+  <span class="period-label">{{ view.period_label }}</span>
+</div>
+
+<div class="period-bar export-bar">
+  <span class="muted">Export CSV:</span>
+  <a class="chip" href="{{ ex('sales') }}">Sales</a>
+  <a class="chip" href="{{ ex('rooms') }}">Rooms</a>
+  <a class="chip" href="{{ ex('expenses') }}">Expenses</a>
+  <a class="chip" href="{{ ex('debtors') }}">Debtors</a>
+</div>
+
+<section class="cards">
+  <div class="card stat"><div class="label">Total Revenue</div><div class="value">{{ view.pnl.total_revenue | naira }}</div></div>
+  <div class="card stat"><div class="label">Net Profit</div>
+    <div class="value {{ 'pos' if view.pnl.net_profit >= 0 else 'neg' }}">{{ view.pnl.net_profit | naira }}</div></div>
+  <div class="card stat"><div class="label">Owed to us</div><div class="value">{{ view.owed.total_owed | naira }}</div>
+    <div class="sub">{{ view.owed.outstanding_count }} debtor(s)</div></div>
+  <div class="card stat"><div class="label">Stock value</div><div class="value">{{ view.stock_value | naira }}</div>
+    <div class="sub">{{ view.low_stock | length }} low</div></div>
+</section>
+
+<section class="card">
+  <h2>Revenue trend</h2>
+  {% if view.trend %}
+    <canvas id="trend" height="90"></canvas>
+    <script id="trend-data" type="application/json">{{ view.trend | tojson }}</script>
+  {% else %}
+    <p class="muted">No activity in this period.</p>
+  {% endif %}
+</section>
+
+<section class="grid-2">
+  <div class="card">
+    <h2>Profit &amp; Loss</h2>
+    <table class="tbl">
+      <thead><tr><th></th><th>🍺 Bar</th><th>🛏 Rooms</th></tr></thead>
+      <tbody>
+        <tr><td>Revenue</td><td>{{ view.pnl.bar.revenue | naira }}</td><td>{{ view.pnl.rooms.revenue | naira }}</td></tr>
+        <tr><td>Cost of stock sold</td><td>{{ view.pnl.bar.cogs | naira }}</td><td>—</td></tr>
+        <tr><td>Salaries</td><td>{{ view.pnl.bar.salary | naira }}</td><td>{{ view.pnl.rooms.salary | naira }}</td></tr>
+        <tr><td>Other expenses</td><td>{{ view.pnl.bar.other_expense | naira }}</td><td>{{ view.pnl.rooms.other_expense | naira }}</td></tr>
+        <tr class="total"><td>Profit</td>
+          <td class="{{ 'pos' if view.pnl.bar.profit >= 0 else 'neg' }}">{{ view.pnl.bar.profit | naira }}</td>
+          <td class="{{ 'pos' if view.pnl.rooms.profit >= 0 else 'neg' }}">{{ view.pnl.rooms.profit | naira }}</td></tr>
+      </tbody>
+    </table>
+    {% if view.pnl.restock_spend > 0 %}
+      <p class="muted small">📦 Stock purchased this period: {{ view.pnl.restock_spend | naira }} — cash → stock, not a profit cost.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Outstanding debtors</h2>
+    {% if view.owed.outstanding_count %}
+      <table class="tbl">
+        <tbody>
+          {% if view.owed.bar_count %}<tr><td>🍺 Bar ({{ view.owed.bar_count }})</td><td class="num">{{ view.owed.bar_owed | naira }}</td></tr>{% endif %}
+          {% if view.owed.rooms_count %}<tr><td>🛏 Rooms ({{ view.owed.rooms_count }})</td><td class="num">{{ view.owed.rooms_owed | naira }}</td></tr>{% endif %}
+          <tr class="total"><td>Total owed</td><td class="num">{{ view.owed.total_owed | naira }}</td></tr>
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No outstanding debtors. 🎉</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="grid-2">
+  <div class="card">
+    <h2>Recommended set-asides <span class="muted small">· {{ view.allocation.total_pct }}% of revenue</span></h2>
+    <table class="tbl">
+      <tbody>
+        <tr><td>Buffer ({{ view.alloc_pcts.buffer }}%)</td><td class="num">{{ view.allocation.buffer_amt | naira }}</td></tr>
+        {% if view.alloc_pcts.restock %}<tr><td>Restock ({{ view.alloc_pcts.restock }}%)</td><td class="num">{{ view.allocation.restock_amt | naira }}</td></tr>{% endif %}
+        <tr class="total"><td>Total to save</td><td class="num">{{ view.allocation.total_save | naira }}</td></tr>
+        <tr><td class="muted">From Bar account</td><td class="num">{{ view.allocation.bar_share | naira }}</td></tr>
+        <tr><td class="muted">From Rooms account</td><td class="num">{{ view.allocation.room_share | naira }}</td></tr>
+      </tbody>
+    </table>
+    <p class="muted small">Net profit {{ view.allocation.working_capital | naira }} · after set-asides
+      <b>{{ view.allocation.after_setaside | naira }}</b> (safe to use) · burn {{ '%.1f' | format(view.allocation.burn_rate) }}%</p>
+  </div>
+
+  <div class="card">
+    <h2>Profit distribution</h2>
+    {% if view.allocation.after_setaside > 0 and view.allocation.dist_total_pct > 0 %}
+      <table class="tbl">
+        <tbody>
+          <tr><td>👤 Owner's draw ({{ view.alloc_pcts.draw }}%)</td><td class="num">{{ view.allocation.draw_amt | naira }}</td></tr>
+          <tr><td>📈 Reinvestment ({{ view.alloc_pcts.reinvest }}%)</td><td class="num">{{ view.allocation.reinvest_amt | naira }}</td></tr>
+          <tr><td>🏦 Cash float ({{ view.alloc_pcts.float }}%)</td><td class="num">{{ view.allocation.float_amt | naira }}</td></tr>
+          {% if view.allocation.unallocated %}<tr><td>Unallocated</td><td class="num">{{ view.allocation.unallocated | naira }}</td></tr>{% endif %}
+        </tbody>
+      </table>
+      {% if view.allocation.draw_amt > 0 %}
+        <p class="muted small">PIT estimate on draw: {{ view.allocation.pit_low_amt | naira }} – {{ view.allocation.pit_high_amt | naira }} <em>(informational)</em></p>
+      {% endif %}
+    {% else %}
+      <p class="muted">Nothing to distribute — expenses + set-asides exceed revenue.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Sales by drink</h2>
+  {% if view.sales_breakdown %}
+    <table class="tbl">
+      <thead><tr><th>Drink</th><th class="num">Qty</th><th class="num">Revenue</th><th class="num">Cost</th><th class="num">Profit</th></tr></thead>
+      <tbody>
+        {% for d in view.sales_breakdown %}
+          <tr><td>{{ d.drink }}</td><td class="num">{{ d.qty }}</td><td class="num">{{ d.revenue | naira }}</td>
+            <td class="num">{{ d.cost | naira }}</td>
+            <td class="num {{ 'pos' if d.profit >= 0 else 'neg' }}">{{ d.profit | naira }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No sales in this period.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Stock on hand</h2>
+  <table class="tbl">
+    <thead><tr><th>Drink</th><th class="num">Bar</th><th class="num">Store</th><th class="num">Cost</th><th class="num">Value</th></tr></thead>
+    <tbody>
+      {% for i in view.stock %}
+        <tr class="{{ 'low' if i.is_low }}">
+          <td>{{ i.drink }}{% if i.is_low %} ⚠️{% endif %}</td>
+          <td class="num">{{ i.bar_stock }}</td>
+          <td class="num">{{ i.store_stock }}</td>
+          <td class="num">{{ i.cost_price | naira }}</td>
+          <td class="num">{{ i.stock_value | naira }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">Inventory is empty.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<script>
+  (function () {
+    var el = document.getElementById('trend-data');
+    if (!el) return;
+    var rows = JSON.parse(el.textContent);
+    new Chart(document.getElementById('trend'), {
+      type: 'bar',
+      data: {
+        labels: rows.map(function (r) { return r.date; }),
+        datasets: [
+          { label: 'Bar', data: rows.map(function (r) { return r.bar; }), backgroundColor: '#c89b3c' },
+          { label: 'Rooms', data: rows.map(function (r) { return r.rooms; }), backgroundColor: '#3c7dc8' }
+        ]
+      },
+      options: { responsive: true, scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } }
+    });
+  })();
+</script>
+{% endblock %}
