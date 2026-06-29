@@ -139,13 +139,14 @@ async def logout():
 # ── Authenticated routes ──────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard_home(request: Request, period: str | None = None,
+async def dashboard_home(request: Request, period: str | None = None, staff: str | None = None,
                          sess: dict = Depends(require_tenant)):
     # role of the currently selected hotel
     role = next((h["role"] for h in sess["hotels"] if h["schema"] == request.state.schema), sess["role"])
-    view = data.dashboard_view(period)
+    view = data.dashboard_view(period, staff=staff)
     return templates.TemplateResponse(request, "dashboard.html", _ctx(
-        request, sess, view=view, role=role, current_period=(period or ""),
+        request, sess, view=view, role=role,
+        current_period=(period or ""), current_staff=(staff or ""),
     ))
 
 

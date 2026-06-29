@@ -90,6 +90,11 @@ def cash_position() -> metrics.CashPosition:
     )
 
 
+def _recorder(r) -> str:
+    """Normalised recorder name (blank/missing → 'Unknown'), matching staff_breakdown."""
+    return (r.get("recorded_by") or "Unknown").strip() or "Unknown"
+
+
 def _sales_breakdown(sales_rows, cost_map) -> list[dict]:
     """Per-drink qty / revenue / cost / profit for the period (matches /sales_report)."""
     totals: dict[str, dict] = {}
@@ -108,8 +113,14 @@ def _sales_breakdown(sales_rows, cost_map) -> list[dict]:
     return out
 
 
-def dashboard_view(period_arg: str | None) -> dict:
-    """Assemble everything the dashboard home page needs for one period."""
+def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
+    """Assemble everything the dashboard home page needs for one period.
+
+    ``staff`` optionally focuses the per-staff drill-down on one recorder. It
+    scopes only revenue/activity (sales-by-drink, transaction counts) — the
+    hotel-wide figures (P&L, cash, allocation, stock, debtors) are never
+    filtered by staff, since they aren't attributable to a single recorder.
+    """
     for_date, for_month, all_time = parse_period(period_arg)
     cost_map = _cost_price_map()
 
@@ -134,6 +145,24 @@ def dashboard_view(period_arg: str | None) -> dict:
     stock_value = round(sum(i["stock_value"] for i in stock), 2)
     low_stock = [i for i in stock if i["is_low"]]
 
+    staff_rows = metrics.staff_breakdown(sales, rooms)
+    # Optional per-staff focus — scopes ONLY this recorder's revenue/activity.
+    selected_staff = (staff or "").strip() or None
+    staff_detail = None
+    if selected_staff:
+        s_sales = [r for r in sales if _recorder(r) == selected_staff]
+        s_rooms = [r for r in rooms if _recorder(r) == selected_staff]
+        staff_detail = {
+            "name": selected_staff,
+            "bar_rev": metrics.sum_revenue(s_sales),
+            "room_rev": metrics.sum_revenue(s_rooms),
+            "total_rev": metrics.sum_revenue(s_sales) + metrics.sum_revenue(s_rooms),
+            "drink_txns": len(s_sales),
+            "room_txns": len(s_rooms),
+            "sales_breakdown": _sales_breakdown(s_sales, cost_map),
+            "trend": _revenue_by_day(s_sales, s_rooms),
+        }
+
     view = {
         "period_label": _period_label(for_date, for_month, all_time),
         "pnl": pnl,
@@ -142,7 +171,9 @@ def dashboard_view(period_arg: str | None) -> dict:
         "alloc_pcts": {"buffer": buffer_pct, "restock": restock_pct,
                        "draw": draw_pct, "reinvest": reinvest_pct, "float": float_pct},
         "sales_breakdown": _sales_breakdown(sales, cost_map),
-        "staff": metrics.staff_breakdown(sales, rooms),
+        "staff": staff_rows,
+        "selected_staff": selected_staff,
+        "staff_detail": staff_detail,
         "stock": stock,
         "stock_value": stock_value,
         "low_stock": low_stock,

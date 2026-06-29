@@ -3,13 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>{% block title %}{{ hotel_name }} Dashboard{% endblock %}</title>
+  <script>
+    /* Set theme before paint to avoid a flash. */
+    (function () {
+      try {
+        var t = localStorage.getItem("theme");
+        if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) { document.documentElement.setAttribute("data-theme", "light"); }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css">
   {% block head %}{% endblock %}
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">🏨 {{ hotel_name }}</div>
+    <div class="brand">
+      <span class="brand-mark">🏨</span>
+      <span>{{ hotel_name }}</span>
+    </div>
     <nav class="topnav">
       {% if session %}
         {% if session.hotels|length > 1 %}
@@ -21,9 +35,10 @@
             </select>
           </form>
         {% endif %}
-        <span class="role">{{ session.username }} · {{ session.role }}</span>
-        <a class="btn ghost" href="/logout">Logout</a>
+        <span class="who"><b>{{ session.username }}</b> · {{ session.role }}</span>
       {% endif %}
+      <button id="theme-btn" class="icon-btn" type="button" aria-label="Toggle theme">🌙</button>
+      {% if session %}<a class="btn ghost" href="/logout">Logout</a>{% endif %}
     </nav>
   </header>
 
@@ -34,5 +49,7 @@
   <footer class="foot">
     Read-only view · the Telegram bot remains the source of truth.
   </footer>
+
+  <script src="/static/app.js"></script>
 </body>
 </html>

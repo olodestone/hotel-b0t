@@ -2,8 +2,9 @@
 {% block title %}Sign in · {{ hotel_name }}{% endblock %}
 {% block content %}
 <div class="login card">
-  <h1>{{ hotel_name }} Dashboard</h1>
-  <p class="muted">Sign in with the same Telegram account you use for the bot.</p>
+  <span class="brand-mark">🏨</span>
+  <h1>{{ hotel_name }}</h1>
+  <p class="muted">Read-only dashboard. Sign in with the same Telegram account you use for the bot.</p>
 
   {% if message %}<p class="error">{{ message }}</p>{% endif %}
 
@@ -16,11 +17,13 @@
         data-request-access="write"></script>
     </div>
   {% else %}
-    <p class="warn">Telegram login is not configured. Set <code>DASHBOARD_LOGIN_BOT_USERNAME</code>.</p>
+    <p class="warn note">Telegram login is not configured. Set <code>DASHBOARD_LOGIN_BOT_USERNAME</code>.</p>
   {% endif %}
 
   {% if dev_login %}
     <p><a class="btn" href="/dev-login">Dev login (insecure — local only)</a></p>
   {% endif %}
+
+  <p class="muted small" style="margin-top: 18px">The bot remains the source of truth — nothing here changes your data.</p>
 </div>
 {% endblock %}

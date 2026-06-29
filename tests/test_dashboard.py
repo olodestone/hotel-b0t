@@ -36,7 +36,7 @@ def test_healthz_ok():
 def test_login_page_renders():
     r = client.get("/login")
     assert r.status_code == 200
-    assert "Dashboard" in r.text
+    assert "Telegram" in r.text          # login page is about Telegram sign-in
 
 
 def test_root_redirects_to_login_when_anonymous():
@@ -116,6 +116,39 @@ def test_dashboard_template_renders(monkeypatch):
     assert "Sales by drink" in html           # sales drill-down
     assert "Staff activity" in html           # per-staff section
     assert "Export CSV" in html               # export links
+
+
+def test_dashboard_view_staff_filter():
+    # No filter → no focus panel.
+    assert data.dashboard_view("all")["staff_detail"] is None
+
+    # Focused on 'john' → only his recorded revenue/activity.
+    view = data.dashboard_view("all", staff="john")
+    assert view["selected_staff"] == "john"
+    sd = view["staff_detail"]
+    assert sd["name"] == "john"
+    assert sd["bar_rev"] == 5000 and sd["drink_txns"] == 2     # heineken x6 + coke x10
+    assert sd["room_rev"] == 50000 and sd["room_txns"] == 1    # one deluxe booking
+    assert sd["total_rev"] == 55000
+    assert [d["drink"] for d in sd["sales_breakdown"]] == ["Coke", "Heineken"]
+
+    # Hotel-wide figures are NOT filtered by staff — identical with/without focus.
+    assert view["pnl"].net_profit == data.dashboard_view("all")["pnl"].net_profit
+    assert view["position"].cash == data.dashboard_view("all")["position"].cash
+
+
+def test_dashboard_template_renders_staff_focus():
+    from dashboard.app import templates
+    view = data.dashboard_view("all", staff="john")
+    session = {"username": "dev", "role": "admin",
+               "hotels": [{"schema": "hotel85", "name": "Hotel 85", "role": "admin"}]}
+    html = templates.get_template("dashboard.html").render(
+        request=None, hotel_name="Hotel 85", session=session,
+        current_schema="hotel85", view=view, role="admin", current_period="",
+    )
+    assert "Focus: john" in html
+    assert "clear filter" in html
+    assert "&staff=mary" in html          # other staff still linkable to switch focus
 
 
 def test_export_dataset():

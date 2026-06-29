@@ -6,70 +6,91 @@
 
 {% macro qp(period) %}/?period={{ period }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
 {% macro ex(kind) %}/export/{{ kind }}.csv?period={{ current_period }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
+{% macro stf(name) %}/?period={{ current_period }}&staff={{ name | urlencode }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
 
 {% block content %}
 {% set pos = view.position %}
 
-<section class="card position">
-  <h2>What you have now <span class="muted small">· as of today</span></h2>
-  <div class="position-grid">
-    <div class="cash-block">
-      <div class="label">💰 Cash at hand <span class="muted">(estimate)</span></div>
-      <div class="value {{ 'pos' if pos.cash >= 0 else 'neg' }}">{{ pos.cash | naira }}</div>
-      <table class="tbl mini">
+<section class="hero">
+  <div class="card-head"><h2>What you have now <span class="muted small">· as of today</span></h2></div>
+  <div class="hero-grid">
+    <div>
+      <div class="cash-label">💰 Cash at hand <span class="muted">(estimate)</span></div>
+      <div class="cash-val {{ 'pos' if pos.cash >= 0 else 'neg' }}">{{ pos.cash | naira }}</div>
+      <table class="flow">
         <tbody>
           {% if pos.anchor_dt %}
             <tr><td>Balance on {{ pos.anchor_dt.strftime('%d %b %Y') }}</td><td class="num">{{ pos.opening | naira }}</td></tr>
           {% else %}
             <tr><td>Opening balance</td><td class="num">{{ pos.opening | naira }}</td></tr>
           {% endif %}
-          <tr><td>+ Collected sales</td><td class="num">{{ pos.collected | naira }}</td></tr>
+          <tr><td>+ Collected sales</td><td class="num pos">{{ pos.collected | naira }}</td></tr>
           <tr><td>− Expenses</td><td class="num">{{ pos.opex_cash | naira }}</td></tr>
           <tr><td>− Stock purchases</td><td class="num">{{ pos.restock_cash | naira }}</td></tr>
           <tr><td>− Owner draws</td><td class="num">{{ pos.draws_cash | naira }}</td></tr>
         </tbody>
       </table>
     </div>
-    <div class="side">
-      <div class="mini-stat"><span class="muted">📦 Stock value</span><b>{{ pos.stock_value | naira }}</b></div>
-      <div class="mini-stat"><span class="muted">💳 Owed to us</span><b>{{ pos.receivables | naira }} <small>({{ pos.outstanding_count }})</small></b></div>
-      <div class="mini-stat"><span class="muted">📊 Profit — this month</span><b>{{ pos.month_profit | naira }}</b></div>
-      <div class="mini-stat"><span class="muted">📊 Profit — all-time</span><b>{{ pos.profit_all | naira }}</b></div>
+    <div class="assets">
+      <div class="asset"><span class="a-label">📦 Stock value</span><b>{{ pos.stock_value | naira }}</b></div>
+      <div class="asset"><span class="a-label">💳 Owed to us</span><b>{{ pos.receivables | naira }} <span class="muted small">({{ pos.outstanding_count }})</span></b></div>
+      <div class="asset"><span class="a-label">📊 Profit — this month</span><b class="{{ 'pos' if pos.month_profit >= 0 else 'neg' }}">{{ pos.month_profit | naira }}</b></div>
+      <div class="asset"><span class="a-label">📈 Profit — all-time</span><b class="{{ 'pos' if pos.profit_all >= 0 else 'neg' }}">{{ pos.profit_all | naira }}</b></div>
     </div>
   </div>
-  <p class="muted small">Cash is an estimate (money in, minus stock bought, expenses &amp; draws). Profit excludes owner draws &amp; stock buys — it is performance, not cash in pocket.</p>
+  <p class="muted small" style="margin: 14px 0 0">Cash is an estimate (money in, minus stock bought, expenses &amp; draws). Profit excludes owner draws &amp; stock buys — it is performance, not cash in pocket.</p>
 </section>
 
-<div class="period-bar">
-  <span class="muted">Period:</span>
-  <a class="chip {% if current_period == '' %}active{% endif %}" href="{{ qp('') }}">This month</a>
-  <a class="chip {% if current_period == 'today' %}active{% endif %}" href="{{ qp('today') }}">Today</a>
-  <a class="chip {% if current_period == 'all' %}active{% endif %}" href="{{ qp('all') }}">All-time</a>
-  <span class="period-label">{{ view.period_label }}</span>
+<div class="toolbar">
+  <div class="segmented">
+    <a class="{{ 'active' if current_period == '' }}" href="{{ qp('') }}">This month</a>
+    <a class="{{ 'active' if current_period == 'today' }}" href="{{ qp('today') }}">Today</a>
+    <a class="{{ 'active' if current_period == 'all' }}" href="{{ qp('all') }}">All-time</a>
+  </div>
+  <div class="toolbar-right">
+    <span class="muted small">{{ view.period_label }}</span>
+    <div class="menu">
+      <span class="muted small">Export CSV</span>
+      <a class="chip" href="{{ ex('sales') }}">Sales</a>
+      <a class="chip" href="{{ ex('rooms') }}">Rooms</a>
+      <a class="chip" href="{{ ex('expenses') }}">Expenses</a>
+      <a class="chip" href="{{ ex('debtors') }}">Debtors</a>
+    </div>
+  </div>
 </div>
 
-<div class="period-bar export-bar">
-  <span class="muted">Export CSV:</span>
-  <a class="chip" href="{{ ex('sales') }}">Sales</a>
-  <a class="chip" href="{{ ex('rooms') }}">Rooms</a>
-  <a class="chip" href="{{ ex('expenses') }}">Expenses</a>
-  <a class="chip" href="{{ ex('debtors') }}">Debtors</a>
-</div>
-
-<section class="cards">
-  <div class="card stat"><div class="label">Total Revenue</div><div class="value">{{ view.pnl.total_revenue | naira }}</div></div>
-  <div class="card stat"><div class="label">Net Profit</div>
-    <div class="value {{ 'pos' if view.pnl.net_profit >= 0 else 'neg' }}">{{ view.pnl.net_profit | naira }}</div></div>
-  <div class="card stat"><div class="label">Owed to us</div><div class="value">{{ view.owed.total_owed | naira }}</div>
-    <div class="sub">{{ view.owed.outstanding_count }} debtor(s)</div></div>
-  <div class="card stat"><div class="label">Stock value</div><div class="value">{{ view.stock_value | naira }}</div>
-    <div class="sub">{{ view.low_stock | length }} low</div></div>
+{% set margin = (view.pnl.net_profit / view.pnl.total_revenue * 100) if view.pnl.total_revenue else 0 %}
+<section class="kpis">
+  <div class="kpi">
+    <div class="ic">💵</div>
+    <div class="k-label">Total Revenue</div>
+    <div class="k-val">{{ view.pnl.total_revenue | naira }}</div>
+    <div class="k-meta">{{ view.pnl.sales_count + view.pnl.rooms_count }} transactions</div>
+  </div>
+  <div class="kpi">
+    <div class="ic">📈</div>
+    <div class="k-label">Net Profit</div>
+    <div class="k-val {{ 'pos' if view.pnl.net_profit >= 0 else 'neg' }}">{{ view.pnl.net_profit | naira }}</div>
+    <div class="k-meta">{{ '%.0f' | format(margin) }}% margin</div>
+  </div>
+  <div class="kpi">
+    <div class="ic">💳</div>
+    <div class="k-label">Owed to us</div>
+    <div class="k-val">{{ view.owed.total_owed | naira }}</div>
+    <div class="k-meta">{{ view.owed.outstanding_count }} debtor(s)</div>
+  </div>
+  <div class="kpi">
+    <div class="ic">📦</div>
+    <div class="k-label">Stock value</div>
+    <div class="k-val">{{ view.stock_value | naira }}</div>
+    <div class="k-meta">{{ view.low_stock | length }} low</div>
+  </div>
 </section>
 
 <section class="card">
-  <h2>Revenue trend</h2>
+  <h2>Revenue trend <span class="muted small">· Bar vs Rooms</span></h2>
   {% if view.trend %}
-    <canvas id="trend" height="90"></canvas>
+    <div class="chart-wrap"><canvas id="trend"></canvas></div>
     <script id="trend-data" type="application/json">{{ view.trend | tojson }}</script>
   {% else %}
     <p class="muted">No activity in this period.</p>
@@ -78,19 +99,21 @@
 
 <section class="grid-2">
   <div class="card">
-    <h2>Profit &amp; Loss</h2>
-    <table class="tbl">
-      <thead><tr><th></th><th>🍺 Bar</th><th>🛏 Rooms</th></tr></thead>
-      <tbody>
-        <tr><td>Revenue</td><td>{{ view.pnl.bar.revenue | naira }}</td><td>{{ view.pnl.rooms.revenue | naira }}</td></tr>
-        <tr><td>Cost of stock sold</td><td>{{ view.pnl.bar.cogs | naira }}</td><td>—</td></tr>
-        <tr><td>Salaries</td><td>{{ view.pnl.bar.salary | naira }}</td><td>{{ view.pnl.rooms.salary | naira }}</td></tr>
-        <tr><td>Other expenses</td><td>{{ view.pnl.bar.other_expense | naira }}</td><td>{{ view.pnl.rooms.other_expense | naira }}</td></tr>
-        <tr class="total"><td>Profit</td>
-          <td class="{{ 'pos' if view.pnl.bar.profit >= 0 else 'neg' }}">{{ view.pnl.bar.profit | naira }}</td>
-          <td class="{{ 'pos' if view.pnl.rooms.profit >= 0 else 'neg' }}">{{ view.pnl.rooms.profit | naira }}</td></tr>
-      </tbody>
-    </table>
+    <h2>Profit &amp; Loss <span class="muted small">· {{ view.period_label }}</span></h2>
+    <div class="tbl-wrap">
+      <table class="tbl stack">
+        <thead><tr><th></th><th class="num">🍺 Bar</th><th class="num">🛏 Rooms</th></tr></thead>
+        <tbody>
+          <tr><td>Revenue</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.revenue | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.revenue | naira }}</td></tr>
+          <tr><td>Cost of stock sold</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.cogs | naira }}</td><td class="num" data-label="🛏 Rooms">—</td></tr>
+          <tr><td>Salaries</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.salary | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.salary | naira }}</td></tr>
+          <tr><td>Other expenses</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.other_expense | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.other_expense | naira }}</td></tr>
+          <tr class="total"><td>Profit</td>
+            <td class="num {{ 'pos' if view.pnl.bar.profit >= 0 else 'neg' }}" data-label="🍺 Bar">{{ view.pnl.bar.profit | naira }}</td>
+            <td class="num {{ 'pos' if view.pnl.rooms.profit >= 0 else 'neg' }}" data-label="🛏 Rooms">{{ view.pnl.rooms.profit | naira }}</td></tr>
+        </tbody>
+      </table>
+    </div>
     {% if view.pnl.restock_spend > 0 %}
       <p class="muted small">📦 Stock purchased this period: {{ view.pnl.restock_spend | naira }} — cash → stock, not a profit cost.</p>
     {% endif %}
@@ -101,8 +124,8 @@
     {% if view.owed.outstanding_count %}
       <table class="tbl">
         <tbody>
-          {% if view.owed.bar_count %}<tr><td>🍺 Bar ({{ view.owed.bar_count }})</td><td class="num">{{ view.owed.bar_owed | naira }}</td></tr>{% endif %}
-          {% if view.owed.rooms_count %}<tr><td>🛏 Rooms ({{ view.owed.rooms_count }})</td><td class="num">{{ view.owed.rooms_owed | naira }}</td></tr>{% endif %}
+          {% if view.owed.bar_count %}<tr><td>🍺 Bar <span class="badge warn">{{ view.owed.bar_count }}</span></td><td class="num">{{ view.owed.bar_owed | naira }}</td></tr>{% endif %}
+          {% if view.owed.rooms_count %}<tr><td>🛏 Rooms <span class="badge warn">{{ view.owed.rooms_count }}</span></td><td class="num">{{ view.owed.rooms_owed | naira }}</td></tr>{% endif %}
           <tr class="total"><td>Total owed</td><td class="num">{{ view.owed.total_owed | naira }}</td></tr>
         </tbody>
       </table>
@@ -131,11 +154,22 @@
   <div class="card">
     <h2>Profit distribution</h2>
     {% if view.allocation.after_setaside > 0 and view.allocation.dist_total_pct > 0 %}
+      {% set dt = view.allocation.dist_total_pct %}
+      <div class="splitbar">
+        <span class="seg-draw" style="width: {{ view.alloc_pcts.draw / dt * 100 }}%"></span>
+        <span class="seg-reinvest" style="width: {{ view.alloc_pcts.reinvest / dt * 100 }}%"></span>
+        <span class="seg-float" style="width: {{ view.alloc_pcts.float / dt * 100 }}%"></span>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>Draw {{ view.alloc_pcts.draw }}%</span>
+        <span><i style="background:var(--gold)"></i>Reinvest {{ view.alloc_pcts.reinvest }}%</span>
+        <span><i style="background:#3aa0a0"></i>Float {{ view.alloc_pcts.float }}%</span>
+      </div>
       <table class="tbl">
         <tbody>
-          <tr><td>👤 Owner's draw ({{ view.alloc_pcts.draw }}%)</td><td class="num">{{ view.allocation.draw_amt | naira }}</td></tr>
-          <tr><td>📈 Reinvestment ({{ view.alloc_pcts.reinvest }}%)</td><td class="num">{{ view.allocation.reinvest_amt | naira }}</td></tr>
-          <tr><td>🏦 Cash float ({{ view.alloc_pcts.float }}%)</td><td class="num">{{ view.allocation.float_amt | naira }}</td></tr>
+          <tr><td>👤 Owner's draw</td><td class="num">{{ view.allocation.draw_amt | naira }}</td></tr>
+          <tr><td>📈 Reinvestment</td><td class="num">{{ view.allocation.reinvest_amt | naira }}</td></tr>
+          <tr><td>🏦 Cash float</td><td class="num">{{ view.allocation.float_amt | naira }}</td></tr>
           {% if view.allocation.unallocated %}<tr><td>Unallocated</td><td class="num">{{ view.allocation.unallocated | naira }}</td></tr>{% endif %}
         </tbody>
       </table>
@@ -151,89 +185,124 @@
 <section class="card">
   <h2>Sales by drink</h2>
   {% if view.sales_breakdown %}
-    <table class="tbl">
-      <thead><tr><th>Drink</th><th class="num">Qty</th><th class="num">Revenue</th><th class="num">Cost</th><th class="num">Profit</th></tr></thead>
-      <tbody>
-        {% for d in view.sales_breakdown %}
-          <tr><td>{{ d.drink }}</td><td class="num">{{ d.qty }}</td><td class="num">{{ d.revenue | naira }}</td>
-            <td class="num">{{ d.cost | naira }}</td>
-            <td class="num {{ 'pos' if d.profit >= 0 else 'neg' }}">{{ d.profit | naira }}</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="tbl-wrap">
+      <table class="tbl stack">
+        <thead><tr><th>Drink</th><th class="num">Qty</th><th class="num">Revenue</th><th class="num">Cost</th><th class="num">Profit</th></tr></thead>
+        <tbody>
+          {% for d in view.sales_breakdown %}
+            <tr><td>{{ d.drink }}</td><td class="num" data-label="Qty">{{ d.qty }}</td><td class="num" data-label="Revenue">{{ d.revenue | naira }}</td>
+              <td class="num" data-label="Cost">{{ d.cost | naira }}</td>
+              <td class="num {{ 'pos' if d.profit >= 0 else 'neg' }}" data-label="Profit">{{ d.profit | naira }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="muted">No sales in this period.</p>
   {% endif %}
 </section>
 
 <section class="card">
-  <h2>Staff activity <span class="muted small">· who recorded what</span></h2>
+  <div class="card-head">
+    <h2>Staff activity <span class="muted small">· who recorded what</span></h2>
+    {% if view.staff %}
+      <form method="get" action="/" class="inline">
+        <input type="hidden" name="period" value="{{ current_period }}">
+        {% if current_schema and session.hotels|length > 1 %}<input type="hidden" name="hotel" value="{{ current_schema }}">{% endif %}
+        <select name="staff" onchange="this.form.submit()" aria-label="Filter by staff">
+          <option value="">All staff</option>
+          {% for s in view.staff %}
+            <option value="{{ s.name }}" {% if s.name == view.selected_staff %}selected{% endif %}>{{ s.name }}</option>
+          {% endfor %}
+        </select>
+      </form>
+    {% endif %}
+  </div>
+
   {% if view.staff %}
     {% set ns = namespace(dt=0, dr=0, rt=0, rr=0) %}
-    <table class="tbl">
-      <thead><tr><th>Staff</th><th class="num">Drink txns</th><th class="num">Drink rev</th><th class="num">Room txns</th><th class="num">Room rev</th></tr></thead>
-      <tbody>
-        {% for d in view.staff %}
-          {% set ns.dt = ns.dt + d.drink_txns %}{% set ns.dr = ns.dr + d.drink_revenue %}
-          {% set ns.rt = ns.rt + d.room_txns %}{% set ns.rr = ns.rr + d.room_revenue %}
-          <tr>
-            <td>{{ d.name }}</td>
-            <td class="num">{{ d.drink_txns }}</td>
-            <td class="num">{{ d.drink_revenue | naira }}</td>
-            <td class="num">{{ d.room_txns }}</td>
-            <td class="num">{{ d.room_revenue | naira }}</td>
+    <div class="tbl-wrap">
+      <table class="tbl stack">
+        <thead><tr><th>Staff</th><th class="num">Drink txns</th><th class="num">Drink rev</th><th class="num">Room txns</th><th class="num">Room rev</th></tr></thead>
+        <tbody>
+          {% for d in view.staff %}
+            {% set ns.dt = ns.dt + d.drink_txns %}{% set ns.dr = ns.dr + d.drink_revenue %}
+            {% set ns.rt = ns.rt + d.room_txns %}{% set ns.rr = ns.rr + d.room_revenue %}
+            <tr class="{{ 'sel' if d.name == view.selected_staff }}">
+              <td><a href="{{ stf(d.name) }}">{{ d.name }}</a></td>
+              <td class="num" data-label="Drink txns">{{ d.drink_txns }}</td>
+              <td class="num" data-label="Drink rev">{{ d.drink_revenue | naira }}</td>
+              <td class="num" data-label="Room txns">{{ d.room_txns }}</td>
+              <td class="num" data-label="Room rev">{{ d.room_revenue | naira }}</td>
+            </tr>
+          {% endfor %}
+          <tr class="total">
+            <td>TOTAL</td>
+            <td class="num" data-label="Drink txns">{{ ns.dt }}</td>
+            <td class="num" data-label="Drink rev">{{ ns.dr | naira }}</td>
+            <td class="num" data-label="Room txns">{{ ns.rt }}</td>
+            <td class="num" data-label="Room rev">{{ ns.rr | naira }}</td>
           </tr>
-        {% endfor %}
-        <tr class="total">
-          <td>TOTAL</td>
-          <td class="num">{{ ns.dt }}</td>
-          <td class="num">{{ ns.dr | naira }}</td>
-          <td class="num">{{ ns.rt }}</td>
-          <td class="num">{{ ns.rr | naira }}</td>
-        </tr>
-      </tbody>
-    </table>
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="muted">No staff activity in this period.</p>
+  {% endif %}
+
+  {% if view.staff_detail %}
+    {% set s = view.staff_detail %}
+    <div class="staff-focus">
+      <div class="card-head">
+        <h3>Focus: {{ s.name }}</h3>
+        <a class="chip" href="{{ qp(current_period) }}">× clear filter</a>
+      </div>
+      <section class="kpis" style="margin: 0 0 14px">
+        <div class="kpi"><div class="k-label">Bar revenue</div><div class="k-val">{{ s.bar_rev | naira }}</div><div class="k-meta">{{ s.drink_txns }} txns</div></div>
+        <div class="kpi"><div class="k-label">Room revenue</div><div class="k-val">{{ s.room_rev | naira }}</div><div class="k-meta">{{ s.room_txns }} txns</div></div>
+        <div class="kpi"><div class="k-label">Total recorded</div><div class="k-val">{{ s.total_rev | naira }}</div></div>
+      </section>
+      <h4>{{ s.name }}'s sales by drink</h4>
+      {% if s.sales_breakdown %}
+        <div class="tbl-wrap">
+          <table class="tbl stack">
+            <thead><tr><th>Drink</th><th class="num">Qty</th><th class="num">Revenue</th><th class="num">Cost</th><th class="num">Profit</th></tr></thead>
+            <tbody>
+              {% for d in s.sales_breakdown %}
+                <tr><td>{{ d.drink }}</td><td class="num" data-label="Qty">{{ d.qty }}</td><td class="num" data-label="Revenue">{{ d.revenue | naira }}</td>
+                  <td class="num" data-label="Cost">{{ d.cost | naira }}</td>
+                  <td class="num {{ 'pos' if d.profit >= 0 else 'neg' }}" data-label="Profit">{{ d.profit | naira }}</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="muted">{{ s.name }} recorded no drink sales in this period.</p>
+      {% endif %}
+      <p class="muted small">Per-staff scopes <em>recorded revenue</em> only. "Profit" here is drink margin (revenue − stock cost) on {{ s.name }}'s sales — not the hotel's net profit, which stays hotel-wide above.</p>
+    </div>
   {% endif %}
 </section>
 
 <section class="card">
-  <h2>Stock on hand</h2>
-  <table class="tbl">
-    <thead><tr><th>Drink</th><th class="num">Bar</th><th class="num">Store</th><th class="num">Cost</th><th class="num">Value</th></tr></thead>
-    <tbody>
-      {% for i in view.stock %}
-        <tr class="{{ 'low' if i.is_low }}">
-          <td>{{ i.drink }}{% if i.is_low %} ⚠️{% endif %}</td>
-          <td class="num">{{ i.bar_stock }}</td>
-          <td class="num">{{ i.store_stock }}</td>
-          <td class="num">{{ i.cost_price | naira }}</td>
-          <td class="num">{{ i.stock_value | naira }}</td>
-        </tr>
-      {% else %}
-        <tr><td colspan="5" class="muted">Inventory is empty.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <h2>Stock on hand <span class="muted small">· {{ view.low_stock | length }} low</span></h2>
+  <div class="tbl-wrap">
+    <table class="tbl stack">
+      <thead><tr><th>Drink</th><th class="num">Bar</th><th class="num">Store</th><th class="num">Cost</th><th class="num">Value</th></tr></thead>
+      <tbody>
+        {% for i in view.stock %}
+          <tr class="{{ 'low' if i.is_low }}">
+            <td>{{ i.drink }}{% if i.is_low %} <span class="badge warn">low</span>{% endif %}</td>
+            <td class="num" data-label="Bar">{{ i.bar_stock }}</td>
+            <td class="num" data-label="Store">{{ i.store_stock }}</td>
+            <td class="num" data-label="Cost">{{ i.cost_price | naira }}</td>
+            <td class="num" data-label="Value">{{ i.stock_value | naira }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="muted">Inventory is empty.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
-
-<script>
-  (function () {
-    var el = document.getElementById('trend-data');
-    if (!el) return;
-    var rows = JSON.parse(el.textContent);
-    new Chart(document.getElementById('trend'), {
-      type: 'bar',
-      data: {
-        labels: rows.map(function (r) { return r.date; }),
-        datasets: [
-          { label: 'Bar', data: rows.map(function (r) { return r.bar; }), backgroundColor: '#c89b3c' },
-          { label: 'Rooms', data: rows.map(function (r) { return r.rooms; }), backgroundColor: '#3c7dc8' }
-        ]
-      },
-      options: { responsive: true, scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } }
-    });
-  })();
-</script>
 {% endblock %}
