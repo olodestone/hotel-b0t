@@ -68,8 +68,8 @@ That config installs `requirements-web.txt`, starts
 
 ## Status
 
-Phase 1 scaffold: a "what you have now" cash-at-hand / stock / receivables /
-profit snapshot (same numbers as the bot's `/position`), plus P&L, revenue
-trend, stock, and outstanding debtors for a selectable period, with a hotel
-switcher for multi-hotel users. Next: allocation view, CSV/Excel export, and
-per-drink / per-staff drill-downs.
+Live. A "what you have now" cash-at-hand / stock / receivables / profit snapshot
+(same numbers as the bot's `/position`), plus period P&L, revenue trend,
+allocation (set-asides + profit distribution), sales-by-drink, staff activity,
+stock, and outstanding debtors — with a hotel switcher for multi-hotel users and
+CSV export. Every figure matches the bot's reports (shared `metrics.py`).

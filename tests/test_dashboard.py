@@ -90,6 +90,11 @@ def test_dashboard_view_matches_golden_numbers():
     assert pos.profit_all == 37201                  # all-time net profit (matches full report)
     assert pos.month_profit == 31800
 
+    staff = {s["name"]: s for s in view["staff"]}   # matches bot /staff_report
+    assert staff["john"]["drink_txns"] == 2 and staff["john"]["drink_revenue"] == 5000
+    assert staff["john"]["room_txns"] == 1 and staff["john"]["room_revenue"] == 50000
+    assert staff["mary"]["drink_revenue"] == 3000 and staff["mary"]["room_revenue"] == 105000
+
 
 def test_dashboard_template_renders(monkeypatch):
     # Render the real dashboard template against fixture data to catch template
@@ -109,6 +114,7 @@ def test_dashboard_template_renders(monkeypatch):
     assert "₦-60,999" in html          # cash-at-hand headline
     assert "Recommended set-asides" in html   # allocation section
     assert "Sales by drink" in html           # sales drill-down
+    assert "Staff activity" in html           # per-staff section
     assert "Export CSV" in html               # export links
 
 

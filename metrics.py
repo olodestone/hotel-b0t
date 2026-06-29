@@ -410,3 +410,34 @@ def compute_allocation(sales_rows, room_rows, expense_rows, cost_map,
         float_amt=float_amt, unallocated=unallocated,
         pit_low_amt=pit_low_amt, pit_high_amt=pit_high_amt,
     )
+
+
+# ── Staff activity (by recorder) ──────────────────────────────────────
+
+def staff_breakdown(sales_rows, room_rows):
+    """Drink + room activity grouped by who recorded it (`recorded_by`).
+
+    Returns a list of dicts sorted by name; blank/missing recorders collapse to
+    "Unknown". Mirrors generate_staff_report's aggregation.
+    """
+    staff: dict[str, dict] = {}
+
+    def _row(name):
+        return staff.setdefault(name, {
+            "name": name, "drink_txns": 0, "drink_revenue": 0.0,
+            "room_txns": 0, "room_revenue": 0.0,
+        })
+
+    for r in sales_rows:
+        name = (r.get("recorded_by") or "Unknown").strip() or "Unknown"
+        d = _row(name)
+        d["drink_txns"] += 1
+        d["drink_revenue"] += float(r["total_revenue"])
+
+    for r in room_rows:
+        name = (r.get("recorded_by") or "Unknown").strip() or "Unknown"
+        d = _row(name)
+        d["room_txns"] += 1
+        d["room_revenue"] += float(r["total_revenue"])
+
+    return [staff[n] for n in sorted(staff)]

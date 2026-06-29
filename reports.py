@@ -405,36 +405,22 @@ def generate_staff_report(
     room_rows = _apply_filter(room_rows, for_date, for_month, False)
     label = _period_label(for_date, for_month, False)
 
-    # Aggregate drink sales by recorder
-    staff: dict[str, dict] = {}
-    for r in sales_rows:
-        name = (r.get("recorded_by") or "Unknown").strip() or "Unknown"
-        if name not in staff:
-            staff[name] = {"drink_txns": 0, "drink_revenue": 0.0, "room_txns": 0, "room_revenue": 0.0}
-        staff[name]["drink_txns"] += 1
-        staff[name]["drink_revenue"] += float(r["total_revenue"])
+    # Aggregate drink + room activity by recorder (shared with the dashboard).
+    staff_rows = metrics.staff_breakdown(sales_rows, room_rows)
 
-    for r in room_rows:
-        name = (r.get("recorded_by") or "Unknown").strip() or "Unknown"
-        if name not in staff:
-            staff[name] = {"drink_txns": 0, "drink_revenue": 0.0, "room_txns": 0, "room_revenue": 0.0}
-        staff[name]["room_txns"] += 1
-        staff[name]["room_revenue"] += float(r["total_revenue"])
-
-    if not staff:
+    if not staff_rows:
         return f"👥 *Staff Report — {label}*\n\nNo activity recorded for this period."
 
-    col_name = max(len(n) for n in staff) + 1
+    col_name = max(len(d["name"]) for d in staff_rows) + 1
     col_name = max(col_name, 10)
     header = f"{'Staff':<{col_name}} {'DrinkTxn':>9}  {'DrinkRev':>13}  {'RoomTxn':>8}  {'RoomRev':>13}"
     divider = "-" * len(header)
 
     rows_out = []
     t_dtxn, t_drev, t_rtxn, t_rrev = 0, 0.0, 0, 0.0
-    for name in sorted(staff):
-        d = staff[name]
+    for d in staff_rows:
         rows_out.append(
-            f"{name:<{col_name}} {d['drink_txns']:>9}  {_fmt(d['drink_revenue']):>13}  "
+            f"{d['name']:<{col_name}} {d['drink_txns']:>9}  {_fmt(d['drink_revenue']):>13}  "
             f"{d['room_txns']:>8}  {_fmt(d['room_revenue']):>13}"
         )
         t_dtxn += d["drink_txns"]

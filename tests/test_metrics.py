@@ -157,3 +157,22 @@ def test_compute_allocation():
     assert a.unallocated == 0
     assert a.pit_low_amt == 309.75 and a.pit_high_amt == 495.6
     assert a.room_by_type == {"Standard": {"bookings": 2, "revenue": 4000.0}}
+
+
+# ── Staff activity ────────────────────────────────────────────────────
+
+def test_staff_breakdown_groups_by_recorder():
+    sales = [
+        {"recorded_by": "john", "total_revenue": 3000},
+        {"recorded_by": "mary", "total_revenue": 2000},
+        {"recorded_by": "john", "total_revenue": 1000},
+        {"recorded_by": "",     "total_revenue": 500},   # blank → Unknown
+    ]
+    rooms = [{"recorded_by": "mary", "total_revenue": 90000}]
+    rows = metrics.staff_breakdown(sales, rooms)
+    by_name = {r["name"]: r for r in rows}
+    assert [r["name"] for r in rows] == ["Unknown", "john", "mary"]  # sorted
+    assert by_name["john"]["drink_txns"] == 2 and by_name["john"]["drink_revenue"] == 4000
+    assert by_name["mary"]["drink_txns"] == 1 and by_name["mary"]["room_revenue"] == 90000
+    assert by_name["mary"]["room_txns"] == 1
+    assert by_name["Unknown"]["drink_revenue"] == 500
