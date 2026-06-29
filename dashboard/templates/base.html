@@ -15,7 +15,7 @@
       } catch (e) { document.documentElement.setAttribute("data-theme", "light"); }
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -50,6 +50,6 @@
     Read-only view · the Telegram bot remains the source of truth.
   </footer>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ asset_v }}"></script>
 </body>
 </html>

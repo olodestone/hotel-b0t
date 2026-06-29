@@ -27,6 +27,18 @@ from . import auth, data, settings
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+def _asset_version() -> str:
+    """Cache-busting token — newest static-file mtime. Changes each deploy so
+    browsers fetch fresh CSS/JS instead of serving a stale cached stylesheet."""
+    try:
+        return str(int(max(f.stat().st_mtime for f in (BASE_DIR / "static").glob("*"))))
+    except (ValueError, OSError):
+        return "1"
+
+
+STATIC_VERSION = _asset_version()
+
 app = FastAPI(title=f"{settings.HOTEL_NAME} Dashboard", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -77,6 +89,7 @@ def _ctx(request: Request, sess: dict | None, **extra) -> dict:
         "hotel_name": settings.HOTEL_NAME,
         "session": sess,
         "current_schema": getattr(request.state, "schema", None),
+        "asset_v": STATIC_VERSION,
         **extra,
     }
 
