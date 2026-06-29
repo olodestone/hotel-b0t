@@ -1,0 +1,10 @@
+# Web dashboard dependencies (separate service — NOT needed by the Telegram bot).
+# The bot's runtime deps stay in requirements.txt and are untouched.
+#   pip install -r requirements-web.txt
+#   uvicorn dashboard.app:app --host 0.0.0.0 --port ${PORT:-8000}
+-r requirements.txt
+fastapi>=0.115
+uvicorn[standard]>=0.30
+jinja2>=3.1
+itsdangerous>=2.1
+python-multipart>=0.0.9

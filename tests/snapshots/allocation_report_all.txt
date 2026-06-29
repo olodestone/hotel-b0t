@@ -1,0 +1,47 @@
+📊 *Hotel 85 — Allocation Report*
+📅 Period: ALL-TIME
+──────────────────────────────
+💰 *REVENUE*
+  🍺 Bar:            ₦8,000
+  🛏 Rooms:          ₦155,000
+  *Total:           ₦163,000*
+  _Room breakdown:_
+    • Deluxe (1 bookings): ₦50,000  32%
+    • Standard (3 bookings): ₦105,000  68%
+──────────────────────────────
+🏦 *RECOMMENDED SET-ASIDES* _10% of gross revenue_
+  Buffer (10%):    ₦16,300  → Savings Account
+  *Total to save:   ₦16,300*
+
+  _How to split it:_
+  From Bar Account:   ₦800
+  From Rooms Account: ₦15,500
+──────────────────────────────
+💸 *COSTS* _(what reduces profit)_
+  🍺 Cost of stock sold: ₦4,800
+  👤 Salaries:       ₦95,000
+    🍺 Bar staff:    ₦50,000
+    🛏 Rooms staff:  ₦45,000
+  🔧 Other:          ₦25,999
+  *Total:           ₦125,799*
+──────────────────────────────
+📈 *NET POSITION*
+  Net profit:       ₦37,201
+  After set-asides: *₦20,901*  ← safe to use
+  Burn rate:        🔴 Danger — expenses eating revenue (74.2%)
+  📦 Stock purchased: ₦30,000 _(cash → stock, not a cost)_
+  ⚠️ Salary bill (₦95,000) exceeds safe amount — review set-aside %
+──────────────────────────────
+💼 *PROFIT DISTRIBUTION* _of ₦20,901 safe profit_
+  👤 Owner's Draw (50%):   ₦10,450  → Personal Account
+  📈 Reinvestment (30%): ₦6,270  → Business Growth
+  🏦 Cash Float (20%):    ₦4,180  → Current Account Reserve
+──────────────────────────────
+ℹ️ *PERSONAL INCOME TAX (estimate)*
+  Owner's Draw:    ₦10,450
+  PIT estimate:    ₦1,568 – ₦2,508  (15–24%)
+  _Nigerian PIT applies to personal income, not the business._
+  _Consult a tax advisor for your exact bracket._
+──────────────────────────────
+_Use /setallocation to adjust percentages_
+_Generated 29 Jun 2026 14:30_

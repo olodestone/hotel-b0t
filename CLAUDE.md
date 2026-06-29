@@ -30,9 +30,12 @@ The bot is split across five modules with a strict layered dependency:
 
 ```
 bot.py  →  logic.py  →  inventory.py  →  database.py
-       →  reports.py →  inventory.py  →  database.py
+       →  reports.py →  metrics.py        (pure calc core)
+                     →  inventory.py  →  database.py
                      →  database.py
 config.py  (imported by all layers)
+
+dashboard/ (separate FastAPI web service, read-only) → metrics.py + database.py
 ```
 
 **`bot.py`** — Entry point. All Telegram command handlers, access control decorators (`_require_auth`, `_require_admin`), argument parsing, and job scheduling. Delegates all business logic to `logic.py` and `reports.py`. `/help` is role-aware — staff see staff commands only, admins see all.
@@ -43,7 +46,9 @@ config.py  (imported by all layers)
 
 **`database.py`** — PostgreSQL persistence via SQLAlchemy + pandas. All queries use parameterised statements. `read_all(table)` returns `list[dict]` using `pd.read_sql`. The `upsert_drink()` function does an atomic `INSERT ... ON CONFLICT DO UPDATE`. `get_setting()`/`set_setting()` manage the `settings` table for configurable percentages.
 
-**`reports.py`** — Pure formatting: reads data from `database.py`/`inventory.py`, builds Telegram Markdown strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses *current* cost price (not historical per-sale cost). Salary expenses are always split out separately from other expenses. Profit calcs exclude `restock` (inventory purchase) and owner draws — see "Profit vs Cash vs Stock" below.
+**`reports.py`** — Telegram formatting: reads data from `database.py`/`inventory.py`, runs the numbers through `metrics.py`, builds Telegram MarkdownV2 strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses *current* cost price (not historical per-sale cost). Salary expenses are always split out separately from other expenses. Profit calcs exclude `restock` (inventory purchase) and owner draws — see "Profit vs Cash vs Stock" below.
+
+**`metrics.py`** — Pure financial calc core (no DB, no formatting). Functions take already-fetched rows + a cost-price map and return dataclasses (`compute_pnl` → `PnL`/`AccountPnL`, `summarize_outstanding`, plus shared row helpers `apply_filter`/`active`/`operating_expenses`/`cost_of_drinks_sold`/…). This is the **single source of truth** for the math, shared by `reports.py` (Telegram) and `dashboard/` (web) so the two can never disagree. The full report, position, and allocation reports consume it (`compute_pnl`, `compute_cash_position`, `compute_allocation`); per-staff is the remaining extraction target. Golden-master tests in `tests/` assert the Telegram output is byte-for-byte unchanged.
 
 **`config.py`** — All env var loading via `python-dotenv`. Also holds allocation defaults (`ALLOC_*`) used as fallback when DB settings are not yet set.
 
@@ -223,3 +228,7 @@ All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing
 - **Railway**: `railway.toml` configures `python bot.py` as start command with `on_failure` restart policy
 - **Heroku**: `Procfile` with `worker: python bot.py` (no web dyno needed)
 - `DATABASE_URL` starting with `postgres://` is auto-corrected to `postgresql://` in `database.py:get_engine()`
+
+## Web Dashboard (read-only)
+
+`dashboard/` is a **separate FastAPI service** that renders the hotel's numbers in a browser for viewing — it does **not** replace the bot (Telegram stays the source of truth) and is **read-only**. It reuses `metrics.py` + `database.py`, authenticates via the Telegram Login Widget (HMAC verified against `BOT_TOKEN`), and sets `database._hotel_schema_var` per request for tenant isolation. Deploy as its own service against the **same** `DATABASE_URL`; start command `uvicorn dashboard.app:app --host 0.0.0.0 --port $PORT`; health check `GET /healthz`. Web deps live in `requirements-web.txt` (kept out of the bot's `requirements.txt`). Full setup in `dashboard/README.md`. Tests/dev deps: `requirements-dev.txt`; run `python3 -m pytest`.

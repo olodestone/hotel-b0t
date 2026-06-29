@@ -1,0 +1,6 @@
+# Dev/test dependencies (not needed at runtime on Railway/Heroku).
+#   pip install -r requirements-dev.txt
+#   pytest                      # run the suite
+#   REGEN=1 pytest tests/test_golden_reports.py   # re-capture report snapshots
+-r requirements.txt
+pytest>=8.0

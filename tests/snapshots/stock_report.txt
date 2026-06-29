@@ -1,0 +1,15 @@
+🏨 *Hotel 85 — Stock Report*
+```
+Drink       Store    Bar       Cost      Price     Margin
+---------------------------------------------------------
+Coke            0      3       ₦120       ₦200        ₦80 !
+Heineken       24     12       ₦300       ₦500       ₦200  
+---------------------------------------------------------
+TOTAL VALUE                                        ₦11,160
+```
+⚠️ *Low Bar Stock* (transfer from store):
+  • Coke
+🔴 *Store Empty* (needs restock):
+  • Coke
+
+_Updated 29 Jun 2026 14:30_
