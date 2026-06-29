@@ -7,6 +7,14 @@
 {% macro qp(period) %}/?period={{ period }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
 {% macro ex(kind) %}/export/{{ kind }}.csv?period={{ current_period }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
 {% macro stf(name) %}/?period={{ current_period }}&staff={{ name | urlencode }}{% if current_schema and session.hotels|length > 1 %}&hotel={{ current_schema }}{% endif %}{% endmacro %}
+{% macro icon(n) %}{% set paths = {
+  'wallet': '<rect x="3" y="6" width="18" height="13" rx="2.5"/><path d="M3 10h18"/><circle cx="16.5" cy="13.5" r="1.1"/>',
+  'cash': '<rect x="2.5" y="6" width="19" height="12" rx="2"/><circle cx="12" cy="12" r="2.6"/><path d="M6 12h.01"/><path d="M18 12h.01"/>',
+  'trend': '<path d="M3 16l5.5-5.5 4 4L21 7"/><path d="M16 7h5v5"/>',
+  'card': '<rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 9.5h19"/><path d="M6 15h4"/>',
+  'box': '<path d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2z"/><path d="M3 8.2l9 5 9-5"/><path d="M12 13.2V21"/>',
+  'bars': '<path d="M6 20v-7"/><path d="M12 20V5"/><path d="M18 20v-10"/>'
+} %}<svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{{ paths[n] | safe }}</svg>{% endmacro %}
 
 {% block content %}
 {% set pos = view.position %}
@@ -15,7 +23,7 @@
   <div class="card-head"><h2>What you have now <span class="muted small">· as of today</span></h2></div>
   <div class="hero-grid">
     <div>
-      <div class="cash-label">💰 Cash at hand <span class="muted">(estimate)</span></div>
+      <div class="cash-label">{{ icon('wallet') }} Cash at hand <span class="muted">(estimate)</span></div>
       <div class="cash-val {{ 'pos' if pos.cash >= 0 else 'neg' }}">{{ pos.cash | naira }}</div>
       <table class="flow">
         <tbody>
@@ -32,10 +40,10 @@
       </table>
     </div>
     <div class="assets">
-      <div class="asset"><span class="a-label">📦 Stock value</span><b>{{ pos.stock_value | naira }}</b></div>
-      <div class="asset"><span class="a-label">💳 Owed to us</span><b>{{ pos.receivables | naira }} <span class="muted small">({{ pos.outstanding_count }})</span></b></div>
-      <div class="asset"><span class="a-label">📊 Profit — this month</span><b class="{{ 'pos' if pos.month_profit >= 0 else 'neg' }}">{{ pos.month_profit | naira }}</b></div>
-      <div class="asset"><span class="a-label">📈 Profit — all-time</span><b class="{{ 'pos' if pos.profit_all >= 0 else 'neg' }}">{{ pos.profit_all | naira }}</b></div>
+      <div class="asset"><span class="a-label">{{ icon('box') }} Stock value</span><b>{{ pos.stock_value | naira }}</b></div>
+      <div class="asset"><span class="a-label">{{ icon('card') }} Owed to us</span><b>{{ pos.receivables | naira }} <span class="muted small">({{ pos.outstanding_count }})</span></b></div>
+      <div class="asset"><span class="a-label">{{ icon('bars') }} Profit — this month</span><b class="{{ 'pos' if pos.month_profit >= 0 else 'neg' }}">{{ pos.month_profit | naira }}</b></div>
+      <div class="asset"><span class="a-label">{{ icon('trend') }} Profit — all-time</span><b class="{{ 'pos' if pos.profit_all >= 0 else 'neg' }}">{{ pos.profit_all | naira }}</b></div>
     </div>
   </div>
   <p class="muted small" style="margin: 14px 0 0">Cash is an estimate (money in, minus stock bought, expenses &amp; draws). Profit excludes owner draws &amp; stock buys — it is performance, not cash in pocket.</p>
@@ -62,25 +70,25 @@
 {% set margin = (view.pnl.net_profit / view.pnl.total_revenue * 100) if view.pnl.total_revenue else 0 %}
 <section class="kpis">
   <div class="kpi">
-    <div class="ic">💵</div>
+    <div class="ic">{{ icon('cash') }}</div>
     <div class="k-label">Total Revenue</div>
     <div class="k-val">{{ view.pnl.total_revenue | naira }}</div>
     <div class="k-meta">{{ view.pnl.sales_count + view.pnl.rooms_count }} transactions</div>
   </div>
   <div class="kpi">
-    <div class="ic">📈</div>
+    <div class="ic">{{ icon('trend') }}</div>
     <div class="k-label">Net Profit</div>
     <div class="k-val {{ 'pos' if view.pnl.net_profit >= 0 else 'neg' }}">{{ view.pnl.net_profit | naira }}</div>
     <div class="k-meta">{{ '%.0f' | format(margin) }}% margin</div>
   </div>
   <div class="kpi">
-    <div class="ic">💳</div>
+    <div class="ic">{{ icon('card') }}</div>
     <div class="k-label">Owed to us</div>
     <div class="k-val">{{ view.owed.total_owed | naira }}</div>
     <div class="k-meta">{{ view.owed.outstanding_count }} debtor(s)</div>
   </div>
   <div class="kpi">
-    <div class="ic">📦</div>
+    <div class="ic">{{ icon('box') }}</div>
     <div class="k-label">Stock value</div>
     <div class="k-val">{{ view.stock_value | naira }}</div>
     <div class="k-meta">{{ view.low_stock | length }} low</div>

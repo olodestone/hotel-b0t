@@ -20,6 +20,7 @@
 </head>
 <body>
   <header class="topbar">
+    <div class="bar-inner">
     <div class="brand">
       <span class="brand-mark">🏨</span>
       <span>{{ hotel_name }}</span>
@@ -40,6 +41,7 @@
       <button id="theme-btn" class="icon-btn" type="button" aria-label="Toggle theme">🌙</button>
       {% if session %}<a class="btn ghost" href="/logout">Logout</a>{% endif %}
     </nav>
+    </div>
   </header>
 
   <main class="container">
