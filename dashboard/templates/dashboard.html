@@ -167,6 +167,38 @@
 </section>
 
 <section class="card">
+  <h2>Staff activity <span class="muted small">· who recorded what</span></h2>
+  {% if view.staff %}
+    {% set ns = namespace(dt=0, dr=0, rt=0, rr=0) %}
+    <table class="tbl">
+      <thead><tr><th>Staff</th><th class="num">Drink txns</th><th class="num">Drink rev</th><th class="num">Room txns</th><th class="num">Room rev</th></tr></thead>
+      <tbody>
+        {% for d in view.staff %}
+          {% set ns.dt = ns.dt + d.drink_txns %}{% set ns.dr = ns.dr + d.drink_revenue %}
+          {% set ns.rt = ns.rt + d.room_txns %}{% set ns.rr = ns.rr + d.room_revenue %}
+          <tr>
+            <td>{{ d.name }}</td>
+            <td class="num">{{ d.drink_txns }}</td>
+            <td class="num">{{ d.drink_revenue | naira }}</td>
+            <td class="num">{{ d.room_txns }}</td>
+            <td class="num">{{ d.room_revenue | naira }}</td>
+          </tr>
+        {% endfor %}
+        <tr class="total">
+          <td>TOTAL</td>
+          <td class="num">{{ ns.dt }}</td>
+          <td class="num">{{ ns.dr | naira }}</td>
+          <td class="num">{{ ns.rt }}</td>
+          <td class="num">{{ ns.rr | naira }}</td>
+        </tr>
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No staff activity in this period.</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>Stock on hand</h2>
   <table class="tbl">
     <thead><tr><th>Drink</th><th class="num">Bar</th><th class="num">Store</th><th class="num">Cost</th><th class="num">Value</th></tr></thead>

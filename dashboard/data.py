@@ -142,6 +142,7 @@ def dashboard_view(period_arg: str | None) -> dict:
         "alloc_pcts": {"buffer": buffer_pct, "restock": restock_pct,
                        "draw": draw_pct, "reinvest": reinvest_pct, "float": float_pct},
         "sales_breakdown": _sales_breakdown(sales, cost_map),
+        "staff": metrics.staff_breakdown(sales, rooms),
         "stock": stock,
         "stock_value": stock_value,
         "low_stock": low_stock,
