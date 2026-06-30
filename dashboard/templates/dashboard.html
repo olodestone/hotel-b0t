@@ -50,10 +50,22 @@
 </section>
 
 <div class="toolbar">
-  <div class="segmented">
-    <a class="{{ 'active' if current_period == '' }}" href="{{ qp('') }}">This month</a>
-    <a class="{{ 'active' if current_period == 'today' }}" href="{{ qp('today') }}">Today</a>
-    <a class="{{ 'active' if current_period == 'all' }}" href="{{ qp('all') }}">All-time</a>
+  <div class="toolbar-left">
+    <div class="segmented">
+      <a class="{{ 'active' if current_period == '' }}" href="{{ qp('') }}">This month</a>
+      <a class="{{ 'active' if current_period == 'today' }}" href="{{ qp('today') }}">Today</a>
+      <a class="{{ 'active' if current_period == 'all' }}" href="{{ qp('all') }}">All-time</a>
+    </div>
+    <div class="datenav">
+      <form method="get" action="/" class="inline">
+        {% if current_schema and session.hotels|length > 1 %}<input type="hidden" name="hotel" value="{{ current_schema }}">{% endif %}
+        <label class="pick" title="Pick a month">🗓<input type="month" name="period" value="{{ view.picker.month }}" onchange="this.form.submit()" aria-label="Pick month"></label>
+      </form>
+      <form method="get" action="/" class="inline">
+        {% if current_schema and session.hotels|length > 1 %}<input type="hidden" name="hotel" value="{{ current_schema }}">{% endif %}
+        <label class="pick" title="Pick a day">📅<input type="date" name="period" value="{{ view.picker.date }}" onchange="this.form.submit()" aria-label="Pick date"></label>
+      </form>
+    </div>
   </div>
   <div class="toolbar-right">
     <span class="muted small">{{ view.period_label }}</span>
@@ -61,7 +73,7 @@
       <span class="muted small">Export CSV</span>
       <a class="chip" href="{{ ex('sales') }}">Sales</a>
       <a class="chip" href="{{ ex('rooms') }}">Rooms</a>
-      <a class="chip" href="{{ ex('expenses') }}">Expenses</a>
+      {% if role == 'admin' %}<a class="chip" href="{{ ex('expenses') }}">Expenses</a>{% endif %}
       <a class="chip" href="{{ ex('debtors') }}">Debtors</a>
     </div>
   </div>
@@ -290,6 +302,111 @@
       <p class="muted small">Per-staff scopes <em>recorded revenue</em> only. "Profit" here is drink margin (revenue − stock cost) on {{ s.name }}'s sales — not the hotel's net profit, which stays hotel-wide above.</p>
     </div>
   {% endif %}
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Records <span class="muted small">· {{ view.period_label }}</span></h2>
+    <span class="muted small">every entry behind the numbers</span>
+  </div>
+  <p class="muted small" style="margin: 2px 0 14px">Expand a section to read it here — no download needed. Sales, Rooms &amp; Expenses follow the selected period; Debtors shows who currently owes.</p>
+
+  <details class="rec" open>
+    <summary>🍺 Sales <span class="muted small">· {{ view.ledger.sales | length }}</span></summary>
+    {% if view.ledger.sales %}
+      <div class="tbl-wrap">
+        <table class="tbl stack">
+          <thead><tr><th>When</th><th>ID</th><th>Drink</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Revenue</th><th>By</th></tr></thead>
+          <tbody>
+            {% for r in view.ledger.sales %}
+              <tr>
+                <td>{{ r.timestamp | when }}</td>
+                <td data-label="ID">{{ r.id }}</td>
+                <td data-label="Drink">{{ r.drink_name | title }}</td>
+                <td class="num" data-label="Qty">{{ r.quantity }}</td>
+                <td class="num" data-label="Price">{{ r.selling_price | naira }}</td>
+                <td class="num" data-label="Revenue">{{ r.total_revenue | naira }}</td>
+                <td data-label="By">{{ r.recorded_by or '—' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="muted">No sales in this period.</p>{% endif %}
+  </details>
+
+  <details class="rec">
+    <summary>🛏 Rooms <span class="muted small">· {{ view.ledger.rooms | length }}</span></summary>
+    {% if view.ledger.rooms %}
+      <div class="tbl-wrap">
+        <table class="tbl stack">
+          <thead><tr><th>When</th><th>ID</th><th>Type</th><th class="num">Qty</th><th class="num">₦/night</th><th class="num">Nights</th><th class="num">Revenue</th><th>By</th></tr></thead>
+          <tbody>
+            {% for r in view.ledger.rooms %}
+              <tr>
+                <td>{{ r.timestamp | when }}</td>
+                <td data-label="ID">{{ r.id }}</td>
+                <td data-label="Type">{{ r.room_type | title }}</td>
+                <td class="num" data-label="Qty">{{ r.quantity }}</td>
+                <td class="num" data-label="₦/night">{{ r.price_per_night | naira }}</td>
+                <td class="num" data-label="Nights">{{ r.nights }}</td>
+                <td class="num" data-label="Revenue">{{ r.total_revenue | naira }}</td>
+                <td data-label="By">{{ r.recorded_by or '—' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="muted">No room bookings in this period.</p>{% endif %}
+  </details>
+
+  {% if role == 'admin' %}
+  <details class="rec">
+    <summary>💸 Expenses <span class="muted small">· {{ view.ledger.expenses | length }}</span></summary>
+    {% if view.ledger.expenses %}
+      <div class="tbl-wrap">
+        <table class="tbl stack">
+          <thead><tr><th>When</th><th>ID</th><th>Account</th><th>Category</th><th class="num">Amount</th><th>Note</th></tr></thead>
+          <tbody>
+            {% for r in view.ledger.expenses %}
+              <tr>
+                <td>{{ r.timestamp | when }}</td>
+                <td data-label="ID">{{ r.id }}</td>
+                <td data-label="Account">{{ r.account | title }}</td>
+                <td data-label="Category">{{ r.category | title }}</td>
+                <td class="num" data-label="Amount">{{ r.amount | naira }}</td>
+                <td data-label="Note">{{ r.description or '—' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="muted">No expenses in this period.</p>{% endif %}
+  </details>
+  {% endif %}
+
+  <details class="rec">
+    <summary>🧾 Debtors <span class="muted small">· {{ view.ledger.debtors | length }} owing</span></summary>
+    {% if view.ledger.debtors %}
+      <div class="tbl-wrap">
+        <table class="tbl stack">
+          <thead><tr><th>Name</th><th>Account</th><th class="num">Amount</th><th class="num">Paid</th><th class="num">Remaining</th><th>Since</th></tr></thead>
+          <tbody>
+            {% for r in view.ledger.debtors %}
+              <tr>
+                <td>{{ r.name }}</td>
+                <td data-label="Account">{{ r.account | title }}</td>
+                <td class="num" data-label="Amount">{{ r.amount | naira }}</td>
+                <td class="num" data-label="Paid">{{ r.amount_paid | naira }}</td>
+                <td class="num" data-label="Remaining">{{ r.remaining | naira }}</td>
+                <td data-label="Since">{{ r.timestamp | when }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="muted">No outstanding debtors. 🎉</p>{% endif %}
+  </details>
 </section>
 
 <section class="card">

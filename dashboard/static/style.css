@@ -152,8 +152,37 @@ select {
 .chip:hover { border-color: var(--accent); color: var(--accent); }
 
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+.toolbar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .toolbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .menu { display: inline-flex; align-items: center; gap: 7px; }
+
+/* Month / day period pickers */
+.datenav { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pick {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  border-radius: 10px; padding: 5px 10px; color: var(--ink-2); cursor: pointer;
+}
+.pick:hover { border-color: var(--accent); }
+.pick input { border: none; background: transparent; color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; padding: 1px 0; }
+.pick input:focus { outline: none; }
+.pick input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .6; }
+
+/* Collapsible record tables */
+.rec { border-top: 1px solid var(--border); }
+.rec:first-of-type { border-top: none; }
+.rec > summary {
+  cursor: pointer; list-style: none; padding: 12px 2px; font-weight: 700; font-size: 14.5px;
+  display: flex; align-items: center; gap: 8px;
+}
+.rec > summary::-webkit-details-marker { display: none; }
+.rec > summary::before {
+  content: "›"; display: inline-block; font-size: 18px; color: var(--muted);
+  transition: transform .15s ease; transform: rotate(0deg);
+}
+.rec[open] > summary::before { transform: rotate(90deg); }
+.rec > summary:hover { color: var(--accent); }
+.rec[open] { padding-bottom: 12px; }
 
 /* ── Hero (what you have now) ────────────────────────────────────────── */
 .hero { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px 22px; }

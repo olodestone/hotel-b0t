@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import database as db
+import metrics
 from . import auth, data, settings
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,6 +44,15 @@ app = FastAPI(title=f"{settings.HOTEL_NAME} Dashboard", docs_url=None, redoc_url
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 templates.env.filters["naira"] = lambda v: f"₦{float(v or 0):,.0f}"
+
+
+def _fmt_when(raw) -> str:
+    """Render a record timestamp as 'DD Mon · HH:MM' for the in-browser tables."""
+    dt = metrics.parse_ts(raw)
+    return dt.strftime("%d %b · %H:%M") if dt else str(raw or "")
+
+
+templates.env.filters["when"] = _fmt_when
 
 
 class _NeedsLogin(Exception):
@@ -79,7 +89,21 @@ def require_tenant(request: Request):
     try:
         yield sess
     finally:
-        db._hotel_schema_var.reset(tok)
+        # On the normal path set() and reset() share a context, so this restores
+        # the previous value. But when the endpoint RAISES after the yield,
+        # FastAPI runs this cleanup via gen.throw() in a different context (sync
+        # generator deps run in a threadpool); reset(tok) then raises a spurious
+        # ValueError that would mask the real HTTPException as a 500. Swallow it —
+        # that other context is discarded with the failed request, so nothing leaks.
+        try:
+            db._hotel_schema_var.reset(tok)
+        except ValueError:
+            db._hotel_schema_var.set("")
+
+
+def _role_for(sess: dict, schema) -> str:
+    """Role for the currently-selected hotel (falls back to the session default)."""
+    return next((h["role"] for h in sess["hotels"] if h["schema"] == schema), sess.get("role"))
 
 
 def _ctx(request: Request, sess: dict | None, **extra) -> dict:
@@ -154,8 +178,7 @@ async def logout():
 @app.get("/", response_class=HTMLResponse)
 async def dashboard_home(request: Request, period: str | None = None, staff: str | None = None,
                          sess: dict = Depends(require_tenant)):
-    # role of the currently selected hotel
-    role = next((h["role"] for h in sess["hotels"] if h["schema"] == request.state.schema), sess["role"])
+    role = _role_for(sess, request.state.schema)
     view = data.dashboard_view(period, staff=staff)
     return templates.TemplateResponse(request, "dashboard.html", _ctx(
         request, sess, view=view, role=role,
@@ -166,6 +189,10 @@ async def dashboard_home(request: Request, period: str | None = None, staff: str
 @app.get("/export/{kind}.csv")
 async def export_csv(kind: str, request: Request, period: str | None = None,
                      sess: dict = Depends(require_tenant)):
+    # Itemised expenses are admin-only (mirrors the bot: staff see expense totals
+    # in /report but not the per-row breakdown in /history).
+    if kind == "expenses" and _role_for(sess, request.state.schema) != "admin":
+        raise HTTPException(status_code=403, detail="admins only")
     result = data.export_dataset(kind, period)
     if result is None:
         raise HTTPException(status_code=404, detail="unknown export")

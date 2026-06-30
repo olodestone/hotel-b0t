@@ -95,6 +95,24 @@ def _recorder(r) -> str:
     return (r.get("recorded_by") or "Unknown").strip() or "Unknown"
 
 
+def _by_time_desc(rows) -> list[dict]:
+    """Newest-first ordering for a raw record table (string sort is chronological
+    for ``YYYY-MM-DD HH:MM:SS`` timestamps)."""
+    return sorted(rows, key=lambda r: str(r.get("timestamp") or ""), reverse=True)
+
+
+def _outstanding_debtors(debtor_rows) -> list[dict]:
+    """Outstanding debtors (matches /debtors + the CSV export) with each one's
+    remaining balance, newest first."""
+    out = []
+    for r in debtor_rows:
+        if r.get("status") != "outstanding":
+            continue
+        rem = round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
+        out.append({**r, "remaining": rem})
+    return _by_time_desc(out)
+
+
 def _sales_breakdown(sales_rows, cost_map) -> list[dict]:
     """Per-drink qty / revenue / cost / profit for the period (matches /sales_report)."""
     totals: dict[str, dict] = {}
@@ -165,6 +183,22 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
 
     view = {
         "period_label": _period_label(for_date, for_month, all_time),
+        # Pre-fills for the date / month period pickers — non-empty only when the
+        # current period IS that kind of selection (so the inputs reflect where
+        # you are, and the quick-segment buttons stay the source of truth otherwise).
+        "picker": {
+            "date": for_date.isoformat() if for_date else "",
+            "month": (f"{for_month[0]:04d}-{for_month[1]:02d}" if for_month else ""),
+        },
+        # Raw records for the period — viewable in-browser instead of CSV-only.
+        # Sales/Rooms/Expenses follow the selected period; debtors are outstanding
+        # balances "as of now" (matches /debtors and the debtors export).
+        "ledger": {
+            "sales": _by_time_desc(sales),
+            "rooms": _by_time_desc(rooms),
+            "expenses": _by_time_desc(expenses),
+            "debtors": _outstanding_debtors(debtors),
+        },
         "pnl": pnl,
         "owed": owed,
         "allocation": allocation,

@@ -73,3 +73,16 @@ Live. A "what you have now" cash-at-hand / stock / receivables / profit snapshot
 allocation (set-asides + profit distribution), sales-by-drink, staff activity,
 stock, and outstanding debtors — with a hotel switcher for multi-hotel users and
 CSV export. Every figure matches the bot's reports (shared `metrics.py`).
+
+Any period is browsable: the quick segments (This month / Today / All-time) sit
+beside a **month picker** and a **day picker**, so you can jump to any prior month
+or specific date. A **Records** section renders the raw Sales, Rooms, Expenses and
+Debtors entries for the selected period right in the browser (collapsible tables) —
+viewing no longer requires a CSV download, though the export buttons remain.
+
+The itemised **Expenses** table and its CSV export are **admin-only** (enforced
+both in the template and server-side on `/export/expenses.csv`), mirroring the
+bot: staff see expense *totals* in the P&L but not the per-row breakdown. Access
+itself is authorization-gated — a verified Telegram login only proves identity;
+the account must be the hotel's owner, in its admin list, or in its `users` table
+(staff/admin) to get in, otherwise it is bounced with "no hotel access".

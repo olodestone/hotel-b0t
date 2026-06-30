@@ -11,7 +11,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from dashboard import auth, data
+from dashboard import auth, data, settings
 from dashboard.app import app
 
 client = TestClient(app)
@@ -149,6 +149,134 @@ def test_dashboard_template_renders_staff_focus():
     assert "Focus: john" in html
     assert "clear filter" in html
     assert "&staff=mary" in html          # other staff still linkable to switch focus
+
+
+def test_dashboard_view_ledger_records():
+    # Raw records are exposed for in-browser viewing (not CSV-only).
+    led = data.dashboard_view("all")["ledger"]
+    # Period-filtered + active (deleted sale id=5 dropped), newest-first.
+    assert [r["id"] for r in led["sales"]] == [3, 2, 1, 4]
+    assert [r["id"] for r in led["rooms"]] == [2, 1, 3]
+    assert {r["id"] for r in led["expenses"]} == {1, 2, 3, 4, 5, 6, 7}   # all-time incl. restock (id=5)
+    # Debtors: outstanding only, each with a computed remaining balance.
+    debtors = {r["name"]: r for r in led["debtors"]}
+    assert "paid guy" not in debtors                 # fully-paid debtor excluded
+    assert debtors["sam"]["remaining"] == 3000       # 5000 owed − 2000 paid
+    assert debtors["acme corp"]["remaining"] == 30000
+
+
+def test_dashboard_view_previous_month():
+    # Navigating to a prior month scopes every record + figure to that month.
+    view = data.dashboard_view("2026-05")
+    assert view["period_label"] == "May 2026"
+    assert view["picker"] == {"month": "2026-05", "date": ""}
+    assert [r["id"] for r in view["ledger"]["sales"]] == [4]   # only the May sale
+    assert view["pnl"].total_revenue == 16000                  # 1000 drink + 15000 room (May)
+
+
+def test_dashboard_view_specific_date_picker():
+    view = data.dashboard_view("2026-06-20")
+    assert view["picker"] == {"month": "", "date": "2026-06-20"}
+    assert [r["id"] for r in view["ledger"]["sales"]] == [3]   # the 06-20 coke sale
+
+
+def test_dashboard_template_renders_records_and_pickers():
+    from dashboard.app import templates
+    view = data.dashboard_view("all")
+    session = {"username": "dev", "role": "admin",
+               "hotels": [{"schema": "hotel85", "name": "Hotel 85", "role": "admin"}]}
+    html = templates.get_template("dashboard.html").render(
+        request=None, hotel_name="Hotel 85", session=session,
+        current_schema="hotel85", view=view, role="admin", current_period="all",
+    )
+    assert "Records" in html
+    assert 'type="month"' in html and 'type="date"' in html    # previous-month / date pickers
+    assert "🍺 Sales" in html and "🧾 Debtors" in html
+    assert "acme corp" in html        # a raw debtor name now visible in-browser, not download-only
+    assert "20 Jun" in html           # formatted record timestamp (the 06-20 sale)
+
+
+def _render(role: str, **ctx) -> str:
+    from dashboard.app import templates
+    view = data.dashboard_view("all")
+    session = {"username": "dev", "role": role,
+               "hotels": [{"schema": "hotel85", "name": "Hotel 85", "role": role}]}
+    return templates.get_template("dashboard.html").render(
+        request=None, hotel_name="Hotel 85", session=session,
+        current_schema="hotel85", view=view, role=role, current_period="", **ctx,
+    )
+
+
+def test_expenses_table_hidden_from_staff():
+    admin_html = _render("admin")
+    assert "💸 Expenses" in admin_html          # itemised expenses visible to admin
+    assert ">Expenses</a>" in admin_html         # and the CSV chip
+
+    staff_html = _render("staff")
+    assert "💸 Expenses" not in staff_html       # hidden from staff (mirrors /history)
+    assert ">Expenses</a>" not in staff_html      # no expenses CSV chip either
+    assert "🍺 Sales" in staff_html               # other records still visible to staff
+
+
+def _login_cookie(role: str):
+    """Forge a signed session cookie for an authenticated request in tests."""
+    payload = {"tid": 1, "username": role, "role": role,
+               "hotels": [{"schema": "hotel85", "name": "Hotel 85", "role": role}],
+               "schema": "hotel85"}
+    return {settings.SESSION_COOKIE: auth.serialize_session(payload)}
+
+
+def test_export_expenses_route_gated_to_admin():
+    # Staff is blocked server-side even hitting the URL directly...
+    r = client.get("/export/expenses.csv?period=all", cookies=_login_cookie("staff"))
+    assert r.status_code == 403
+    # ...but other exports still work for staff, and admin can export expenses.
+    assert client.get("/export/sales.csv?period=all", cookies=_login_cookie("staff")).status_code == 200
+    assert client.get("/export/expenses.csv?period=all", cookies=_login_cookie("admin")).status_code == 200
+
+
+def test_unknown_export_returns_404_not_500():
+    # Guards the require_tenant cleanup fix: an HTTPException raised after the
+    # dependency yields must surface as its real status, not a masked 500.
+    r = client.get("/export/nonsense.csv?period=all", cookies=_login_cookie("admin"))
+    assert r.status_code == 404
+
+
+# ── Access control: only owner / admins / users-table members get in ──
+
+def test_resolve_access_rejects_unknown_telegram_user(monkeypatch):
+    # One hotel; the logged-in stranger is NOT its owner and NOT in admin_ids.
+    monkeypatch.setattr(auth, "_hotels_meta", lambda: [
+        {"schema": "hotel85", "name": "Hotel 85", "owner": 999, "admin_ids": ""}])
+    monkeypatch.setattr(auth.settings, "OWNER_ID", None)
+    monkeypatch.setattr(auth.settings, "ADMIN_IDS", [])
+
+    # Stranger absent from the hotel's users table → no access at all.
+    monkeypatch.setattr(auth.db, "get_user", lambda tid: None)
+    assert auth.resolve_access(12345) == []
+
+    # A user present in the users table → access with that exact role.
+    monkeypatch.setattr(auth.db, "get_user", lambda tid: {"role": "staff"})
+    assert auth.resolve_access(12345) == [
+        {"schema": "hotel85", "name": "Hotel 85", "role": "staff"}]
+
+    # The hotel owner is always an admin, even without a users-table row.
+    monkeypatch.setattr(auth.db, "get_user", lambda tid: None)
+    assert auth.resolve_access(999) == [
+        {"schema": "hotel85", "name": "Hotel 85", "role": "admin"}]
+
+
+def test_login_rejected_for_telegram_user_without_access(monkeypatch):
+    # A genuine, correctly-signed Telegram login still gets bounced if the
+    # account maps to no hotel — identity verified ≠ authorized.
+    token = "123456:LOGINTOKEN"
+    monkeypatch.setattr(settings, "LOGIN_BOT_TOKEN", token)
+    monkeypatch.setattr(auth, "resolve_access", lambda tid: [])
+    payload = _signed_login(token, id="777", first_name="Stranger")
+    r = client.get("/auth/telegram", params=payload, follow_redirects=False)
+    assert r.status_code == 303
+    assert "no+hotel+access" in r.headers["location"]
+    assert settings.SESSION_COOKIE not in r.cookies      # no session granted
 
 
 def test_export_dataset():
