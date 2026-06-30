@@ -76,7 +76,11 @@ CSV export. Every figure matches the bot's reports (shared `metrics.py`).
 
 Any period is browsable: the quick segments (This month / Today / All-time) sit
 beside a **month picker** and a **day picker**, so you can jump to any prior month
-or specific date. A **Records** section renders the raw Sales, Rooms, Expenses and
+or specific date. Changing the period or staff filter **swaps just the affected
+region in place** (fetched from `GET /partial/period`) instead of reloading the
+whole page — scroll position and the "what you have now" card are preserved, and
+the URL still updates so links/back-forward work. JS-off or on fetch error it
+falls back to a normal full navigation. A **Records** section renders the raw Sales, Rooms, Expenses and
 Debtors entries for the selected period right in the browser (collapsible tables) —
 viewing no longer requires a CSV download, though the export buttons remain.
 

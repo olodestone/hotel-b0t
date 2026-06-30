@@ -158,11 +158,14 @@ def test_dashboard_view_ledger_records():
     assert [r["id"] for r in led["sales"]] == [3, 2, 1, 4]
     assert [r["id"] for r in led["rooms"]] == [2, 1, 3]
     assert {r["id"] for r in led["expenses"]} == {1, 2, 3, 4, 5, 6, 7}   # all-time incl. restock (id=5)
-    # Debtors: outstanding only, each with a computed remaining balance.
+    # Debtors: outstanding only, each with a computed remaining balance + the
+    # staff responsible for the sale (staff_name, NOT the admin who recorded it).
     debtors = {r["name"]: r for r in led["debtors"]}
     assert "paid guy" not in debtors                 # fully-paid debtor excluded
     assert debtors["sam"]["remaining"] == 3000       # 5000 owed − 2000 paid
+    assert debtors["sam"]["staff"] == "Peter"        # the seller, not recorder "john"
     assert debtors["acme corp"]["remaining"] == 30000
+    assert debtors["acme corp"]["staff"] == "—"      # no seller set → dash
 
 
 def test_dashboard_view_previous_month():
@@ -193,6 +196,7 @@ def test_dashboard_template_renders_records_and_pickers():
     assert 'type="month"' in html and 'type="date"' in html    # previous-month / date pickers
     assert "🍺 Sales" in html and "🧾 Debtors" in html
     assert "acme corp" in html        # a raw debtor name now visible in-browser, not download-only
+    assert "Peter" in html            # the staff responsible shown beside their debtor
     assert "20 Jun" in html           # formatted record timestamp (the 06-20 sale)
 
 
@@ -233,6 +237,32 @@ def test_export_expenses_route_gated_to_admin():
     # ...but other exports still work for staff, and admin can export expenses.
     assert client.get("/export/sales.csv?period=all", cookies=_login_cookie("staff")).status_code == 200
     assert client.get("/export/expenses.csv?period=all", cookies=_login_cookie("admin")).status_code == 200
+
+
+def test_full_page_has_swappable_period_region():
+    # The full page keeps the period-independent shell (hero) and wraps the
+    # period-dependent region in the container the client swaps in place.
+    r = client.get("/", cookies=_login_cookie("admin"))
+    assert r.status_code == 200
+    assert 'id="period-content"' in r.text
+    assert "What you have now" in r.text      # hero stays outside the swap region
+    assert "Records" in r.text                 # period region rendered on first load
+
+
+def test_period_partial_returns_fragment_only():
+    # The partial endpoint returns just the period region — no page chrome — so
+    # the client can drop it straight into #period-content.
+    r = client.get("/partial/period?period=2026-05", cookies=_login_cookie("admin"))
+    assert r.status_code == 200
+    assert "Profit &amp; Loss" in r.text and "Records" in r.text   # period content present
+    assert "<html" not in r.text.lower()       # not a full document
+    assert "What you have now" not in r.text    # hero is NOT re-sent on every swap
+
+
+def test_period_partial_requires_auth():
+    r = client.get("/partial/period?period=all", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/login"
 
 
 def test_unknown_export_returns_404_not_500():
@@ -284,8 +314,9 @@ def test_export_dataset():
     assert "total_revenue" in cols
     assert len(rows) == 4              # 4 active (non-deleted) sales all-time
     assert data.export_dataset("nonsense", "all") is None
-    _, debtors = data.export_dataset("debtors", None)
+    dcols, debtors = data.export_dataset("debtors", None)
     assert all(r["status"] == "outstanding" for r in debtors)
+    assert "staff_name" in dcols       # responsible staff included in the debtors export
 
 
 def test_parse_period_variants():

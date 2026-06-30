@@ -103,13 +103,18 @@ def _by_time_desc(rows) -> list[dict]:
 
 def _outstanding_debtors(debtor_rows) -> list[dict]:
     """Outstanding debtors (matches /debtors + the CSV export) with each one's
-    remaining balance, newest first."""
+    remaining balance and the staff responsible for the sale, newest first.
+
+    ``staff`` is the debt's ``staff_name`` (who sold/booked) — NOT ``recorded_by``
+    (who keyed the entry, usually an admin). Mirrors the bot's "(by …)" tag.
+    """
     out = []
     for r in debtor_rows:
         if r.get("status") != "outstanding":
             continue
         rem = round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
-        out.append({**r, "remaining": rem})
+        staff = str(r.get("staff_name") or "").strip()
+        out.append({**r, "remaining": rem, "staff": staff.title() if staff else "—"})
     return _by_time_desc(out)
 
 
@@ -224,7 +229,7 @@ _EXPORTS = {
     "sales":    (["timestamp", "drink_name", "quantity", "selling_price", "total_revenue", "recorded_by"], "sales", True),
     "rooms":    (["timestamp", "room_type", "quantity", "price_per_night", "nights", "total_revenue", "recorded_by"], "rooms", True),
     "expenses": (["timestamp", "account", "category", "amount", "description"], "expenses", True),
-    "debtors":  (["timestamp", "account", "name", "amount", "amount_paid", "description", "status"], "debtors", False),
+    "debtors":  (["timestamp", "account", "name", "staff_name", "amount", "amount_paid", "description", "status"], "debtors", False),
 }
 
 

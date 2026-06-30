@@ -168,6 +168,10 @@ select {
 .pick input:focus { outline: none; }
 .pick input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .6; }
 
+/* Period region while a partial swap is in flight */
+#period-content { transition: opacity .12s ease; }
+#period-content.is-loading { opacity: .5; pointer-events: none; }
+
 /* Collapsible record tables */
 .rec { border-top: 1px solid var(--border); }
 .rec:first-of-type { border-top: none; }

@@ -66,7 +66,7 @@ def _dataset() -> dict:
             {"id": 7, "timestamp": "2026-05-25 12:00:00", "account": "bar",   "category": "utilities", "amount": 9999,  "description": "prior month", "deleted_at": None},
         ],
         "debtors": [
-            {"id": 1, "timestamp": "2026-06-08 17:00:00", "account": "bar",   "name": "sam",       "amount": 5000,  "amount_paid": 2000, "description": "tab",   "status": "outstanding", "paid_at": None, "recorded_by": "john"},
+            {"id": 1, "timestamp": "2026-06-08 17:00:00", "account": "bar",   "name": "sam",       "amount": 5000,  "amount_paid": 2000, "description": "tab",   "status": "outstanding", "paid_at": None, "recorded_by": "john", "staff_name": "peter"},
             {"id": 2, "timestamp": "2026-06-14 17:00:00", "account": "rooms", "name": "acme corp", "amount": 30000, "amount_paid": 0,    "description": "event", "status": "outstanding", "paid_at": None, "recorded_by": "mary"},
             {"id": 3, "timestamp": "2026-06-02 17:00:00", "account": "bar",   "name": "paid guy",  "amount": 1000,  "amount_paid": 1000, "description": "",      "status": "paid", "paid_at": "2026-06-03 10:00:00", "recorded_by": "john"},
         ],

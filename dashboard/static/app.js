@@ -1,4 +1,5 @@
-/* Dashboard client behaviour: theme toggle + themed revenue chart. */
+/* Dashboard client behaviour: theme toggle, themed revenue chart, and
+   partial (no full-reload) period/staff navigation. */
 (function () {
   "use strict";
 
@@ -65,12 +66,75 @@
     buildTrend();
   }
 
+  // ── Partial period/staff navigation (swap #period-content, no full reload) ──
+
+  // Build a clean "/?period=…&staff=…" URL from one of the toolbar/staff forms,
+  // dropping empty values so the address bar stays tidy.
+  function navUrlFromForm(form) {
+    var raw = new URLSearchParams(new FormData(form));
+    var clean = new URLSearchParams();
+    raw.forEach(function (v, k) { if (v !== "") clean.append(k, v); });
+    var qs = clean.toString();
+    return qs ? "/?" + qs : "/";
+  }
+
+  var inFlight = null;
+  function loadPeriod(navUrl, push) {
+    var container = document.getElementById("period-content");
+    if (!container) { window.location.href = navUrl; return; }
+    var base = container.getAttribute("data-partial") || "/partial/period";
+    var search = "";
+    try { search = new URL(navUrl, window.location.origin).search; } catch (e) { search = ""; }
+
+    container.classList.add("is-loading");
+    var token = {};
+    inFlight = token;
+    fetch(base + search, { credentials: "same-origin", headers: { "X-Partial": "1" } })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+      .then(function (html) {
+        if (inFlight !== token) return;          // a newer request superseded this one
+        if (chart) { chart.destroy(); chart = null; }
+        container.innerHTML = html;
+        container.classList.remove("is-loading");
+        if (push !== false) history.pushState({ period: true }, "", navUrl);
+        buildTrend();
+      })
+      .catch(function () {
+        if (inFlight !== token) return;
+        window.location.href = navUrl;            // graceful fallback to a full load
+      });
+  }
+
+  function wirePartialNav() {
+    // Period/staff links (quick segments, staff drill-down, clear-filter).
+    document.addEventListener("click", function (e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      var a = e.target.closest ? e.target.closest("a.js-period") : null;
+      if (!a) return;
+      e.preventDefault();
+      loadPeriod(a.getAttribute("href"), true);
+    });
+    // Date / month pickers and the staff <select> (they live in .js-period-form).
+    document.addEventListener("change", function (e) {
+      var el = e.target;
+      if (!el.name || (el.name !== "period" && el.name !== "staff")) return;
+      var form = el.closest ? el.closest("form.js-period-form") : null;
+      if (!form) return;
+      loadPeriod(navUrlFromForm(form), true);
+    });
+    // Back / forward — re-render the region for the URL without pushing state.
+    window.addEventListener("popstate", function () {
+      loadPeriod(window.location.pathname + window.location.search, false);
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     var b = document.getElementById("theme-btn");
     if (b) {
       b.textContent = theme() === "dark" ? "☀️" : "🌙";
       b.addEventListener("click", function () { setTheme(theme() === "dark" ? "light" : "dark"); });
     }
+    wirePartialNav();
     buildTrend();
   });
 })();

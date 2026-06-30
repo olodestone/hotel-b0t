@@ -186,6 +186,19 @@ async def dashboard_home(request: Request, period: str | None = None, staff: str
     ))
 
 
+@app.get("/partial/period", response_class=HTMLResponse)
+async def period_partial(request: Request, period: str | None = None, staff: str | None = None,
+                         sess: dict = Depends(require_tenant)):
+    """Just the period-dependent region (toolbar → records → stock), for the
+    client to swap in place without a full page reload. Same data path as `/`."""
+    role = _role_for(sess, request.state.schema)
+    view = data.dashboard_view(period, staff=staff)
+    return templates.TemplateResponse(request, "_period.html", _ctx(
+        request, sess, view=view, role=role,
+        current_period=(period or ""), current_staff=(staff or ""),
+    ))
+
+
 @app.get("/export/{kind}.csv")
 async def export_csv(kind: str, request: Request, period: str | None = None,
                      sess: dict = Depends(require_tenant)):
