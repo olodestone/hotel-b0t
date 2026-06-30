@@ -156,6 +156,21 @@ def process_add_debtor(account: str, name: str, amount: float, description: str 
     )
 
 
+def process_set_debt_staff(debt_id: int, staff_name: str) -> tuple[bool, str]:
+    """Reassign / correct the staff responsible for an existing debt.
+
+    Used when a debt was logged against the wrong staff member. Relabel-only:
+    it just updates ``staff_name`` on that one row — amounts and the debtor are
+    untouched. Returns ``(False, …)`` on an empty name or unknown debt id.
+    """
+    name = staff_name.strip()
+    if not name:
+        return False, "❌ Staff name cannot be empty"
+    if db.update_debt_staff_name(debt_id, name):
+        return True, f"✅ Debt `#{debt_id}` — staff updated to *{reports._esc(name.title())}*"
+    return False, f"❌ No debt found with ID `#{debt_id}`"
+
+
 def process_pay_debtor(account: str, name: str, paid_by: str = "", amount: float | None = None) -> tuple[bool, str]:
     if account.lower() not in VALID_ACCOUNTS:
         return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"

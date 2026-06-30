@@ -257,6 +257,17 @@ async def _send_chunk_cb(q, text: str) -> None:
         await q.message.reply_text(text)
 
 
+async def _edit_cb(q, text: str) -> None:
+    """Edit a callback message, falling back to plain text if MarkdownV2 parsing fails."""
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception:
+        try:
+            await q.edit_message_text(text)
+        except Exception:
+            pass
+
+
 async def _reply_long_cb(q, text: str) -> None:
     """Send a long reply from a CallbackQuery context."""
     limit = 4000
@@ -810,11 +821,8 @@ async def cmd_set_debt_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     staff_name = " ".join(args[1:])
-    updated = db.update_debt_staff_name(debt_id, staff_name)
-    if updated:
-        await _reply(update, f"✅ Debt `#{debt_id}` — staff set to *{reports._esc(staff_name.title())}*.")
-    else:
-        await _reply(update, f"❌ No debt found with ID `#{debt_id}`.")
+    _ok, msg = logic.process_set_debt_staff(debt_id, staff_name)
+    await _reply(update, msg)
 
 
 # ── /debtor_history ───────────────────────────────────────────────────
@@ -1970,6 +1978,7 @@ _DEB_STAFF = 60  # add-debtor flow: "who served them?" step (after note, before 
 _DRW_AMT, _DRW_NOTE = range(61, 63)  # owner-draw flow: amount → optional note
 _SCS_DRINK, _SCS_COST = range(63, 65)  # set-cost flow: pick drink → new cost price
 _SMN_OLD, _SMN_NEW = range(65, 67)  # staff-merge flow: pick duplicate → name to keep
+_DSF_DEBT, _DSF_STAFF = range(67, 69)  # edit-debt-staff flow: pick debt → pick/type correct staff
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -3569,6 +3578,86 @@ async def _smn_new_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Edit a debt's responsible staff ───────────────────────────────────
+# Correct the "who served them" attribution on an existing debt when it was
+# logged against the wrong staff. Debt IDs are ints → safe in callback_data;
+# the staff list reuses _staff_keyboard (Telegram usernames, no colons/spaces).
+
+_DSF_MAX = 60  # cap the debt picker so the inline keyboard stays usable
+
+
+@_require_admin
+async def _dsf_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    debts = list(reversed(db.get_debtors()))  # outstanding, newest first
+    if not debts:
+        await q.edit_message_text("✅ No outstanding debts to edit.")
+        return ConversationHandler.END
+    rows = []
+    for d in debts[:_DSF_MAX]:
+        rem = float(d["amount"]) - float(d.get("amount_paid") or 0)
+        cur = str(d.get("staff_name") or "").strip() or "—"
+        label = f"{str(d['name']).title()} · {d['account']} ₦{rem:,.0f} · 👤{cur}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"dsf:debt:{d['id']}")])
+    note = "" if len(debts) <= _DSF_MAX else f"\n\n_Showing the {_DSF_MAX} most recent of {len(debts)} — use /set\\_debt\\_staff for older ones_"
+    await q.edit_message_text(
+        "✏️ *Edit debt's staff*\n\nPick the debt to fix \\(shows current staff\\):" + note,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _DSF_DEBT
+
+
+async def _dsf_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    debt_id = int(q.data.rsplit(":", 1)[1])
+    ctx.user_data["dsf_debt_id"] = debt_id
+    await q.edit_message_text(
+        f"✏️ Debt `#{debt_id}` — who is *actually* responsible?\n\n"
+        "Tap the correct staff member, or ✏️ Other to type a name:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_staff_keyboard("dsf_st"),
+    )
+    return _DSF_STAFF
+
+
+async def _dsf_pick_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data.split(":", 1)[1]
+    if val == "__other__":
+        await q.edit_message_text("✏️ Type the correct staff member's name:")
+        return _DSF_STAFF
+    if val == "__skip__":
+        ctx.user_data.pop("dsf_debt_id", None)
+        await q.edit_message_text("Cancelled — no change made.")
+        return ConversationHandler.END
+    debt_id = ctx.user_data.pop("dsf_debt_id", None)
+    if debt_id is None:
+        await q.edit_message_text("❌ Selection expired — open Debtors again.")
+        return ConversationHandler.END
+    _ok, msg = logic.process_set_debt_staff(debt_id, val)
+    await _edit_cb(q, msg)
+    return ConversationHandler.END
+
+
+async def _dsf_staff_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    debt_id = ctx.user_data.pop("dsf_debt_id", None)
+    kb = _get_keyboard(update.effective_user.id)
+    if debt_id is None:
+        await update.message.reply_text("❌ Selection expired — open Debtors again.", reply_markup=kb)
+        return ConversationHandler.END
+    _ok, msg = logic.process_set_debt_staff(debt_id, name)
+    try:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    except Exception:
+        await update.message.reply_text(msg, reply_markup=kb)
+    return ConversationHandler.END
+
+
 async def _sst_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
@@ -4182,6 +4271,8 @@ async def _btn_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for name in staff_list:
         buttons.append([InlineKeyboardButton(f"👤 {name.title()}", callback_data=f"dbt:staff:{name}")])
     buttons.append([InlineKeyboardButton("📋 All Debtors", callback_data="dbt:all")])
+    if _is_admin(update.effective_user.id):
+        buttons.append([InlineKeyboardButton("✏️ Edit debt's staff", callback_data="dsf:start")])
     await update.message.reply_text(
         "💳 *Debtors — View by:*",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -4565,6 +4656,18 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    dsf_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_dsf_start, pattern="^dsf:start$")],
+        states={
+            _DSF_DEBT: [CallbackQueryHandler(_dsf_pick_debt, pattern="^dsf:debt:")],
+            _DSF_STAFF: [
+                CallbackQueryHandler(_dsf_pick_staff, pattern="^dsf_st:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _dsf_staff_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     sst_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_sst_start, pattern="^fix:setstock$")],
         states={
@@ -4607,7 +4710,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     )
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
-                 rnm_conv, smn_conv, sst_conv, scs_conv, ddr_conv):
+                 rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
