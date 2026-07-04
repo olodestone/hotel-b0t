@@ -354,6 +354,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Temporary diagnostic: no auth gate, reports how this bot resolves admin state."""
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        "uid=" + str(uid) + "\n"
+        "bot_data.schema=" + str(ctx.bot_data.get("schema")) + "\n"
+        "bot_data.admin_ids=" + str(ctx.bot_data.get("admin_ids")) + "\n"
+        "active_admin_ids=" + str(_active_admin_ids.get()) + "\n"
+        "hotel_schema_var=" + str(db._hotel_schema_var.get()) + "\n"
+        "is_admin=" + str(_is_admin(uid))
+    )
+
+
 def _help_text(is_admin: bool = False) -> str:
     staff_cmds = (
         "*📌 Recording*\n"
@@ -4734,6 +4747,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
 
     app.add_handler(CommandHandler("setup", _cmd_setup))
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("sell_drink", cmd_sell_drink))
     app.add_handler(CommandHandler("setprice", cmd_setprice))
