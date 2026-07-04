@@ -135,18 +135,6 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         conn.execute(text(
             "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS selling_price FLOAT NOT NULL DEFAULT 0"
         ))
-        # Back-fill selling_price from the most recent sale per drink (one-time, safe to re-run)
-        conn.execute(text("""
-            UPDATE inventory
-            SET selling_price = s.selling_price
-            FROM (
-                SELECT DISTINCT ON (lower(drink_name)) lower(drink_name) AS drink_key, selling_price
-                FROM sales
-                ORDER BY lower(drink_name), timestamp DESC
-            ) s
-            WHERE lower(inventory.drink_name) = s.drink_key
-            AND inventory.selling_price = 0
-        """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sales (
                 id              SERIAL PRIMARY KEY,
@@ -157,6 +145,19 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
                 total_revenue   FLOAT,
                 recorded_by     TEXT DEFAULT ''
             )
+        """))
+        # Back-fill selling_price from the most recent sale per drink (one-time, safe to re-run).
+        # Must run after `sales` is created above - it reads from that table.
+        conn.execute(text("""
+            UPDATE inventory
+            SET selling_price = s.selling_price
+            FROM (
+                SELECT DISTINCT ON (lower(drink_name)) lower(drink_name) AS drink_key, selling_price
+                FROM sales
+                ORDER BY lower(drink_name), timestamp DESC
+            ) s
+            WHERE lower(inventory.drink_name) = s.drink_key
+            AND inventory.selling_price = 0
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS rooms (
