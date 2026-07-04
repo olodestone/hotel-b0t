@@ -272,6 +272,43 @@ def test_unknown_export_returns_404_not_500():
     assert r.status_code == 404
 
 
+def _multi_hotel_cookie():
+    """A session with access to two distinct hotel schemas, to prove ?hotel=
+    actually changes which schema is queried (not just which one is displayed)."""
+    payload = {"tid": 1, "username": "owner", "role": "admin",
+               "hotels": [{"schema": "hotel_a", "name": "Hotel A", "role": "admin"},
+                          {"schema": "hotel_b", "name": "Hotel B", "role": "admin"}],
+               "schema": "hotel_a"}
+    return {settings.SESSION_COOKIE: auth.serialize_session(payload)}
+
+
+def test_hotel_switch_reaches_the_real_request_context(monkeypatch):
+    """require_tenant must be an async generator: FastAPI resolves sync-generator
+    dependencies via anyio.to_thread.run_sync, which runs the pre-yield code in a
+    *copy* of the current context — so db._hotel_schema_var.set() there would
+    never be visible to the route handler, and every request would silently fall
+    back to the process's default HOTEL_SCHEMA regardless of ?hotel=. Assert the
+    schema active *inside* the route handler's own call into data.dashboard_view
+    matches whatever ?hotel= requested, proving the set() really propagated."""
+    import database as db
+
+    seen_schemas = []
+
+    def fake_dashboard_view(period_arg, staff=None):
+        seen_schemas.append(db._hotel_schema_var.get())
+        return data_view_stub
+
+    data_view_stub = data.dashboard_view("all")  # a real view to keep rendering happy
+    monkeypatch.setattr(data, "dashboard_view", fake_dashboard_view)
+
+    cookies = _multi_hotel_cookie()
+    r_a = client.get("/?hotel=hotel_a", cookies=cookies)
+    r_b = client.get("/?hotel=hotel_b", cookies=cookies)
+
+    assert r_a.status_code == 200 and r_b.status_code == 200
+    assert seen_schemas == ["hotel_a", "hotel_b"]
+
+
 # ── Access control: only owner / admins / users-table members get in ──
 
 def test_resolve_access_rejects_unknown_telegram_user(monkeypatch):
@@ -317,6 +354,29 @@ def test_export_dataset():
     dcols, debtors = data.export_dataset("debtors", None)
     assert all(r["status"] == "outstanding" for r in debtors)
     assert "staff_name" in dcols       # responsible staff included in the debtors export
+
+
+def test_csv_export_neutralizes_formula_injection(monkeypatch):
+    # Telegram's first_name (unlike username) is unrestricted, so a staff
+    # account's recorded_by could be a spreadsheet formula payload. Exported
+    # cells starting with =, +, -, @ must be neutralized before they reach a
+    # spreadsheet app, or opening the export runs the formula for whoever's
+    # admin account does it.
+    from dashboard import app as dashboard_app
+
+    assert dashboard_app._csv_safe('=HYPERLINK("http://evil","x")') == "'=HYPERLINK(\"http://evil\",\"x\")"
+    assert dashboard_app._csv_safe("+1-800-555-0100") == "'+1-800-555-0100"
+    assert dashboard_app._csv_safe("john") == "john"      # ordinary values pass through untouched
+    assert dashboard_app._csv_safe(3000) == "3000"        # numeric values pass through untouched
+
+    monkeypatch.setattr(data, "export_dataset", lambda kind, period: (
+        ["drink_name", "recorded_by"],
+        [{"drink_name": "heineken", "recorded_by": '=HYPERLINK("http://evil","x")'}],
+    ))
+    r = client.get("/export/sales.csv?period=all", cookies=_login_cookie("admin"))
+    assert r.status_code == 200
+    assert '"\'=HYPERLINK' in r.text or "'=HYPERLINK" in r.text   # quoted, not a live formula
+    assert '\n=HYPERLINK' not in r.text and ',=HYPERLINK' not in r.text
 
 
 def test_parse_period_variants():

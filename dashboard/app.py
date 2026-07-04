@@ -68,12 +68,17 @@ def _session(request: Request) -> dict | None:
     return auth.read_session_token(request.cookies.get(settings.SESSION_COOKIE))
 
 
-def require_tenant(request: Request):
+async def require_tenant(request: Request):
     """Dependency: enforce auth AND scope the DB engine to the chosen hotel schema.
 
     Honors ?hotel=<schema> for users with access to more than one hotel, falling
-    back to the session's default. The schema contextvar is reset after the
-    request so it never leaks into another task.
+    back to the session's default. Must be an ASYNC generator: FastAPI resolves
+    sync-generator dependencies via anyio.to_thread.run_sync, which runs the
+    pre-yield code in a *copy* of the current context — so a plain `def` here
+    would set db._hotel_schema_var in a context the route handler never sees,
+    silently leaving every query on the process's default HOTEL_SCHEMA instead
+    of the tenant the user actually selected. An async generator runs in the
+    same task/context as the route handler, so the set() is visible to it.
     """
     sess = _session(request)
     if not sess or not sess.get("hotels"):
@@ -89,16 +94,7 @@ def require_tenant(request: Request):
     try:
         yield sess
     finally:
-        # On the normal path set() and reset() share a context, so this restores
-        # the previous value. But when the endpoint RAISES after the yield,
-        # FastAPI runs this cleanup via gen.throw() in a different context (sync
-        # generator deps run in a threadpool); reset(tok) then raises a spurious
-        # ValueError that would mask the real HTTPException as a 500. Swallow it —
-        # that other context is discarded with the failed request, so nothing leaks.
-        try:
-            db._hotel_schema_var.reset(tok)
-        except ValueError:
-            db._hotel_schema_var.set("")
+        db._hotel_schema_var.reset(tok)
 
 
 def _role_for(sess: dict, schema) -> str:
@@ -199,6 +195,19 @@ async def period_partial(request: Request, period: str | None = None, staff: str
     ))
 
 
+# Leading characters that Excel/Sheets/LibreOffice interpret as the start of a
+# formula. Telegram's first_name (unlike username) is unrestricted, and it ends
+# up in exported columns like recorded_by/name/description — so a value like
+# `=HYPERLINK(...)` from an untrusted staff account could execute as a live
+# formula in whoever's spreadsheet app opens the export.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value) -> str:
+    s = str(value)
+    return "'" + s if s.startswith(_FORMULA_PREFIXES) else s
+
+
 @app.get("/export/{kind}.csv")
 async def export_csv(kind: str, request: Request, period: str | None = None,
                      sess: dict = Depends(require_tenant)):
@@ -214,7 +223,7 @@ async def export_csv(kind: str, request: Request, period: str | None = None,
     writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     writer.writeheader()
     for r in rows:
-        writer.writerow({c: r.get(c, "") for c in cols})
+        writer.writerow({c: _csv_safe(r.get(c, "")) for c in cols})
     fname = f"{request.state.schema}_{kind}_{period or 'month'}.csv"
     return Response(
         buf.getvalue(), media_type="text/csv",
