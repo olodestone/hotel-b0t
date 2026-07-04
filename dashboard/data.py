@@ -8,7 +8,7 @@ strings, so the dashboard and the bot can never disagree.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import database as db
 import inventory as inv
@@ -69,6 +69,37 @@ def _revenue_by_day(sales_rows, room_rows) -> list[dict]:
     ]
 
 
+def _revenue_by_month(sales_rows, room_rows) -> list[dict]:
+    """Monthly bar/room revenue series — used for the trend chart over all-time,
+    where a daily bucket would render as unreadable noise over a long history."""
+    by_month: dict[str, dict] = {}
+    for rows, key in ((sales_rows, "bar"), (room_rows, "rooms")):
+        for r in rows:
+            dt = metrics.parse_ts(r.get("timestamp"))
+            if dt:
+                bucket = by_month.setdefault(f"{dt.year:04d}-{dt.month:02d}", {"bar": 0.0, "rooms": 0.0})
+                bucket[key] += float(r["total_revenue"])
+    return [
+        {"date": d, "bar": round(v["bar"], 2), "rooms": round(v["rooms"], 2),
+         "total": round(v["bar"] + v["rooms"], 2)}
+        for d, v in sorted(by_month.items())
+    ]
+
+
+def _trend(sales_rows, room_rows, all_time: bool) -> tuple[list[dict], str]:
+    """(series, granularity) — buckets by month for all-time, else by day."""
+    if all_time:
+        return _revenue_by_month(sales_rows, room_rows), "month"
+    return _revenue_by_day(sales_rows, room_rows), "day"
+
+
+def _week_bounds(now: datetime | None = None) -> tuple:
+    """(monday, sunday) — the current local week, inclusive, used for period=week."""
+    today = (now or datetime.now()).date()
+    monday = today - timedelta(days=today.weekday())
+    return monday, monday + timedelta(days=6)
+
+
 def cash_position() -> metrics.CashPosition:
     """Cash-at-hand / assets / profit snapshot — 'as of now', independent of the
     selected period. Same numbers as the bot's /position."""
@@ -101,21 +132,26 @@ def _by_time_desc(rows) -> list[dict]:
     return sorted(rows, key=lambda r: str(r.get("timestamp") or ""), reverse=True)
 
 
-def _outstanding_debtors(debtor_rows) -> list[dict]:
+def _outstanding_debtors(debtor_rows, now: datetime | None = None) -> list[dict]:
     """Outstanding debtors (matches /debtors + the CSV export) with each one's
-    remaining balance and the staff responsible for the sale, newest first.
+    remaining balance, age in days and the staff responsible for the sale —
+    oldest first, so the list reads as a follow-up/chase queue rather than a log.
 
     ``staff`` is the debt's ``staff_name`` (who sold/booked) — NOT ``recorded_by``
     (who keyed the entry, usually an admin). Mirrors the bot's "(by …)" tag.
     """
+    now = now or datetime.now()
     out = []
     for r in debtor_rows:
         if r.get("status") != "outstanding":
             continue
         rem = round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
         staff = str(r.get("staff_name") or "").strip()
-        out.append({**r, "remaining": rem, "staff": staff.title() if staff else "—"})
-    return _by_time_desc(out)
+        dt = metrics.parse_ts(r.get("timestamp"))
+        age_days = (now.date() - dt.date()).days if dt else 0
+        out.append({**r, "remaining": rem, "staff": staff.title() if staff else "—",
+                    "age_days": age_days, "overdue": age_days > 30})
+    return sorted(out, key=lambda r: r["age_days"], reverse=True)
 
 
 def _sales_breakdown(sales_rows, cost_map) -> list[dict]:
@@ -144,12 +180,30 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
     hotel-wide figures (P&L, cash, allocation, stock, debtors) are never
     filtered by staff, since they aren't attributable to a single recorder.
     """
-    for_date, for_month, all_time = parse_period(period_arg)
     cost_map = _cost_price_map()
+    is_week = (period_arg or "").strip().lower() == "week"
 
-    sales = metrics.apply_filter(metrics.active(db.read_all("sales")), for_date, for_month, all_time)
-    rooms = metrics.apply_filter(metrics.active(db.read_all("rooms")), for_date, for_month, all_time)
-    expenses = metrics.apply_filter(metrics.active(db.read_all("expenses")), for_date, for_month, all_time)
+    if is_week:
+        week_start, week_end = _week_bounds()
+        all_time = False
+        sales = metrics.filter_by_range(metrics.active(db.read_all("sales")), week_start, week_end)
+        rooms = metrics.filter_by_range(metrics.active(db.read_all("rooms")), week_start, week_end)
+        expenses = metrics.filter_by_range(metrics.active(db.read_all("expenses")), week_start, week_end)
+        period_label = f"This week · {week_start.strftime('%d %b')}–{week_end.strftime('%d %b %Y')}"
+        picker = {"date": "", "month": ""}
+    else:
+        for_date, for_month, all_time = parse_period(period_arg)
+        sales = metrics.apply_filter(metrics.active(db.read_all("sales")), for_date, for_month, all_time)
+        rooms = metrics.apply_filter(metrics.active(db.read_all("rooms")), for_date, for_month, all_time)
+        expenses = metrics.apply_filter(metrics.active(db.read_all("expenses")), for_date, for_month, all_time)
+        period_label = _period_label(for_date, for_month, all_time)
+        # Pre-fills for the date / month period pickers — non-empty only when the
+        # current period IS that kind of selection (so the inputs reflect where
+        # you are, and the quick-segment buttons stay the source of truth otherwise).
+        picker = {
+            "date": for_date.isoformat() if for_date else "",
+            "month": (f"{for_month[0]:04d}-{for_month[1]:02d}" if for_month else ""),
+        }
     debtors = db.read_all("debtors")
 
     pnl = metrics.compute_pnl(sales, rooms, expenses, cost_map)
@@ -186,15 +240,11 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
             "trend": _revenue_by_day(s_sales, s_rooms),
         }
 
+    trend, trend_granularity = _trend(sales, rooms, all_time)
+
     view = {
-        "period_label": _period_label(for_date, for_month, all_time),
-        # Pre-fills for the date / month period pickers — non-empty only when the
-        # current period IS that kind of selection (so the inputs reflect where
-        # you are, and the quick-segment buttons stay the source of truth otherwise).
-        "picker": {
-            "date": for_date.isoformat() if for_date else "",
-            "month": (f"{for_month[0]:04d}-{for_month[1]:02d}" if for_month else ""),
-        },
+        "period_label": period_label,
+        "picker": picker,
         # Raw records for the period — viewable in-browser instead of CSV-only.
         # Sales/Rooms/Expenses follow the selected period; debtors are outstanding
         # balances "as of now" (matches /debtors and the debtors export).
@@ -216,7 +266,8 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         "stock": stock,
         "stock_value": stock_value,
         "low_stock": low_stock,
-        "trend": _revenue_by_day(sales, rooms),
+        "trend": trend,
+        "trend_granularity": trend_granularity,
         "position": cash_position(),  # 'as of now', not period-filtered
     }
     return view
@@ -241,6 +292,9 @@ def export_dataset(kind: str, period_arg: str | None):
     cols, table, period_filtered = spec
     if table == "debtors":
         rows = [r for r in db.read_all("debtors") if r.get("status") == "outstanding"]
+    elif (period_arg or "").strip().lower() == "week":
+        week_start, week_end = _week_bounds()
+        rows = metrics.filter_by_range(metrics.active(db.read_all(table)), week_start, week_end)
     else:
         for_date, for_month, all_time = parse_period(period_arg)
         rows = metrics.apply_filter(metrics.active(db.read_all(table)), for_date, for_month, all_time)

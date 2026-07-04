@@ -115,7 +115,7 @@ def test_dashboard_template_renders(monkeypatch):
     assert "Recommended set-asides" in html   # allocation section
     assert "Sales by drink" in html           # sales drill-down
     assert "Staff activity" in html           # per-staff section
-    assert "Export CSV" in html               # export links
+    assert "Export ▾" in html                 # export dropdown
 
 
 def test_dashboard_view_staff_filter():
@@ -214,11 +214,11 @@ def _render(role: str, **ctx) -> str:
 def test_expenses_table_hidden_from_staff():
     admin_html = _render("admin")
     assert "💸 Expenses" in admin_html          # itemised expenses visible to admin
-    assert ">Expenses</a>" in admin_html         # and the CSV chip
+    assert "Expenses CSV</a>" in admin_html      # and the CSV export link
 
     staff_html = _render("staff")
     assert "💸 Expenses" not in staff_html       # hidden from staff (mirrors /history)
-    assert ">Expenses</a>" not in staff_html      # no expenses CSV chip either
+    assert "Expenses CSV</a>" not in staff_html   # no expenses CSV export link either
     assert "🍺 Sales" in staff_html               # other records still visible to staff
 
 

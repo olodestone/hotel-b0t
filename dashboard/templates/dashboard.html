@@ -2,7 +2,7 @@
 {% from "_macros.html" import icon with context %}
 {% block title %}{{ hotel_name }} · {{ view.period_label }}{% endblock %}
 {% block head %}
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="/static/chart.min.js?v={{ asset_v }}"></script>
 {% endblock %}
 
 {% block content %}

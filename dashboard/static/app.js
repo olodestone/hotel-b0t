@@ -15,18 +15,45 @@
   }
   function theme() { return document.documentElement.getAttribute("data-theme") || "light"; }
 
+  // Desktop Firefox (among others) doesn't implement <input type="month"> and
+  // silently degrades it to a plain text box with no hint of the expected
+  // format. Detect that once and patch in a placeholder/pattern as a fallback.
+  var monthInputSupported = (function () {
+    var i = document.createElement("input");
+    i.setAttribute("type", "month");
+    return i.type === "month";
+  })();
+
+  function fixMonthInputFallback(root) {
+    if (monthInputSupported) return;
+    (root || document).querySelectorAll('input[type="month"]').forEach(function (input) {
+      if (!input.placeholder) input.placeholder = "YYYY-MM";
+      if (!input.pattern) input.pattern = "\\d{4}-\\d{2}";
+    });
+  }
+
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  // Format a "YYYY-MM" or "YYYY-MM-DD" bucket key as a human label, without
+  // going through Date parsing (these are naive local dates, not UTC instants).
+  function formatBucket(dateStr, granularity) {
+    var parts = dateStr.split("-").map(Number);
+    if (granularity === "month") return MONTHS[parts[1] - 1] + " " + parts[0];
+    return parts[2] + " " + MONTHS[parts[1] - 1];
+  }
+
   var chart = null;
   function buildTrend() {
     var el = document.getElementById("trend-data");
     var ctx = document.getElementById("trend");
     if (!el || !ctx || !window.Chart) return;
     var rows = JSON.parse(el.textContent);
+    var granularity = el.getAttribute("data-granularity") || "day";
     var text = cssvar("--muted"), grid = cssvar("--chart-grid");
     if (chart) chart.destroy();
     chart = new Chart(ctx, {
       type: "bar",
       data: {
-        labels: rows.map(function (r) { return r.date.slice(5); }),
+        labels: rows.map(function (r) { return formatBucket(r.date, granularity); }),
         datasets: [
           { label: "Bar", data: rows.map(function (r) { return r.bar; }),
             backgroundColor: cssvar("--c-bar"), borderRadius: 5, maxBarThickness: 24 },
@@ -90,13 +117,22 @@
     var token = {};
     inFlight = token;
     fetch(base + search, { credentials: "same-origin", headers: { "X-Partial": "1" } })
-      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+      .then(function (r) {
+        // An expired session makes /partial/period 303 to /login; fetch follows
+        // that redirect and would otherwise inject the login page's HTML into
+        // this content region. Bail out to a real navigation instead.
+        if (r.redirected) { window.location.href = r.url || navUrl; return null; }
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.text();
+      })
       .then(function (html) {
+        if (html === null) return;               // redirected to login — navigating away
         if (inFlight !== token) return;          // a newer request superseded this one
         if (chart) { chart.destroy(); chart = null; }
         container.innerHTML = html;
         container.classList.remove("is-loading");
         if (push !== false) history.pushState({ period: true }, "", navUrl);
+        fixMonthInputFallback(container);
         buildTrend();
       })
       .catch(function () {
@@ -126,6 +162,12 @@
     window.addEventListener("popstate", function () {
       loadPeriod(window.location.pathname + window.location.search, false);
     });
+    // Close any open "Export ▾" dropdown when clicking outside it.
+    document.addEventListener("click", function (e) {
+      document.querySelectorAll("details.exportmenu[open]").forEach(function (d) {
+        if (!d.contains(e.target)) d.removeAttribute("open");
+      });
+    });
   }
 
   document.addEventListener("DOMContentLoaded", function () {
@@ -135,6 +177,7 @@
       b.addEventListener("click", function () { setTheme(theme() === "dark" ? "light" : "dark"); });
     }
     wirePartialNav();
+    fixMonthInputFallback();
     buildTrend();
   });
 })();

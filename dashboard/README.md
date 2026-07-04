@@ -74,7 +74,7 @@ allocation (set-asides + profit distribution), sales-by-drink, staff activity,
 stock, and outstanding debtors — with a hotel switcher for multi-hotel users and
 CSV export. Every figure matches the bot's reports (shared `metrics.py`).
 
-Any period is browsable: the quick segments (This month / Today / All-time) sit
+Any period is browsable: the quick segments (This month / Today / This week / All-time) sit
 beside a **month picker** and a **day picker**, so you can jump to any prior month
 or specific date. Changing the period or staff filter **swaps just the affected
 region in place** (fetched from `GET /partial/period`) instead of reloading the

@@ -55,6 +55,16 @@ def filter_by_month(rows, year, month):
     return result
 
 
+def filter_by_range(rows, start, end):
+    """Inclusive [start, end] local-calendar-date filter (e.g. a Mon-Sun week)."""
+    result = []
+    for r in rows:
+        dt = parse_ts(r.get("timestamp"))
+        if dt and start <= dt.date() <= end:
+            result.append(r)
+    return result
+
+
 def apply_filter(rows, for_date, for_month, all_time):
     now = datetime.now()
     if for_date:

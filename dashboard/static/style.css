@@ -31,6 +31,7 @@
   --chart-grid: rgba(15,23,42,.07);
   --c-bar: #c79a3a;
   --c-rooms: #4f6cff;
+  --teal: #3aa0a0;
 }
 
 html[data-theme="dark"] {
@@ -57,6 +58,7 @@ html[data-theme="dark"] {
   --chart-grid: rgba(255,255,255,.08);
   --c-bar: #d9b25c;
   --c-rooms: #8893ff;
+  --teal: #4bb8b8;
 }
 
 * { box-sizing: border-box; }
@@ -154,7 +156,21 @@ select {
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
 .toolbar-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .toolbar-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.menu { display: inline-flex; align-items: center; gap: 7px; }
+/* Export CSV dropdown */
+.exportmenu { position: relative; }
+.exportmenu > summary { cursor: pointer; list-style: none; }
+.exportmenu > summary::-webkit-details-marker { display: none; }
+.exportmenu-list {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 15;
+  display: flex; flex-direction: column; gap: 2px; min-width: 160px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow); padding: 6px;
+}
+.exportmenu-list a {
+  padding: 8px 10px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  color: var(--ink-2); text-decoration: none; white-space: nowrap;
+}
+.exportmenu-list a:hover { background: var(--surface-2); color: var(--accent); }
 
 /* Month / day period pickers */
 .datenav { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -236,7 +252,7 @@ select {
 .splitbar > span { display: block; height: 100%; }
 .seg-draw { background: var(--accent); }
 .seg-reinvest { background: var(--gold); }
-.seg-float { background: #3aa0a0; }
+.seg-float { background: var(--teal); }
 .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2); }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
 

@@ -1,9 +1,10 @@
-{% from "_macros.html" import qp, ex, stf, icon with context %}
+{% from "_macros.html" import qp, ex, stf, icon, cap_note with context %}
 <div class="toolbar">
   <div class="toolbar-left">
     <div class="segmented">
       <a class="js-period {{ 'active' if current_period == '' }}" href="{{ qp('') }}">This month</a>
       <a class="js-period {{ 'active' if current_period == 'today' }}" href="{{ qp('today') }}">Today</a>
+      <a class="js-period {{ 'active' if current_period == 'week' }}" href="{{ qp('week') }}">This week</a>
       <a class="js-period {{ 'active' if current_period == 'all' }}" href="{{ qp('all') }}">All-time</a>
     </div>
     <div class="datenav">
@@ -18,14 +19,15 @@
     </div>
   </div>
   <div class="toolbar-right">
-    <span class="muted small">{{ view.period_label }}</span>
-    <div class="menu">
-      <span class="muted small">Export CSV</span>
-      <a class="chip" href="{{ ex('sales') }}">Sales</a>
-      <a class="chip" href="{{ ex('rooms') }}">Rooms</a>
-      {% if role == 'admin' %}<a class="chip" href="{{ ex('expenses') }}">Expenses</a>{% endif %}
-      <a class="chip" href="{{ ex('debtors') }}">Debtors</a>
-    </div>
+    <details class="exportmenu">
+      <summary class="chip">Export ▾</summary>
+      <div class="exportmenu-list">
+        <a href="{{ ex('sales') }}">🍺 Sales CSV</a>
+        <a href="{{ ex('rooms') }}">🛏 Rooms CSV</a>
+        {% if role == 'admin' %}<a href="{{ ex('expenses') }}">💸 Expenses CSV</a>{% endif %}
+        <a href="{{ ex('debtors') }}">🧾 Debtors CSV</a>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -39,7 +41,7 @@
   </div>
   <div class="kpi">
     <div class="ic">{{ icon('trend') }}</div>
-    <div class="k-label">Net Profit</div>
+    <div class="k-label">Net Profit <span class="muted">· {{ view.period_label }}</span></div>
     <div class="k-val {{ 'pos' if view.pnl.net_profit >= 0 else 'neg' }}">{{ view.pnl.net_profit | naira }}</div>
     <div class="k-meta">{{ '%.0f' | format(margin) }}% margin</div>
   </div>
@@ -53,7 +55,10 @@
     <div class="ic">{{ icon('box') }}</div>
     <div class="k-label">Stock value</div>
     <div class="k-val">{{ view.stock_value | naira }}</div>
-    <div class="k-meta">{{ view.low_stock | length }} low</div>
+    <div class="k-meta">
+      {% if view.low_stock %}<a href="#stock">{{ view.low_stock | length }} low: {{ view.low_stock[:3] | map(attribute='drink') | join(', ') }}{% if view.low_stock | length > 3 %}…{% endif %}</a>
+      {% else %}0 low{% endif %}
+    </div>
   </div>
 </section>
 
@@ -61,48 +66,31 @@
   <h2>Revenue trend <span class="muted small">· Bar vs Rooms</span></h2>
   {% if view.trend %}
     <div class="chart-wrap"><canvas id="trend"></canvas></div>
-    <script id="trend-data" type="application/json">{{ view.trend | tojson }}</script>
+    <script id="trend-data" type="application/json" data-granularity="{{ view.trend_granularity }}">{{ view.trend | tojson }}</script>
   {% else %}
     <p class="muted">No activity in this period.</p>
   {% endif %}
 </section>
 
-<section class="grid-2">
-  <div class="card">
-    <h2>Profit &amp; Loss <span class="muted small">· {{ view.period_label }}</span></h2>
-    <div class="tbl-wrap">
-      <table class="tbl stack">
-        <thead><tr><th></th><th class="num">🍺 Bar</th><th class="num">🛏 Rooms</th></tr></thead>
-        <tbody>
-          <tr><td>Revenue</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.revenue | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.revenue | naira }}</td></tr>
-          <tr><td>Cost of stock sold</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.cogs | naira }}</td><td class="num" data-label="🛏 Rooms">—</td></tr>
-          <tr><td>Salaries</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.salary | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.salary | naira }}</td></tr>
-          <tr><td>Other expenses</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.other_expense | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.other_expense | naira }}</td></tr>
-          <tr class="total"><td>Profit</td>
-            <td class="num {{ 'pos' if view.pnl.bar.profit >= 0 else 'neg' }}" data-label="🍺 Bar">{{ view.pnl.bar.profit | naira }}</td>
-            <td class="num {{ 'pos' if view.pnl.rooms.profit >= 0 else 'neg' }}" data-label="🛏 Rooms">{{ view.pnl.rooms.profit | naira }}</td></tr>
-        </tbody>
-      </table>
-    </div>
-    {% if view.pnl.restock_spend > 0 %}
-      <p class="muted small">📦 Stock purchased this period: {{ view.pnl.restock_spend | naira }} — cash → stock, not a profit cost.</p>
-    {% endif %}
+<section class="card">
+  <h2>Profit &amp; Loss <span class="muted small">· {{ view.period_label }}</span></h2>
+  <div class="tbl-wrap">
+    <table class="tbl stack">
+      <thead><tr><th></th><th class="num">🍺 Bar</th><th class="num">🛏 Rooms</th></tr></thead>
+      <tbody>
+        <tr><td>Revenue</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.revenue | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.revenue | naira }}</td></tr>
+        <tr><td>Cost of stock sold</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.cogs | naira }}</td><td class="num" data-label="🛏 Rooms">—</td></tr>
+        <tr><td>Salaries</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.salary | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.salary | naira }}</td></tr>
+        <tr><td>Other expenses</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.other_expense | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.other_expense | naira }}</td></tr>
+        <tr class="total"><td>Profit</td>
+          <td class="num {{ 'pos' if view.pnl.bar.profit >= 0 else 'neg' }}" data-label="🍺 Bar">{{ view.pnl.bar.profit | naira }}</td>
+          <td class="num {{ 'pos' if view.pnl.rooms.profit >= 0 else 'neg' }}" data-label="🛏 Rooms">{{ view.pnl.rooms.profit | naira }}</td></tr>
+      </tbody>
+    </table>
   </div>
-
-  <div class="card">
-    <h2>Outstanding debtors</h2>
-    {% if view.owed.outstanding_count %}
-      <table class="tbl">
-        <tbody>
-          {% if view.owed.bar_count %}<tr><td>🍺 Bar <span class="badge warn">{{ view.owed.bar_count }}</span></td><td class="num">{{ view.owed.bar_owed | naira }}</td></tr>{% endif %}
-          {% if view.owed.rooms_count %}<tr><td>🛏 Rooms <span class="badge warn">{{ view.owed.rooms_count }}</span></td><td class="num">{{ view.owed.rooms_owed | naira }}</td></tr>{% endif %}
-          <tr class="total"><td>Total owed</td><td class="num">{{ view.owed.total_owed | naira }}</td></tr>
-        </tbody>
-      </table>
-    {% else %}
-      <p class="muted">No outstanding debtors. 🎉</p>
-    {% endif %}
-  </div>
+  {% if view.pnl.restock_spend > 0 %}
+    <p class="muted small">📦 Stock purchased this period: {{ view.pnl.restock_spend | naira }} — cash → stock, not a profit cost.</p>
+  {% endif %}
 </section>
 
 <section class="grid-2">
@@ -117,8 +105,8 @@
         <tr><td class="muted">From Rooms account</td><td class="num">{{ view.allocation.room_share | naira }}</td></tr>
       </tbody>
     </table>
-    <p class="muted small">Net profit {{ view.allocation.working_capital | naira }} · after set-asides
-      <b>{{ view.allocation.after_setaside | naira }}</b> (safe to use) · burn {{ '%.1f' | format(view.allocation.burn_rate) }}%</p>
+    <p class="muted small">Net profit {{ view.allocation.working_capital | naira }} · after moving the above to savings, <b>{{ view.allocation.after_setaside | naira }}</b> is safe to use · expenses ate {{ '%.1f' | format(view.allocation.burn_rate) }}% of revenue</p>
+    <p class="muted small">💡 Move these amounts to the Savings Account every Monday — run <code>/allocation</code> in the bot for the exact split.</p>
   </div>
 
   <div class="card">
@@ -133,18 +121,18 @@
       <div class="legend">
         <span><i style="background:var(--accent)"></i>Draw {{ view.alloc_pcts.draw }}%</span>
         <span><i style="background:var(--gold)"></i>Reinvest {{ view.alloc_pcts.reinvest }}%</span>
-        <span><i style="background:#3aa0a0"></i>Float {{ view.alloc_pcts.float }}%</span>
+        <span><i style="background:var(--teal)"></i>Float {{ view.alloc_pcts.float }}%</span>
       </div>
       <table class="tbl">
         <tbody>
           <tr><td>👤 Owner's draw</td><td class="num">{{ view.allocation.draw_amt | naira }}</td></tr>
           <tr><td>📈 Reinvestment</td><td class="num">{{ view.allocation.reinvest_amt | naira }}</td></tr>
           <tr><td>🏦 Cash float</td><td class="num">{{ view.allocation.float_amt | naira }}</td></tr>
-          {% if view.allocation.unallocated %}<tr><td>Unallocated</td><td class="num">{{ view.allocation.unallocated | naira }}</td></tr>{% endif %}
+          {% if view.allocation.unallocated %}<tr><td>Left over, not yet assigned</td><td class="num">{{ view.allocation.unallocated | naira }}</td></tr>{% endif %}
         </tbody>
       </table>
       {% if view.allocation.draw_amt > 0 %}
-        <p class="muted small">PIT estimate on draw: {{ view.allocation.pit_low_amt | naira }} – {{ view.allocation.pit_high_amt | naira }} <em>(informational)</em></p>
+        <p class="muted small">If the owner takes this draw, expect to owe roughly {{ view.allocation.pit_low_amt | naira }}–{{ view.allocation.pit_high_amt | naira }} in personal income tax <em>(estimate only)</em></p>
       {% endif %}
     {% else %}
       <p class="muted">Nothing to distribute — expenses + set-asides exceed revenue.</p>
@@ -261,14 +249,15 @@
   </div>
   <p class="muted small" style="margin: 2px 0 14px">Expand a section to read it here — no download needed. Sales, Rooms &amp; Expenses follow the selected period; Debtors shows who currently owes.</p>
 
-  <details class="rec" open>
+  {% set cap = 30 %}
+  <details class="rec">
     <summary>🍺 Sales <span class="muted small">· {{ view.ledger.sales | length }}</span></summary>
     {% if view.ledger.sales %}
       <div class="tbl-wrap">
         <table class="tbl stack">
           <thead><tr><th>When</th><th>ID</th><th>Drink</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Revenue</th><th>By</th></tr></thead>
           <tbody>
-            {% for r in view.ledger.sales %}
+            {% for r in view.ledger.sales[:cap] %}
               <tr>
                 <td>{{ r.timestamp | when }}</td>
                 <td data-label="ID">{{ r.id }}</td>
@@ -282,6 +271,7 @@
           </tbody>
         </table>
       </div>
+      {{ cap_note(view.ledger.sales[:cap] | length, view.ledger.sales | length, ex('sales')) }}
     {% else %}<p class="muted">No sales in this period.</p>{% endif %}
   </details>
 
@@ -292,7 +282,7 @@
         <table class="tbl stack">
           <thead><tr><th>When</th><th>ID</th><th>Type</th><th class="num">Qty</th><th class="num">₦/night</th><th class="num">Nights</th><th class="num">Revenue</th><th>By</th></tr></thead>
           <tbody>
-            {% for r in view.ledger.rooms %}
+            {% for r in view.ledger.rooms[:cap] %}
               <tr>
                 <td>{{ r.timestamp | when }}</td>
                 <td data-label="ID">{{ r.id }}</td>
@@ -307,6 +297,7 @@
           </tbody>
         </table>
       </div>
+      {{ cap_note(view.ledger.rooms[:cap] | length, view.ledger.rooms | length, ex('rooms')) }}
     {% else %}<p class="muted">No room bookings in this period.</p>{% endif %}
   </details>
 
@@ -318,7 +309,7 @@
         <table class="tbl stack">
           <thead><tr><th>When</th><th>ID</th><th>Account</th><th>Category</th><th class="num">Amount</th><th>Note</th></tr></thead>
           <tbody>
-            {% for r in view.ledger.expenses %}
+            {% for r in view.ledger.expenses[:cap] %}
               <tr>
                 <td>{{ r.timestamp | when }}</td>
                 <td data-label="ID">{{ r.id }}</td>
@@ -331,18 +322,19 @@
           </tbody>
         </table>
       </div>
+      {{ cap_note(view.ledger.expenses[:cap] | length, view.ledger.expenses | length, ex('expenses')) }}
     {% else %}<p class="muted">No expenses in this period.</p>{% endif %}
   </details>
   {% endif %}
 
   <details class="rec">
-    <summary>🧾 Debtors <span class="muted small">· {{ view.ledger.debtors | length }} owing</span></summary>
+    <summary>🧾 Debtors <span class="muted small">· {{ view.ledger.debtors | length }} owing, as of today</span></summary>
     {% if view.ledger.debtors %}
       <div class="tbl-wrap">
         <table class="tbl stack">
-          <thead><tr><th>Name</th><th>Account</th><th>Staff</th><th class="num">Amount</th><th class="num">Paid</th><th class="num">Remaining</th><th>Since</th></tr></thead>
+          <thead><tr><th>Name</th><th>Account</th><th>Staff</th><th class="num">Amount</th><th class="num">Paid</th><th class="num">Remaining</th><th>Age</th></tr></thead>
           <tbody>
-            {% for r in view.ledger.debtors %}
+            {% for r in view.ledger.debtors[:cap] %}
               <tr>
                 <td>{{ r.name }}</td>
                 <td data-label="Account">{{ r.account | title }}</td>
@@ -350,17 +342,19 @@
                 <td class="num" data-label="Amount">{{ r.amount | naira }}</td>
                 <td class="num" data-label="Paid">{{ r.amount_paid | naira }}</td>
                 <td class="num" data-label="Remaining">{{ r.remaining | naira }}</td>
-                <td data-label="Since">{{ r.timestamp | when }}</td>
+                <td data-label="Age">{{ r.age_days }}d{% if r.overdue %} <span class="badge warn">overdue</span>{% endif %}</td>
               </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
+      {{ cap_note(view.ledger.debtors[:cap] | length, view.ledger.debtors | length, ex('debtors')) }}
+      <p class="muted small">💡 Settle a debt in the bot: <code>/pay_debtor {{ view.ledger.debtors[0].account }} {{ view.ledger.debtors[0].name }}</code></p>
     {% else %}<p class="muted">No outstanding debtors. 🎉</p>{% endif %}
   </details>
 </section>
 
-<section class="card">
+<section class="card" id="stock">
   <h2>Stock on hand <span class="muted small">· {{ view.low_stock | length }} low</span></h2>
   <div class="tbl-wrap">
     <table class="tbl stack">
@@ -380,4 +374,7 @@
       </tbody>
     </table>
   </div>
+  {% if view.low_stock %}
+    <p class="muted small">💡 Top up in the bot: <code>/restock {{ view.low_stock[0].drink | lower }} &lt;qty&gt; &lt;cost&gt;</code>, then <code>/transfer {{ view.low_stock[0].drink | lower }} &lt;qty&gt;</code> to move it to the bar.</p>
+  {% endif %}
 </section>
