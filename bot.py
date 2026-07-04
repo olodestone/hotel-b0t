@@ -4302,12 +4302,13 @@ async def _cb_debtors_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
 async def _cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
-    # Only a hardcoded admin (ADMIN_IDS) can run setup — the users table may not
-    # exist yet or may be empty on a brand-new deployment.
-    if uid not in ADMIN_IDS:
+    # Only that hotel's configured admin(s) can run setup — the users table may
+    # not exist yet or may be empty on a brand-new deployment, so check against
+    # this bot's admin_ids (set per-hotel via /addhotel) rather than the users table.
+    if not _is_admin(uid):
         await update.message.reply_text(
             "🔒 Only the configured bot owner can run /setup.\n"
-            "Add your Telegram ID to ADMIN\\_IDS in the deployment environment.",
+            "Add your Telegram ID to the admin\\_id passed to /addhotel for this bot\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return ConversationHandler.END
