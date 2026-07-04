@@ -107,8 +107,15 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
             """), {"schema": s, "hash": token_hash})
         conn.commit()
 
-    # Step 2: create hotel tables under the hotel schema (search_path routes them).
-    engine = get_engine()
+    # Step 2: create hotel tables under the hotel schema. Build the engine from
+    # `s` directly rather than get_engine() — get_engine() resolves its schema
+    # from the per-request contextvar (or the global HOTEL_SCHEMA env var as a
+    # fallback), neither of which reflects the schema this init_db() call was
+    # asked to set up, so it would silently target the wrong hotel's schema.
+    engine = create_engine(
+        _canonical_url(),
+        connect_args={"options": f"-c search_path={s},public"},
+    )
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS inventory (
