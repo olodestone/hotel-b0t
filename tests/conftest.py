@@ -5,8 +5,11 @@ Two things make the financial reports testable without a live database:
 
 1. ``database.read_all`` / ``database.get_setting`` are monkeypatched to serve an
    in-memory fixture dataset, so no PostgreSQL is needed.
-2. ``datetime`` is frozen in ``reports`` and ``metrics`` so the "Generated …" /
-   "current month" output is deterministic.
+2. ``datetime`` is frozen in ``reports``, ``metrics`` and ``dashboard.data`` so the
+   "Generated …" / "current month" output is deterministic. Every module that reads
+   the wall clock must be frozen: the fixture rows all fall in June 2026, so any
+   unfrozen ``datetime.now()`` silently zeroes out the "current month" figures once
+   the real calendar leaves that month.
 
 The golden-master tests (``test_golden_reports.py``) snapshot the exact Telegram
 strings; these fixtures keep that snapshot reproducible run-to-run.
@@ -28,6 +31,7 @@ if str(ROOT) not in sys.path:
 import database  # noqa: E402
 import metrics    # noqa: E402
 import reports    # noqa: E402
+from dashboard import data as dashboard_data  # noqa: E402  (imports no web deps)
 
 SNAP_DIR = Path(__file__).parent / "snapshots"
 FROZEN_NOW = datetime(2026, 6, 29, 14, 30, 0)
@@ -105,6 +109,7 @@ def patch_db_and_time(monkeypatch):
     monkeypatch.setattr(database, "get_setting", fake_get_setting)
     monkeypatch.setattr(reports, "datetime", _FrozenDateTime)
     monkeypatch.setattr(metrics, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(dashboard_data, "datetime", _FrozenDateTime)
     yield
 
 
