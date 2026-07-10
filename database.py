@@ -18,7 +18,6 @@ import os
 from datetime import datetime
 from typing import Any
 
-import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -38,18 +37,39 @@ def _canonical_url() -> str:
     return url
 
 
+_engines: dict[str, Engine] = {}
+
+
 def get_engine() -> Engine:
+    """One pooled Engine per hotel schema, reused across calls.
+
+    Previously this created (and immediately discarded) a brand-new Engine —
+    and therefore a brand-new connection pool — on every call, so no DB
+    operation ever actually reused a pooled connection. Cached per schema
+    since one process can serve several hotels' schemas (dashboard requests
+    switch `_hotel_schema_var` per request; the bot runs one Application per
+    hotel schema).
+    """
     from config import HOTEL_SCHEMA
     schema = _hotel_schema_var.get() or HOTEL_SCHEMA or "public"
-    return create_engine(
-        _canonical_url(),
-        connect_args={"options": f"-c search_path={schema},public"},
-    )
+    engine = _engines.get(schema)
+    if engine is None:
+        engine = create_engine(
+            _canonical_url(),
+            connect_args={"options": f"-c search_path={schema},public"},
+            pool_pre_ping=True,
+        )
+        _engines[schema] = engine
+    return engine
 
 
 def _base_engine() -> Engine:
     """Engine with no custom search_path — used for public-schema registry queries."""
-    return create_engine(_canonical_url())
+    engine = _engines.get("")
+    if engine is None:
+        engine = create_engine(_canonical_url(), pool_pre_ping=True)
+        _engines[""] = engine
+    return engine
 
 
 def now_str() -> str:
@@ -390,11 +410,24 @@ def add_hotel_config(schema: str, token: str, admin_ids: str = "") -> None:
 
 # ── Generic read (used by inventory.py, reports.py) ───────────────────
 
+def _rows(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Run a SELECT, return every row as a plain dict."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        return [dict(r) for r in conn.execute(text(sql), params or {}).mappings().all()]
+
+
+def _row(sql: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Run a SELECT, return the first row as a dict, or None if no match."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        r = conn.execute(text(sql), params or {}).mappings().first()
+        return dict(r) if r is not None else None
+
+
 def read_all(table: str) -> list[dict[str, Any]]:
     """Return all rows as a list of dicts."""
-    engine = get_engine()
-    df = pd.read_sql(f"SELECT * FROM {table}", engine)
-    return df.to_dict(orient="records")
+    return _rows(f"SELECT * FROM {table}")
 
 
 # ── Drink-sale record ─────────────────────────────────────────────────
@@ -484,18 +517,16 @@ def record_debtor(account: str, name: str, amount: float, description: str = "",
 
 def get_debtors(account: str | None = None, month: str | None = None) -> list[dict[str, Any]]:
     """Return all outstanding debtor rows, optionally filtered by account and/or month (YYYY-MM)."""
-    engine = get_engine()
     clauses = ["status = 'outstanding'"]
     params: dict[str, Any] = {}
     if account:
-        clauses.append("account = %(account)s")
+        clauses.append("account = :account")
         params["account"] = account.lower()
     if month:
-        clauses.append("timestamp LIKE %(month)s")
+        clauses.append("timestamp LIKE :month")
         params["month"] = f"{month}%"
     where = " AND ".join(clauses)
-    df = pd.read_sql(f"SELECT * FROM debtors WHERE {where} ORDER BY timestamp ASC", engine, params=params or None)
-    return df.to_dict(orient="records")
+    return _rows(f"SELECT * FROM debtors WHERE {where} ORDER BY timestamp ASC", params)
 
 
 def update_debt_staff_name(debt_id: int, staff_name: str) -> bool:
@@ -512,22 +543,18 @@ def update_debt_staff_name(debt_id: int, staff_name: str) -> bool:
 
 def get_debts_by_staff(staff_name: str) -> list[dict[str, Any]]:
     """Return all outstanding debts attributed to a staff member."""
-    engine = get_engine()
-    df = pd.read_sql(
-        "SELECT * FROM debtors WHERE lower(staff_name) = lower(%(staff)s) AND status = 'outstanding' ORDER BY timestamp ASC",
-        engine, params={"staff": staff_name.strip()},
+    return _rows(
+        "SELECT * FROM debtors WHERE lower(staff_name) = lower(:staff) AND status = 'outstanding' ORDER BY timestamp ASC",
+        {"staff": staff_name.strip()},
     )
-    return df.to_dict(orient="records")
 
 
 def get_outstanding_by_name(name: str) -> list[dict[str, Any]]:
     """Return all outstanding debts for a person across both accounts."""
-    engine = get_engine()
-    df = pd.read_sql(
-        "SELECT * FROM debtors WHERE lower(name) = lower(%(name)s) AND status = 'outstanding' ORDER BY timestamp ASC",
-        engine, params={"name": name.strip()},
+    return _rows(
+        "SELECT * FROM debtors WHERE lower(name) = lower(:name) AND status = 'outstanding' ORDER BY timestamp ASC",
+        {"name": name.strip()},
     )
-    return df.to_dict(orient="records")
 
 
 def mark_debtor_paid(name: str, account: str, paid_by: str = "", amount: float | None = None) -> dict[str, Any] | None:
@@ -659,22 +686,20 @@ def mark_debt_paid_by_id(debt_id: int, paid_by: str = "", amount: float | None =
 
 def get_debtor_history(name: str, account: str) -> dict[str, Any]:
     """Return all debts and payment events for a given person + account."""
-    engine = get_engine()
-    debts_df = pd.read_sql(
-        "SELECT * FROM debtors WHERE lower(name) = lower(%(name)s) AND account = %(account)s ORDER BY timestamp ASC",
-        engine, params={"name": name.strip(), "account": account.lower()},
+    debts = _rows(
+        "SELECT * FROM debtors WHERE lower(name) = lower(:name) AND account = :account ORDER BY timestamp ASC",
+        {"name": name.strip(), "account": account.lower()},
     )
-    debts = debts_df.to_dict(orient="records")
     if not debts:
         return {"debts": [], "payments": {}}
 
     debtor_ids = [int(d["id"]) for d in debts]
-    payments_df = pd.read_sql(
-        "SELECT * FROM debtor_payments WHERE debtor_id = ANY(%(ids)s) ORDER BY timestamp ASC",
-        engine, params={"ids": debtor_ids},
+    payments = _rows(
+        "SELECT * FROM debtor_payments WHERE debtor_id = ANY(:ids) ORDER BY timestamp ASC",
+        {"ids": debtor_ids},
     )
     payments_by_id: dict[int, list[dict]] = {}
-    for row in payments_df.to_dict(orient="records"):
+    for row in payments:
         did = int(row["debtor_id"])
         payments_by_id.setdefault(did, []).append(row)
 
@@ -684,14 +709,10 @@ def get_debtor_history(name: str, account: str) -> dict[str, Any]:
 # ── Inventory operations ──────────────────────────────────────────────
 
 def get_drink(drink: str) -> dict[str, Any] | None:
-    engine = get_engine()
-    df = pd.read_sql(
-        "SELECT * FROM inventory WHERE lower(drink_name) = lower(%(name)s)",
-        engine, params={"name": drink.lower()},
+    return _row(
+        "SELECT * FROM inventory WHERE lower(drink_name) = lower(:name)",
+        {"name": drink.lower()},
     )
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
 
 
 def upsert_drink(
@@ -886,16 +907,15 @@ def delete_drink(drink: str) -> dict[str, Any] | None:
 
 def get_entries_by_date(date_str: str) -> list[dict[str, Any]]:
     """Return active (non-voided) sales, rooms, and expenses for a given YYYY-MM-DD."""
-    engine = get_engine()
     entries: list[dict[str, Any]] = []
 
     for table, tag in (("sales", "sale"), ("rooms", "room"), ("expenses", "expense")):
-        df = pd.read_sql(
-            f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s"
+        rows = _rows(
+            f"SELECT * FROM {table} WHERE timestamp LIKE :prefix"
             f" AND (deleted_at = '' OR deleted_at IS NULL) ORDER BY timestamp",
-            engine, params={"prefix": date_str + "%"},
+            {"prefix": date_str + "%"},
         )
-        for row in df.to_dict(orient="records"):
+        for row in rows:
             row["entry_type"] = tag
             entries.append(row)
 
@@ -986,7 +1006,6 @@ def get_activity_log(date_str: str, username: str | None = None) -> list[dict[st
     Includes voided/deleted entries (flagged via deleted_at).
     Optionally filter to a single actor (recorded_by / paid_by).
     """
-    engine = get_engine()
     entries: list[dict[str, Any]] = []
     prefix = date_str + "%"
     u_filter = username
@@ -999,47 +1018,47 @@ def get_activity_log(date_str: str, username: str | None = None) -> list[dict[st
         ("debtors",  "debtor_add"),
     ):
         if u_filter:
-            df = pd.read_sql(
-                f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s AND recorded_by = %(u)s ORDER BY timestamp",
-                engine, params={"prefix": prefix, "u": u_filter},
+            rows = _rows(
+                f"SELECT * FROM {table} WHERE timestamp LIKE :prefix AND recorded_by = :u ORDER BY timestamp",
+                {"prefix": prefix, "u": u_filter},
             )
         else:
-            df = pd.read_sql(
-                f"SELECT * FROM {table} WHERE timestamp LIKE %(prefix)s ORDER BY timestamp",
-                engine, params={"prefix": prefix},
+            rows = _rows(
+                f"SELECT * FROM {table} WHERE timestamp LIKE :prefix ORDER BY timestamp",
+                {"prefix": prefix},
             )
-        for row in df.to_dict(orient="records"):
+        for row in rows:
             row["entry_type"] = tag
             entries.append(row)
 
     # Debts marked paid on this date
     if u_filter:
-        paid_df = pd.read_sql(
-            "SELECT * FROM debtors WHERE paid_at LIKE %(prefix)s AND status = 'paid' AND paid_by = %(u)s ORDER BY paid_at",
-            engine, params={"prefix": prefix, "u": u_filter},
+        paid_rows = _rows(
+            "SELECT * FROM debtors WHERE paid_at LIKE :prefix AND status = 'paid' AND paid_by = :u ORDER BY paid_at",
+            {"prefix": prefix, "u": u_filter},
         )
     else:
-        paid_df = pd.read_sql(
-            "SELECT * FROM debtors WHERE paid_at LIKE %(prefix)s AND status = 'paid' ORDER BY paid_at",
-            engine, params={"prefix": prefix},
+        paid_rows = _rows(
+            "SELECT * FROM debtors WHERE paid_at LIKE :prefix AND status = 'paid' ORDER BY paid_at",
+            {"prefix": prefix},
         )
-    for row in paid_df.to_dict(orient="records"):
+    for row in paid_rows:
         row["entry_type"] = "debtor_pay"
         row["timestamp"] = row.get("paid_at", "")
         entries.append(row)
 
     # Store→bar transfers
     if u_filter:
-        tf_df = pd.read_sql(
-            "SELECT * FROM transfers WHERE timestamp LIKE %(prefix)s AND recorded_by = %(u)s ORDER BY timestamp",
-            engine, params={"prefix": prefix, "u": u_filter},
+        tf_rows = _rows(
+            "SELECT * FROM transfers WHERE timestamp LIKE :prefix AND recorded_by = :u ORDER BY timestamp",
+            {"prefix": prefix, "u": u_filter},
         )
     else:
-        tf_df = pd.read_sql(
-            "SELECT * FROM transfers WHERE timestamp LIKE %(prefix)s ORDER BY timestamp",
-            engine, params={"prefix": prefix},
+        tf_rows = _rows(
+            "SELECT * FROM transfers WHERE timestamp LIKE :prefix ORDER BY timestamp",
+            {"prefix": prefix},
         )
-    for row in tf_df.to_dict(orient="records"):
+    for row in tf_rows:
         row["entry_type"] = "transfer"
         entries.append(row)
 
@@ -1051,9 +1070,7 @@ def get_activity_log(date_str: str, username: str | None = None) -> list[dict[st
 
 def get_drink_selling_prices() -> list[dict[str, Any]]:
     """Return drink_name and selling_price for all inventory rows."""
-    engine = get_engine()
-    df = pd.read_sql("SELECT drink_name, selling_price FROM inventory ORDER BY drink_name", engine)
-    return df.to_dict(orient="records")
+    return _rows("SELECT drink_name, selling_price FROM inventory ORDER BY drink_name")
 
 
 # ── Undo (last staff entry within window) ────────────────────────────
@@ -1063,26 +1080,22 @@ def get_last_staff_entry(username: str, window_minutes: int = 2) -> dict[str, An
     Return the most recent sale or room entry recorded by `username`
     within the last `window_minutes` minutes, or None if outside the window.
     """
-    engine = get_engine()
     cutoff = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    sale_df = pd.read_sql(
+    sale = _row(
         "SELECT *, 'sale' AS entry_type FROM sales "
-        "WHERE recorded_by = %(u)s AND (deleted_at = '' OR deleted_at IS NULL)"
+        "WHERE recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)"
         " ORDER BY timestamp DESC LIMIT 1",
-        engine, params={"u": username},
+        {"u": username},
     )
-    room_df = pd.read_sql(
+    room = _row(
         "SELECT *, 'room' AS entry_type FROM rooms "
-        "WHERE recorded_by = %(u)s AND (deleted_at = '' OR deleted_at IS NULL)"
+        "WHERE recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)"
         " ORDER BY timestamp DESC LIMIT 1",
-        engine, params={"u": username},
+        {"u": username},
     )
 
-    candidates = []
-    for df in (sale_df, room_df):
-        if not df.empty:
-            candidates.append(df.iloc[0].to_dict())
+    candidates = [c for c in (sale, room) if c is not None]
 
     if not candidates:
         return None
@@ -1105,14 +1118,8 @@ def get_last_staff_entry(username: str, window_minutes: int = 2) -> dict[str, An
 
 def get_setting(key: str, default: str = "") -> str:
     """Return a setting value by key, or default if not set."""
-    engine = get_engine()
-    df = pd.read_sql(
-        "SELECT value FROM settings WHERE key = %(key)s",
-        engine, params={"key": key},
-    )
-    if df.empty:
-        return default
-    return str(df.iloc[0]["value"])
+    row = _row("SELECT value FROM settings WHERE key = :key", {"key": key})
+    return str(row["value"]) if row is not None else default
 
 
 def set_setting(key: str, value: str) -> None:
@@ -1142,13 +1149,9 @@ def set_room_type_price(room_type: str, price: float) -> None:
 
 def get_all_room_type_prices() -> list[dict[str, Any]]:
     """Return all configured room type presets as [{room_type, price}]."""
-    engine = get_engine()
-    df = pd.read_sql(
-        text("SELECT key, value FROM settings WHERE key LIKE 'roomtype_price:%' ORDER BY key"),
-        engine,
-    )
+    raw = _rows("SELECT key, value FROM settings WHERE key LIKE 'roomtype_price:%' ORDER BY key")
     rows = []
-    for _, r in df.iterrows():
+    for r in raw:
         rtype = str(r["key"]).replace("roomtype_price:", "").title()
         try:
             rows.append({"room_type": rtype, "price": float(r["value"])})
@@ -1168,13 +1171,11 @@ def get_all_staff() -> list[str]:
     any representative spelling resolves to all of that person's debts; we keep
     the first spelling seen as the display label.
     """
-    engine = get_engine()
-    df = pd.read_sql(
-        "SELECT DISTINCT staff_name FROM debtors WHERE status = 'outstanding' AND staff_name IS NOT NULL AND staff_name <> ''",
-        engine,
+    rows = _rows(
+        "SELECT DISTINCT staff_name FROM debtors WHERE status = 'outstanding' AND staff_name IS NOT NULL AND staff_name <> ''"
     )
     seen: dict[str, str] = {}
-    for row in df.to_dict(orient="records"):
+    for row in rows:
         raw = str(row["staff_name"]).strip()
         if raw:
             seen.setdefault(raw.lower(), raw)
@@ -1182,14 +1183,7 @@ def get_all_staff() -> list[str]:
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:
-    engine = get_engine()
-    df = pd.read_sql(
-        "SELECT * FROM users WHERE user_id = %(uid)s",
-        engine, params={"uid": user_id},
-    )
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
+    return _row("SELECT * FROM users WHERE user_id = :uid", {"uid": user_id})
 
 
 def upsert_user(user_id: int, username: str, role: str = "staff") -> None:
