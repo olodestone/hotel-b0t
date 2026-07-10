@@ -967,14 +967,14 @@ def void_draw(entry_id: int, actor: str = "") -> dict[str, Any] | None:
 
 # ── Transfer log ─────────────────────────────────────────────────────
 
-def record_transfer(drink: str, qty: int, recorded_by: str = "") -> None:
+def record_transfer(drink: str, qty: int, recorded_by: str = "", timestamp: str | None = None) -> None:
     """Log a store→bar stock transfer for audit purposes."""
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO transfers (timestamp, drink_name, quantity, recorded_by)
             VALUES (:ts, :drink, :qty, :recorded_by)
-        """), {"ts": now_str(), "drink": drink.lower(), "qty": qty, "recorded_by": recorded_by})
+        """), {"ts": _ts(timestamp), "drink": drink.lower(), "qty": qty, "recorded_by": recorded_by})
         conn.commit()
 
 

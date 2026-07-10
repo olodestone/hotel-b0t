@@ -21,7 +21,7 @@ Admin only:
   /add_debtor <room|bar> <name> <amt> [note] — Log a debtor
   /pay_debtor <room|bar> <name>              — Mark debtor as paid
   /restock <drink> <qty> <cost>              — Add inventory
-  /transfer <drink> <qty>                    — Move store → bar
+  /transfer <drink> <qty> [YYYY-MM-DD]       — Move store → bar
   /delete <sale|room|expense> <id>           — Remove an entry
   /sales_report [today|YYYY-MM-DD|YYYY-MM|all] — Sales breakdown with cost & profit
   /expense_report [today|YYYY-MM-DD|YYYY-MM|all] — Expense breakdown by category
@@ -390,7 +390,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/set_debt_staff <id> <staff>` — assign staff to a debt\n"
         "`/restock <drink> <qty> <cost_price>`\n"
         "`/restock_plan` — weekly restock advisor _(transfers, reorder tiers, budget)_\n"
-        "`/transfer <drink> <qty>` — move store → bar\n"
+        "`/transfer <drink> <qty> [YYYY-MM-DD]` — move store → bar\n"
         "`/renamedrink <old> <new>` — rename, or merge duplicate SKUs\n"
         "`/setstock <drink> <store> <bar>` — correct stock counts\n"
         "`/deletedrink <drink>` — remove a zero-stock drink\n"
@@ -1376,13 +1376,14 @@ async def cmd_setallocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 @_require_admin
 async def cmd_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = _parse_args(ctx)
+    args, ts = _extract_date(_parse_args(ctx))
     if len(args) < 2:
         await _reply(
             update,
-            "Usage: `/transfer <drink> <qty>`\n"
+            "Usage: `/transfer <drink> <qty> [YYYY-MM-DD]`\n"
             "Moves stock from store to bar/freezer.\n"
-            "Example: `/transfer heineken 12`",
+            "Example: `/transfer heineken 12`\n"
+            "Backdate: `/transfer heineken 12 2025-03-20`",
         )
         return
 
@@ -1392,9 +1393,18 @@ async def cmd_transfer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, err)
         return
 
+    # `_extract_date` only checks the YYYY-MM-DD *shape*, so a calendar-invalid
+    # date (e.g. 2026-13-40) reaches here and must be rejected before the units move.
+    if ts:
+        try:
+            date.fromisoformat(ts)
+        except ValueError:
+            await _reply(update, f"❌ `{ts}` isn't a real date. Use *YYYY-MM-DD*, e.g. `2026-06-01`.")
+            return
+
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_transfer(drink, qty, recorded_by=recorded_by)
+    ok, msg = logic.process_transfer(drink, qty, recorded_by=recorded_by, timestamp=ts)
     await _reply(update, msg)
 
 

@@ -93,7 +93,7 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/pay_debtor <room\|bar> <name> [amount]` | Full or partial debt payment |
 | `/debtor_history <bar\|rooms> <name>` | Full payment timeline for a debtor |
 | `/restock <drink> <qty> <cost_price>` | Add inventory to store. Logged as a `restock` expense row but treated as a cash→stock movement, **not** a P&L cost |
-| `/transfer <drink> <qty>` | Move store → bar |
+| `/transfer <drink> <qty> [YYYY-MM-DD]` | Move store → bar. Logged to the `transfers` audit table; the optional date backdates that log row |
 | `/delete <sale\|room\|expense\|draw> <id>` | Remove an entry |
 | `/staff_report [today\|YYYY-MM-DD\|YYYY-MM]` | Sales per staff member |
 | `/position [set <amount> [YYYY-MM-DD]]` | "What you have" snapshot — cash at hand (headline), stock value & receivables, profit as a one-line footnote. `set <amount> <YYYY-MM-DD>` anchors cash to your real bank balance **on that day**; only flows on/after it are counted, so earlier months are ignored and you can **re-anchor safely each period**. `set <amount>` without a date = all-time starting balance (before the first entry) — set once, never to a current balance |
@@ -200,6 +200,10 @@ Any recording command accepts an optional `YYYY-MM-DD` as the **last argument**:
 Detection: `_extract_date(args)` in `bot.py` checks if the last arg matches `^\d{4}-\d{2}-\d{2}$` and peels it off. The date flows down through `logic.py` → `inventory.py` → `database.py` via a `timestamp: str | None` parameter. `database._ts(custom)` converts `YYYY-MM-DD` to `YYYY-MM-DD 00:00:00`.
 
 `/restock` does **not** support backdating.
+
+`/transfer` backdates its **audit row only** (the `transfers` table). Store and bar
+counts are a live snapshot rather than a per-date ledger, so the units always move
+on execution — the date records *when the move happened*, not when stock existed where.
 
 ## Staff Tracking (`recorded_by`)
 

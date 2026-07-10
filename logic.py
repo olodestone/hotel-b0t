@@ -333,14 +333,18 @@ def process_undo(username: str) -> tuple[bool, str]:
 
 # ── Store → Bar transfer ──────────────────────────────────────────────
 
-def process_transfer(drink: str, qty: int, recorded_by: str = "") -> tuple[bool, str]:
+def process_transfer(drink: str, qty: int, recorded_by: str = "", timestamp: str | None = None) -> tuple[bool, str]:
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer."
 
+    # `timestamp` backdates the audit row only. Store/bar counts are a live
+    # snapshot, not a per-date ledger, so the units always move now.
     result: StockResult = inv.transfer_to_bar(drink.strip(), qty)
     if result.ok:
-        db.record_transfer(drink.strip(), qty, recorded_by=recorded_by)
+        db.record_transfer(drink.strip(), qty, recorded_by=recorded_by, timestamp=timestamp)
     msg = result.message
+    if result.ok and timestamp:
+        msg += f"\nDate: {timestamp}"
     if result.low_stock_alert:
         msg += f"\n\n{result.low_stock_alert}"
     return result.ok, msg
