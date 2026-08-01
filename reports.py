@@ -1271,8 +1271,16 @@ def generate_menu_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
             if key == "not-selling":
                 # "0 sold · GP ₦0" on every line is noise; what matters is how
                 # much cash each one is holding still.
-                held = f" · {i.stock_units} units held ({_fmt(i.tied_value)})" if i.stock_units else " · none in stock"
+                held = (f" · {_plural(i.stock_units, 'unit')} held ({_fmt(i.tied_value)})"
+                        if i.stock_units else " · none in stock")
                 lines.append(f"  • {_esc(i.drink)}: {_fmt(i.unit_margin)}/unit ({_pct(i.margin_pct)}){held}")
+                # Stock sitting entirely in the store can't be sold at all — that's
+                # a missed transfer, not a dead product. Say so before "delist".
+                if i.stranded_in_store:
+                    lines.append(
+                        f"    ⚠️ _all in the store — it never reached the bar._ "
+                        f"`/transfer {i.drink.lower()} {i.store_units}`"
+                    )
             else:
                 lines.append(
                     f"  • {_esc(i.drink)}: {i.units} sold · {_fmt(i.unit_margin)}/unit "

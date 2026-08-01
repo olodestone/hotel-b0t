@@ -572,3 +572,30 @@ def test_variance_rolls_up_losses_separately_from_the_net():
     assert vs.total_units == -2               # … net nets the overage off
     assert vs.total_value == 100.0            # -300 + 400
     assert vs.by_drink[0]["drink"] == "Beer"  # worst loss first
+
+
+def test_menu_item_reports_where_the_stock_actually_is():
+    """A zero-seller with stock only in the store is a missed transfer, not a
+    dead product — it literally cannot be sold from the bar."""
+    stranded = {"drink": "Tiger", "cost_price": 775, "selling_price": 1200,
+                "bar_stock": 0, "store_stock": 14}
+    on_bar = {"drink": "Lager", "cost_price": 500, "selling_price": 800,
+              "bar_stock": 9, "store_stock": 0}
+    items = {m.drink: m for m in metrics.menu_engineering([], [stranded, on_bar])}
+
+    t = items["Tiger"]
+    assert t.quadrant == "not-selling"
+    assert (t.bar_units, t.store_units, t.stock_units) == (0, 14, 14)
+    assert t.stranded_in_store is True
+    assert t.tied_value == 10_850
+
+    # Same zero sales, but it IS on the bar — so the stock isn't the explanation.
+    assert items["Lager"].stranded_in_store is False
+
+
+def test_stranded_needs_stock_in_the_store_not_merely_an_empty_bar():
+    empty = {"drink": "Gone", "cost_price": 500, "selling_price": 800,
+             "bar_stock": 0, "store_stock": 0}
+    m = metrics.menu_engineering([], [empty])[0]
+    assert m.stranded_in_store is False      # nothing anywhere — nothing to transfer
+    assert m.tied_value == 0

@@ -887,8 +887,19 @@ class MenuItem:
     margin_pct: float
     weekly_velocity: float
     quadrant: str
-    stock_units: int
+    stock_units: int            # bar + store
+    bar_units: int
+    store_units: int
     tied_value: float
+
+    @property
+    def stranded_in_store(self):
+        """Stock exists but none of it is in the bar, so it *cannot* be sold.
+
+        A zero-seller in this state is a missed `/transfer`, not a demand
+        problem — a very different fix from delisting it.
+        """
+        return self.bar_units == 0 and self.store_units > 0
 
 
 def menu_engineering(sales_rows, stock_rows, window_days=30):
@@ -923,7 +934,8 @@ def menu_engineering(sales_rows, stock_rows, window_days=30):
             "unit_margin": round(price - cost, 2),
             "margin_pct": pct_of(price - cost, price),
             "weekly_velocity": round(units / weeks, 1),
-            "stock_units": int(i.get("bar_stock", 0)) + int(i.get("store_stock", 0)),
+            "bar_units": int(i.get("bar_stock", 0)),
+            "store_units": int(i.get("store_stock", 0)),
             "cost_price": cost,
         })
 
@@ -952,8 +964,9 @@ def menu_engineering(sales_rows, stock_rows, window_days=30):
             gross_profit=round(r["revenue"] - r["cogs"], 2),
             unit_margin=r["unit_margin"], margin_pct=r["margin_pct"],
             weekly_velocity=r["weekly_velocity"], quadrant=quadrant,
-            stock_units=r["stock_units"],
-            tied_value=round(r["stock_units"] * r["cost_price"], 2),
+            stock_units=r["bar_units"] + r["store_units"],
+            bar_units=r["bar_units"], store_units=r["store_units"],
+            tied_value=round((r["bar_units"] + r["store_units"]) * r["cost_price"], 2),
         ))
     out.sort(key=lambda m: (-m.gross_profit, m.drink))
     return out
