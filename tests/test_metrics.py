@@ -511,19 +511,46 @@ def test_menu_quadrants_split_on_margin_and_popularity():
         {"drink_name": "star", "quantity": 100, "total_revenue": 60000},
         {"drink_name": "plow", "quantity": 100, "total_revenue": 15000},
         {"drink_name": "puzzle", "quantity": 1, "total_revenue": 700},
+        {"drink_name": "dog", "quantity": 1, "total_revenue": 130},   # sells a little
     ]
     quadrants = {m.drink: m.quadrant for m in metrics.menu_engineering(sales, stock)}
     assert quadrants == {"Star": "star", "Plow": "plow-horse",
                          "Puzzle": "puzzle", "Dog": "dog"}
 
 
-def test_unsold_priced_drinks_still_appear_as_dogs_holding_cash():
-    stock = [_stock("Sold", 100, 500), _stock("Idle", 100, 120, units=12)]
+def test_zero_sellers_get_their_own_bucket_not_promotion_advice():
+    """On unit margin alone a zero-seller can score as a "puzzle" and be told to
+    "push it harder" — wrong advice for something nobody bought at all."""
+    stock = [_stock("Sold", 100, 500), _stock("Idle", 100, 900, units=12)]
     sales = [{"drink_name": "sold", "quantity": 50, "total_revenue": 25000}]
     items = {m.drink: m for m in metrics.menu_engineering(sales, stock)}
     assert items["Idle"].units == 0
-    assert items["Idle"].quadrant == "dog"
+    assert items["Idle"].quadrant == "not-selling"      # high margin, but zero sales
     assert items["Idle"].tied_value == 1200
+    assert "Delist" in metrics.QUADRANT_ACTIONS["not-selling"]
+
+
+def test_splitting_zero_sellers_out_does_not_move_the_other_quadrants():
+    """They stay in the averages, so the star/plow/puzzle/dog boundaries hold."""
+    stock = [_stock("Star", 100, 600), _stock("Plow", 100, 150),
+             _stock("Puzzle", 100, 700), _stock("Dog", 100, 130, 10)]
+    sales = [
+        {"drink_name": "star", "quantity": 100, "total_revenue": 60000},
+        {"drink_name": "plow", "quantity": 100, "total_revenue": 15000},
+        {"drink_name": "puzzle", "quantity": 1, "total_revenue": 700},
+        {"drink_name": "dog", "quantity": 1, "total_revenue": 130},
+    ]
+    before = {m.drink: m.quadrant for m in metrics.menu_engineering(sales, stock)}
+    with_zero = metrics.menu_engineering(sales, stock + [_stock("Ghost", 100, 5000, 3)])
+    after = {m.drink: m.quadrant for m in with_zero}
+    assert after["Ghost"] == "not-selling"
+    assert {k: v for k, v in after.items() if k != "Ghost"} == before
+
+
+def test_idle_quadrants_cover_every_bucket_holding_dead_cash():
+    assert set(metrics.IDLE_QUADRANTS) == {"dog", "not-selling"}
+    for q in metrics.IDLE_QUADRANTS:
+        assert q in metrics.QUADRANT_ACTIONS
 
 
 def test_unpriced_drinks_are_excluded_from_the_menu():

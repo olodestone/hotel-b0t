@@ -858,12 +858,22 @@ def compute_room_metrics(room_rows, total_rooms, days):
 
 _POPULARITY_FACTOR = 0.7
 
+# Items that sold *nothing* in the window are pulled out before the quadrants
+# are applied. On unit margin alone a zero-seller often scores as a "puzzle" and
+# gets told to "push it harder", which is the wrong advice for something nobody
+# bought at all — the question there is whether it belongs on the menu, or never
+# reached the bar. They keep their own bucket so that advice, and the cash they
+# tie up, stay visible instead of hiding among genuine low-volume earners.
 QUADRANT_ACTIONS = {
-    "star":       "Protect — keep it always in stock",
-    "plow-horse": "Raise price or renegotiate cost",
-    "puzzle":     "Promote — push it harder",
-    "dog":        "Delist — frees cash and shelf space",
+    "star":        "Protect — keep it always in stock",
+    "plow-horse":  "Raise price or renegotiate cost",
+    "puzzle":      "Promote — push it harder",
+    "dog":         "Delist — frees cash and shelf space",
+    "not-selling": "Delist, or find out why it isn't moving",
 }
+
+# Quadrants whose stock is idle capital worth totalling for the owner.
+IDLE_QUADRANTS = ("dog", "not-selling")
 
 
 @dataclass(frozen=True)
@@ -930,7 +940,11 @@ def menu_engineering(sales_rows, stock_rows, window_days=30):
     for r in rows:
         popular = r["units"] >= avg_units
         profitable = r["unit_margin"] >= avg_margin
-        quadrant = ("star" if popular and profitable else
+        # Zero-sellers are split out first — see IDLE_QUADRANTS above. They stay
+        # in the averages, so pulling them into their own bucket never shifts the
+        # boundaries between the four real quadrants.
+        quadrant = ("not-selling" if r["units"] == 0 else
+                    "star" if popular and profitable else
                     "plow-horse" if popular else
                     "puzzle" if profitable else "dog")
         out.append(MenuItem(

@@ -234,7 +234,7 @@
       <tbody>
         {% for m in view.menu %}
           <tr>
-            <td>{{ m.drink }} <span class="muted small">{{ {'star': '⭐', 'plow-horse': '🐴', 'puzzle': '🧩', 'dog': '🐕'}[m.quadrant] }}</span></td>
+            <td>{{ m.drink }} <span class="muted small">{{ {'star': '⭐', 'plow-horse': '🐴', 'puzzle': '🧩', 'dog': '🐕', 'not-selling': '🚫'}[m.quadrant] }}</span></td>
             <td class="num" data-label="Sold">{{ m.units }}</td>
             <td class="num" data-label="₦/unit">{{ m.unit_margin | naira }}</td>
             <td class="num" data-label="Margin">{{ '%.1f' | format(m.margin_pct) }}%</td>
@@ -245,7 +245,7 @@
       </tbody>
     </table>
   </div>
-  <p class="muted small">⭐ star · 🐴 plow-horse (popular, thin margin) · 🧩 puzzle (good margin, few sales) · 🐕 dog. Quadrants are relative to the menu average, so they shift as sales change.</p>
+  <p class="muted small">⭐ star · 🐴 plow-horse (popular, thin margin) · 🧩 puzzle (good margin, few sales) · 🐕 dog · 🚫 not selling (zero sales this period). Quadrants are relative to the menu average, so they shift as sales change.</p>
 </section>
 {% endif %}
 

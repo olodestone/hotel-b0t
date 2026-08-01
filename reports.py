@@ -1229,10 +1229,11 @@ def generate_payables_report() -> str:
 # ── Menu engineering ──────────────────────────────────────────────────
 
 _QUADRANT_DISPLAY = (
-    ("star",       "⭐ STARS",       "High margin, high volume"),
-    ("plow-horse", "🐴 PLOW-HORSES", "Popular but thin margin"),
-    ("puzzle",     "🧩 PUZZLES",     "Good margin, few sales"),
-    ("dog",        "🐕 DOGS",        "Low margin, low volume"),
+    ("star",        "⭐ STARS",       "High margin, high volume"),
+    ("plow-horse",  "🐴 PLOW-HORSES", "Popular but thin margin"),
+    ("puzzle",      "🧩 PUZZLES",     "Good margin, few sales"),
+    ("dog",         "🐕 DOGS",        "Low margin, low volume"),
+    ("not-selling", "🚫 NOT SELLING", "Zero sales in this window"),
 )
 
 
@@ -1267,15 +1268,26 @@ def generate_menu_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
         lines.append(f"{heading} _({blurb})_")
         lines.append(f"  ➜ {metrics.QUADRANT_ACTIONS[key]}")
         for i in group:
-            lines.append(
-                f"  • {_esc(i.drink)}: {i.units} sold · {_fmt(i.unit_margin)}/unit "
-                f"({_pct(i.margin_pct)}) · GP {_fmt(i.gross_profit)}"
-            )
-        if key == "dog":
+            if key == "not-selling":
+                # "0 sold · GP ₦0" on every line is noise; what matters is how
+                # much cash each one is holding still.
+                held = f" · {i.stock_units} units held ({_fmt(i.tied_value)})" if i.stock_units else " · none in stock"
+                lines.append(f"  • {_esc(i.drink)}: {_fmt(i.unit_margin)}/unit ({_pct(i.margin_pct)}){held}")
+            else:
+                lines.append(
+                    f"  • {_esc(i.drink)}: {i.units} sold · {_fmt(i.unit_margin)}/unit "
+                    f"({_pct(i.margin_pct)}) · GP {_fmt(i.gross_profit)}"
+                )
+        if key in metrics.IDLE_QUADRANTS:
             tied = round(sum(i.tied_value for i in group), 2)
             if tied:
                 lines.append(f"  _{_fmt(tied)} of cash is sitting in these._")
         lines.append("")
+
+    idle = [i for i in items if i.quadrant in metrics.IDLE_QUADRANTS]
+    idle_cash = round(sum(i.tied_value for i in idle), 2)
+    if idle_cash:
+        lines.append(f"💤 *{_fmt(idle_cash)} tied up across {_plural(len(idle), 'drink')} earning nothing.*")
 
     lines += [
         _SEP,
