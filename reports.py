@@ -977,13 +977,39 @@ def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
             lines.append(f"    _…and {len(wc.dead_stock) - 5} more._")
         lines.append(_SEP)
 
-    # Break-even on the current month — the horizon the owner actually budgets to.
-    month_sales = _filter_by_month(_active(db.read_all("sales")), now.year, now.month)
-    month_rooms = _filter_by_month(_active(db.read_all("rooms")), now.year, now.month)
-    month_exp = _filter_by_month(_active(db.read_all("expenses")), now.year, now.month)
+    # Break-even and the room target run on a whole month — the horizon the owner
+    # budgets to. On the first days of a new month there is nothing to measure
+    # yet, and reporting "₦0 needed, ✅ covered" would read as reassurance when
+    # nothing has happened. Fall back to the last month that actually traded.
+    all_sales, all_rooms = _active(db.read_all("sales")), _active(db.read_all("rooms"))
+    all_exp = _active(db.read_all("expenses"))
+
+    def _month(year, month):
+        return (_filter_by_month(all_sales, year, month),
+                _filter_by_month(all_rooms, year, month),
+                _filter_by_month(all_exp, year, month))
+
+    be_year, be_month = now.year, now.month
+    month_sales, month_rooms, month_exp = _month(be_year, be_month)
+    month_label = now.strftime("%B %Y")
+    if not (month_sales or month_rooms):
+        prev = datetime(now.year, now.month, 1) - timedelta(days=1)
+        be_year, be_month = prev.year, prev.month
+        month_sales, month_rooms, month_exp = _month(be_year, be_month)
+        month_label = f"{prev.strftime('%B %Y')} — no {now.strftime('%B')} entries yet"
+
+    if not (month_sales or month_rooms):
+        lines += [
+            "⚖️ *BREAK-EVEN*",
+            "  _No trading recorded yet — record some sales and this fills in._",
+            _SEP,
+            f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
+        ]
+        return "\n".join(lines)
+
     be = metrics.compute_break_even(month_sales, month_exp, cost_map)
 
-    lines.append(f"⚖️ *BAR BREAK-EVEN* _({now.strftime('%B %Y')})_")
+    lines.append(f"⚖️ *BAR BREAK-EVEN* _({month_label})_")
     if be.break_even_revenue is None:
         lines.append(f"  Bar fixed costs: {_fmt(be.fixed_costs)}")
         if be.actual_revenue <= 0:
@@ -1007,7 +1033,7 @@ def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
     # month's real target: the shared overheads (rent, diesel, security, room
     # staff) exist whether or not the bar opens, so rooms carry them.
     rt = metrics.compute_rooms_target(month_sales, month_rooms, month_exp, cost_map)
-    lines += [_SEP, f"🛏 *ROOMS MUST COVER* _({now.strftime('%B %Y')})_"]
+    lines += [_SEP, f"🛏 *ROOMS MUST COVER* _({month_label})_"]
     if rt.bar_contribution >= 0:
         bar_line = f"  − Bar contribution:  {_fmt(rt.bar_contribution)}"
     else:

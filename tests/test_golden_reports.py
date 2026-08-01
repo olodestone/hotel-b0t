@@ -83,3 +83,27 @@ def test_variance_report_current_month(snapshot):
 
 def test_payables_report(snapshot):
     snapshot("payables_report", reports.generate_payables_report())
+
+
+def test_cashcycle_break_even_falls_back_to_the_last_trading_month(monkeypatch):
+    """On the first days of a new month there is nothing to measure yet.
+
+    Reporting "₦0 needed, ✅ covered" there would read as reassurance when
+    nothing has happened, so both blocks fall back to the last month that traded.
+    """
+    from datetime import datetime
+    import metrics as _metrics
+
+    class _JulyFirst(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 7, 1, 9, 0, 0)
+
+    monkeypatch.setattr(reports, "datetime", _JulyFirst)
+    monkeypatch.setattr(_metrics, "datetime", _JulyFirst)
+    out = reports.generate_cashcycle_report()
+
+    assert "no July entries yet" in out          # fallback is labelled, not silent
+    assert "June 2026" in out
+    assert "Bar sales needed" in out             # real figures, not a row of zeros
+    assert "✅ Covered — ₦0 clear" not in out
