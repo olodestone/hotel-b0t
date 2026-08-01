@@ -31,7 +31,7 @@
   </div>
 </div>
 
-{% set margin = (view.pnl.net_profit / view.pnl.total_revenue * 100) if view.pnl.total_revenue else 0 %}
+{# Margins come from metrics.PnL so the dashboard and Telegram can never disagree. #}
 <section class="kpis">
   <div class="kpi">
     <div class="ic">{{ icon('cash') }}</div>
@@ -43,7 +43,13 @@
     <div class="ic">{{ icon('trend') }}</div>
     <div class="k-label">Net Profit <span class="muted">· {{ view.period_label }}</span></div>
     <div class="k-val {{ 'pos' if view.pnl.net_profit >= 0 else 'neg' }}">{{ view.pnl.net_profit | naira }}</div>
-    <div class="k-meta">{{ '%.0f' | format(margin) }}% margin</div>
+    <div class="k-meta">{{ '%.1f' | format(view.pnl.net_margin_pct) }}% net margin</div>
+  </div>
+  <div class="kpi">
+    <div class="ic">{{ icon('bars') }}</div>
+    <div class="k-label">Bar gross margin</div>
+    <div class="k-val">{{ '%.1f' | format(view.pnl.bar.gross_margin_pct) }}%</div>
+    <div class="k-meta">{{ view.pnl.bar.gross_profit | naira }} after stock cost</div>
   </div>
   <div class="kpi">
     <div class="ic">{{ icon('card') }}</div>
@@ -80,6 +86,9 @@
       <tbody>
         <tr><td>Revenue</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.revenue | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.revenue | naira }}</td></tr>
         <tr><td>Cost of stock sold</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.cogs | naira }}</td><td class="num" data-label="🛏 Rooms">—</td></tr>
+        <tr><td>Gross profit <span class="muted small">· margin</span></td>
+          <td class="num" data-label="🍺 Bar">{{ view.pnl.bar.gross_profit | naira }} <span class="muted small">({{ '%.1f' | format(view.pnl.bar.gross_margin_pct) }}%)</span></td>
+          <td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.gross_profit | naira }} <span class="muted small">(no stock cost)</span></td></tr>
         <tr><td>Salaries</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.salary | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.salary | naira }}</td></tr>
         <tr><td>Other expenses</td><td class="num" data-label="🍺 Bar">{{ view.pnl.bar.other_expense | naira }}</td><td class="num" data-label="🛏 Rooms">{{ view.pnl.rooms.other_expense | naira }}</td></tr>
         <tr class="total"><td>Profit</td>
@@ -92,6 +101,202 @@
     <p class="muted small">📦 Stock purchased this period: {{ view.pnl.restock_spend | naira }} — cash → stock, not a profit cost.</p>
   {% endif %}
 </section>
+
+{% set wc = view.working_capital %}
+{% set be = view.break_even %}
+<section class="grid-2">
+  <div class="card">
+    <h2>Cash conversion cycle <span class="muted small">· last {{ wc.window_days }} days</span></h2>
+    {% if wc.ccc_days is none %}
+      <p class="muted">Not enough trading in this window to measure.</p>
+    {% else %}
+      <div class="k-val">{{ '%.0f' | format(wc.ccc_days) }} <span class="muted small">days of cash locked up</span></div>
+      <table class="tbl">
+        <tbody>
+          <tr><td>① Stock sits</td><td class="num">{{ '%.0f' | format(wc.dio_days) }} days</td></tr>
+          <tr><td>② Debtors pay in</td><td class="num">+ {{ '%.0f' | format(wc.dso_days or 0) }} days</td></tr>
+          <tr><td>③ Supplier credit</td><td class="num">− {{ '%.0f' | format(wc.dpo_days or 0) }} days</td></tr>
+        </tbody>
+      </table>
+      <p class="muted small">Every ₦1 spent on stock comes back {{ '%.0f' | format(wc.ccc_days) }} days later.
+      {% if not wc.dpo_tracked %} Supplier credit isn’t tracked yet — buying on terms is the cheapest way to shorten this.{% endif %}</p>
+    {% endif %}
+    {% if wc.receivables > 0 %}
+      <p class="muted small">Owed to us: {{ wc.receivables | naira }} —
+        {% for b in wc.aging if b.amount %}{{ b.label }}: {{ b.amount | naira }}{% if not loop.last %} · {% endif %}{% endfor %}
+      </p>
+    {% endif %}
+    {% if wc.dead_stock %}
+      <p class="muted small">💤 {{ wc.dead_stock | length }} drinks unsold this window — {{ wc.dead_stock_value | naira }} tied up.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Break-even <span class="muted small">· {{ view.period_label }}</span></h2>
+    <h3>Bar</h3>
+    {% if be.break_even_revenue is none %}
+      {% if be.actual_revenue <= 0 %}
+        <p class="muted">No bar sales this period — no margin to work from.</p>
+      {% else %}
+        <p class="muted">No positive gross margin yet — check cost vs selling prices.</p>
+      {% endif %}
+    {% else %}
+      <div class="k-val">{{ be.break_even_revenue | naira }}</div>
+      <div class="k-meta muted small">bar sales needed to cover the bar’s costs</div>
+      <table class="tbl">
+        <tbody>
+          <tr><td>Bar fixed costs</td><td class="num">{{ be.fixed_costs | naira }}</td></tr>
+          <tr><td>Bar gross margin</td><td class="num">{{ '%.1f' | format(be.gross_margin_ratio * 100) }}%</td></tr>
+          <tr class="total"><td>Actual bar sales</td>
+            <td class="num {{ 'pos' if be.surplus >= 0 else 'neg' }}">{{ be.actual_revenue | naira }}</td></tr>
+        </tbody>
+      </table>
+      <p class="muted small">
+        {% if be.surplus >= 0 %}
+          ✅ {{ be.surplus | naira }} above break-even — bar sales can fall {{ '%.1f' | format(be.margin_of_safety_pct) }}% before a loss.
+        {% else %}
+          🔻 {{ (be.surplus | abs) | naira }} short of break-even.
+        {% endif %}
+        Bar only — room revenue carries no stock cost, so blending the two would flatter this badly.
+      </p>
+    {% endif %}
+
+    {% set rt = view.rooms_target %}
+    <h3>Rooms must cover</h3>
+    <div class="k-val">{{ rt.room_sales_needed | naira }}</div>
+    <div class="k-meta muted small">room sales needed, once the bar has done its bit</div>
+    <table class="tbl">
+      <tbody>
+        <tr><td>Shared costs <span class="muted small">· rent, diesel, room staff</span></td>
+          <td class="num">{{ rt.shared_costs | naira }}</td></tr>
+        {% if rt.bar_contribution >= 0 %}
+          <tr><td>− Bar contribution</td><td class="num pos">{{ rt.bar_contribution | naira }}</td></tr>
+        {% else %}
+          <tr><td>+ Bar shortfall <span class="muted small">· rooms cover this too</span></td>
+            <td class="num neg">{{ (rt.bar_contribution | abs) | naira }}</td></tr>
+        {% endif %}
+        <tr class="total"><td>Actual room sales</td>
+          <td class="num {{ 'pos' if rt.covered else 'neg' }}">{{ rt.actual_room_revenue | naira }}</td></tr>
+      </tbody>
+    </table>
+    <p class="muted small">
+      {% if rt.covered %}
+        ✅ Covered — {{ rt.surplus | naira }} clear.
+      {% else %}
+        🔻 Short by {{ (rt.surplus | abs) | naira }} — the month isn’t paid for yet.
+      {% endif %}
+      Rooms carry the shared overheads; a room sale has no stock cost.
+    </p>
+  </div>
+</section>
+
+{% set rm = view.rooms_metrics %}
+{% if rm.room_nights_sold %}
+<section class="card">
+  <h2>Room performance <span class="muted small">· {{ view.period_label }}</span></h2>
+  <div class="tbl-wrap">
+    <table class="tbl stack">
+      <thead><tr><th>Room type</th><th class="num">Nights</th><th class="num">Revenue</th><th class="num">ADR</th></tr></thead>
+      <tbody>
+        {% for rtype, d in rm.by_type.items() | sort(attribute='1.revenue', reverse=true) %}
+          <tr>
+            <td>{{ rtype }}</td>
+            <td class="num" data-label="Nights">{{ d.nights }}</td>
+            <td class="num" data-label="Revenue">{{ d.revenue | naira }}</td>
+            <td class="num" data-label="ADR">{{ d.adr | naira }}</td>
+          </tr>
+        {% endfor %}
+        <tr class="total">
+          <td>All rooms</td>
+          <td class="num" data-label="Nights">{{ rm.room_nights_sold }}</td>
+          <td class="num" data-label="Revenue">{{ rm.revenue | naira }}</td>
+          <td class="num" data-label="ADR">{{ rm.adr | naira }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% if rm.available_room_nights %}
+    <p class="muted small">Occupancy {{ '%.1f' | format(rm.occupancy_pct) }}%
+      ({{ rm.room_nights_sold }} of {{ rm.available_room_nights }} room-nights, {{ rm.total_rooms }} rooms × {{ rm.days }} days)
+      · RevPAR {{ rm.revpar | naira }}. RevPAR is the honest one — discounting to fill rooms lifts occupancy while RevPAR stays flat.</p>
+  {% else %}
+    <p class="muted small">Set your room count in Telegram with <code>/setrooms &lt;n&gt;</code> to see occupancy and RevPAR.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if view.menu %}
+<section class="card">
+  <h2>Menu analysis <span class="muted small">· margin vs popularity</span></h2>
+  <div class="tbl-wrap">
+    <table class="tbl stack">
+      <thead><tr><th>Drink</th><th class="num">Sold</th><th class="num">₦/unit</th><th class="num">Margin</th><th class="num">Gross profit</th><th>Action</th></tr></thead>
+      <tbody>
+        {% for m in view.menu %}
+          <tr>
+            <td>{{ m.drink }} <span class="muted small">{{ {'star': '⭐', 'plow-horse': '🐴', 'puzzle': '🧩', 'dog': '🐕'}[m.quadrant] }}</span></td>
+            <td class="num" data-label="Sold">{{ m.units }}</td>
+            <td class="num" data-label="₦/unit">{{ m.unit_margin | naira }}</td>
+            <td class="num" data-label="Margin">{{ '%.1f' | format(m.margin_pct) }}%</td>
+            <td class="num" data-label="Gross profit">{{ m.gross_profit | naira }}</td>
+            <td data-label="Action" class="muted small">{{ view.menu_actions[m.quadrant] }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted small">⭐ star · 🐴 plow-horse (popular, thin margin) · 🧩 puzzle (good margin, few sales) · 🐕 dog. Quadrants are relative to the menu average, so they shift as sales change.</p>
+</section>
+{% endif %}
+
+{% if view.variance.counts or view.payables %}
+<section class="grid-2">
+  {% if view.variance.counts %}
+  <div class="card">
+    <h2>Stock variance <span class="muted small">· {{ view.variance.counts }} counts</span></h2>
+    {% if view.variance.shrink_units %}
+      <div class="k-val neg">{{ (view.variance.shrink_value | abs) | naira }}</div>
+      <div class="k-meta muted small">{{ view.variance.shrink_units | abs }} units short — breakage, unrecorded sales or theft</div>
+    {% else %}
+      <p class="muted">✅ No shortages recorded.</p>
+    {% endif %}
+    <table class="tbl">
+      <tbody>
+        {% for d in view.variance.by_drink %}
+          <tr><td>{{ d.drink }}</td>
+            <td class="num {{ 'neg' if d.units < 0 else ('pos' if d.units > 0 else '') }}">
+              {{ d.units }} units{% if d.units %} ({{ (d.value | abs) | naira }}){% endif %}
+            </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if view.payables %}
+  <div class="card">
+    <h2>Supplier invoices <span class="muted small">· unpaid</span></h2>
+    <div class="k-val">{{ view.payables_owed | naira }}</div>
+    <div class="k-meta muted small">{{ view.payables | length }} outstanding</div>
+    <div class="tbl-wrap">
+      <table class="tbl stack">
+        <thead><tr><th>#</th><th>Supplier</th><th class="num">Owed</th><th>Due</th></tr></thead>
+        <tbody>
+          {% for p in view.payables %}
+            <tr>
+              <td>{{ p.id }}</td>
+              <td data-label="Supplier">{{ p.supplier | title }}</td>
+              <td class="num" data-label="Owed">{{ (p.amount - (p.amount_paid or 0)) | naira }}</td>
+              <td data-label="Due" class="muted small">{{ p.due_date or '—' }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
 
 <section class="grid-2">
   <div class="card">

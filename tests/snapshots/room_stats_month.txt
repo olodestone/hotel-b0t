@@ -1,0 +1,17 @@
+🛏 *Hotel 85 — Room Performance*
+📅 Period: June 2026 (current month)
+──────────────────────────────
+  Revenue:          ₦140,000
+  Room-nights sold: 8
+  📈 *ADR:  ₦17,500*  _(average rate per night sold)_
+  🏨 *Occupancy: 3.4%*  (8 of 232 room-nights)
+  💰 *RevPAR: ₦603*  _(revenue per available room-night)_
+  _Basis: 8 rooms × 29 days._
+──────────────────────────────
+*BY ROOM TYPE*
+  • Standard: 6 nights · ₦90,000 · ADR ₦15,000
+  • Deluxe: 2 nights · ₦50,000 · ADR ₦25,000
+──────────────────────────────
+_RevPAR is the honest one: discounting to fill rooms lifts occupancy_
+_while RevPAR stays flat._
+_Generated 29 Jun 2026 14:30_

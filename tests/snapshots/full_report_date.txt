@@ -4,20 +4,24 @@
 🍺 *BAR ACCOUNT*
   Revenue: ₦0
   Cost of Stock Sold: ₦0
+  Gross Profit: ₦0  (0.0% margin)
   Salaries: ₦0
   Other Expenses: ₦0
-  📈 *Profit: ₦0*
+  📈 *Profit: ₦0*  (0.0% net)
 ──────────────────────────────
 🛏 *ROOMS ACCOUNT*
   Revenue: ₦90,000
   Salaries: ₦0
   Other Expenses: ₦0
-  📈 *Profit: ₦90,000*
+  📈 *Profit: ₦90,000*  (100.0% net)
+  Room-nights sold: 6  ·  ADR ₦15,000
+  Occupancy: 75.0%  ·  RevPAR ₦11,250
 ──────────────────────────────
 📊 *COMBINED*
   Total Revenue:   ₦90,000
   Total Outgoings: ₦0
   📈 *Net Profit:    ₦90,000*
+  Net Margin:      100.0%  _(₦ kept per ₦100 of sales)_
 ──────────────────────────────
 💳 *OUTSTANDING DEBTORS*
   🍺 Bar (1):    ₦3,000

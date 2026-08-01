@@ -1,0 +1,42 @@
+🔄 *Hotel 85 — Cash Conversion Cycle*
+📅 Last 30 days · as of 29 Jun 2026
+──────────────────────────────
+⏱ *THE CYCLE*
+  ① Stock sits:        83 days
+  ② Debtors pay in:  + 28 days
+  ③ Supplier credit: − 6 days
+  = 🔄 *105 days of cash locked up*
+  _Every ₦1 spent on stock comes back 105 days later._
+──────────────────────────────
+📦 *① STOCK (DIO)*
+  Stock at cost:     ₦11,160
+  Sold at cost:      ₦4,200  (₦140/day)
+  _Basis: from daily stock snapshots._
+──────────────────────────────
+💳 *② DEBTORS (DSO)*
+  Owed to us now:    ₦33,000
+  Sales on credit:   ₦36,000
+  Actual collection: 2 days avg (1 payment, in window)
+  Aging → 0–30 days: ₦33,000
+──────────────────────────────
+🧾 *③ SUPPLIER CREDIT (DPO)*
+  Owed to suppliers: ₦7,200
+  Stock bought:      ₦38,640
+──────────────────────────────
+⚖️ *BAR BREAK-EVEN* _(June 2026)_
+  Bar fixed costs: ₦60,000
+  Bar gross margin:   40.0%
+  Bar sales needed:    ₦150,000
+  Actual bar sales:      ₦7,000  → 🔻 below break-even by ₦143,000
+  _Bar only — room revenue carries no stock cost, so blending the_
+  _two would flatter this number badly._
+──────────────────────────────
+🛏 *ROOMS MUST COVER* _(June 2026)_
+  Shared costs:        ₦51,000
+  + Bar shortfall:     ₦57,200  _(rooms cover this too)_
+  = *Room sales needed: ₦108,200*
+  Actual room sales:   ₦140,000
+  ✅ Covered — ₦31,800 clear.
+  _Rooms carry the shared overheads; a room sale has no stock cost._
+──────────────────────────────
+_Generated 29 Jun 2026 14:30_

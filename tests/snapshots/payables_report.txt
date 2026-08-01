@@ -1,0 +1,10 @@
+🧾 *Hotel 85 — Supplier Invoices*
+📅 As of 29 Jun 2026
+──────────────────────────────
+  *Total owed: ₦7,200* across 1 invoice
+──────────────────────────────
+  #1 Nbl — ₦7,200 · due 2026-07-15
+      _Heineken ×24 @ ₦300.00_  ·  13d old
+──────────────────────────────
+_Settle with_ `/pay_supplier <id> [amount]` _— cash only moves then._
+_Generated 29 Jun 2026 14:30_

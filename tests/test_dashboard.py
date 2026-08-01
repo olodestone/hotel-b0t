@@ -385,3 +385,83 @@ def test_parse_period_variants():
     assert data.parse_period("2026-06") == (None, (2026, 6), False)
     fd, fm, at = data.parse_period("2026-06-05")
     assert (fd.year, fd.month, fd.day) == (2026, 6, 5) and fm is None and at is False
+
+
+# ── Performance & working-capital panels ──────────────────────────────
+
+def test_dashboard_view_exposes_performance_metrics():
+    """The new panels must come from the same metrics core the bot uses, so a
+    number shown in the browser can never disagree with Telegram."""
+    view = data.dashboard_view("all")
+
+    # Margins — identical to the golden full report's ALL-TIME figures.
+    assert view["pnl"].bar.gross_margin_pct == 40.0
+    assert view["pnl"].net_margin_pct == 22.8
+
+    # Rooms yield metrics (8 rooms from the fixture settings).
+    rm = view["rooms_metrics"]
+    assert rm.room_nights_sold == 9
+    assert rm.adr == round(155000 / 9, 2)
+    assert rm.total_rooms == 8
+
+    # Working capital is 'as of now' (trailing 30 days), not the selected period.
+    wc = view["working_capital"]
+    assert wc.window_days == 30
+    assert wc.dio_basis == "snapshots"        # fixture has 3 days of snapshots
+    assert wc.dpo_tracked is True             # fixture has an outstanding payable
+    assert wc.ccc_days is not None
+
+    # Break-even and menu follow the selected period.
+    assert view["break_even"].break_even_revenue is not None
+    # Rooms target must reconcile to the P&L the same page is showing.
+    rt = view["rooms_target"]
+    assert rt.bar_contribution == view["pnl"].bar.profit
+    assert rt.surplus == view["pnl"].net_profit
+    assert {m.drink for m in view["menu"]} == {"Heineken", "Coke"}
+
+    # Stocktake + supplier credit.
+    assert view["variance"].shrink_units == -2
+    assert view["payables_owed"] == 7200
+
+
+def test_dashboard_template_renders_performance_panels(monkeypatch):
+    from dashboard.app import templates
+    view = data.dashboard_view("all")
+    session = {"username": "dev", "role": "admin",
+               "hotels": [{"schema": "hotel85", "name": "Hotel 85", "role": "admin"}]}
+    html = templates.get_template("dashboard.html").render(
+        request=None, hotel_name="Hotel 85", session=session,
+        current_schema="hotel85", view=view, role="admin", current_period="",
+    )
+    assert "Cash conversion cycle" in html
+    assert "Break-even" in html
+    assert "Rooms must cover" in html
+    assert "Room performance" in html
+    assert "Menu analysis" in html
+    assert "Stock variance" in html
+    assert "Supplier invoices" in html
+    assert "40.0%" in html                    # bar gross margin KPI
+    assert "Raise price or renegotiate cost" in html   # menu action column
+
+
+def test_dashboard_renders_when_new_tables_are_empty():
+    """A hotel that has never counted stock or bought on credit must still render."""
+    import database
+    real_read_all = database.read_all
+    real_payables = database.get_outstanding_payables
+    real_snapshots = database.get_inventory_snapshots
+
+    database.read_all = lambda t: [] if t in ("stock_counts", "payables", "inventory_snapshots") else real_read_all(t)
+    database.get_outstanding_payables = lambda: []
+    database.get_inventory_snapshots = lambda since: []
+    try:
+        view = data.dashboard_view("all")
+        assert view["variance"].counts == 0
+        assert view["payables"] == [] and view["payables_owed"] == 0
+        wc = view["working_capital"]
+        assert wc.dio_basis == "current"      # falls back to today's shelf
+        assert wc.dpo_tracked is False        # reported as untracked, not zero
+    finally:
+        database.read_all = real_read_all
+        database.get_outstanding_payables = real_payables
+        database.get_inventory_snapshots = real_snapshots

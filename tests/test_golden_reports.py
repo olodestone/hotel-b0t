@@ -61,3 +61,25 @@ def test_daily_summary(snapshot):
 
 def test_stock_report(snapshot):
     snapshot("stock_report", reports.generate_stock_report())
+
+
+# ── Performance & working-capital reports ─────────────────────────────
+
+def test_cashcycle_report(snapshot):
+    snapshot("cashcycle_report", reports.generate_cashcycle_report())
+
+
+def test_menu_report(snapshot):
+    snapshot("menu_report", reports.generate_menu_report())
+
+
+def test_room_stats_report_current_month(snapshot):
+    snapshot("room_stats_month", reports.generate_room_stats_report())
+
+
+def test_variance_report_current_month(snapshot):
+    snapshot("variance_report_month", reports.generate_variance_report())
+
+
+def test_payables_report(snapshot):
+    snapshot("payables_report", reports.generate_payables_report())

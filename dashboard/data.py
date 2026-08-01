@@ -16,11 +16,16 @@ import metrics
 from config import PIT_LOW_RATE, PIT_HIGH_RATE
 from reports import (  # presentation label + setting keys + pct getters, shared with the bot
     _period_label,
+    _period_days,
     _get_alloc_pcts,
     _get_profit_dist_pcts,
+    _total_rooms,
     CASH_OPENING_KEY,
     CASH_OPENING_DATE_KEY,
 )
+
+# Trailing window for the cash-cycle panel — matches reports._CCC_WINDOW_DAYS.
+CCC_WINDOW_DAYS = 30
 
 
 def parse_period(arg: str | None):
@@ -121,6 +126,24 @@ def cash_position() -> metrics.CashPosition:
     )
 
 
+def working_capital(window_days: int = CCC_WINDOW_DAYS) -> metrics.WorkingCapital:
+    """Cash conversion cycle 'as of now' — same numbers as the bot's /cashcycle."""
+    now = datetime.now()
+    since = (now.date() - timedelta(days=window_days - 1)).strftime("%Y-%m-%d")
+    return metrics.compute_working_capital(
+        sales_all=db.read_all("sales"),
+        expense_all=db.read_all("expenses"),
+        debtor_rows=db.read_all("debtors"),
+        payment_rows=db.read_all("debtor_payments"),
+        stock_rows=inv.get_inventory_summary(),
+        cost_map=_cost_price_map(),
+        payable_rows=db.read_all("payables"),
+        snapshot_rows=db.get_inventory_snapshots(since),
+        window_days=window_days,
+        now=now,
+    )
+
+
 def _recorder(r) -> str:
     """Normalised recorder name (blank/missing → 'Unknown'), matching staff_breakdown."""
     return (r.get("recorded_by") or "Unknown").strip() or "Unknown"
@@ -189,6 +212,8 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         sales = metrics.filter_by_range(metrics.active(db.read_all("sales")), week_start, week_end)
         rooms = metrics.filter_by_range(metrics.active(db.read_all("rooms")), week_start, week_end)
         expenses = metrics.filter_by_range(metrics.active(db.read_all("expenses")), week_start, week_end)
+        counts = metrics.filter_by_range(db.read_all("stock_counts"), week_start, week_end)
+        period_days = (week_end - week_start).days + 1
         period_label = f"This week · {week_start.strftime('%d %b')}–{week_end.strftime('%d %b %Y')}"
         picker = {"date": "", "month": ""}
     else:
@@ -196,6 +221,8 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         sales = metrics.apply_filter(metrics.active(db.read_all("sales")), for_date, for_month, all_time)
         rooms = metrics.apply_filter(metrics.active(db.read_all("rooms")), for_date, for_month, all_time)
         expenses = metrics.apply_filter(metrics.active(db.read_all("expenses")), for_date, for_month, all_time)
+        counts = metrics.apply_filter(db.read_all("stock_counts"), for_date, for_month, all_time)
+        period_days = _period_days(for_date, for_month, all_time, rooms)
         period_label = _period_label(for_date, for_month, all_time)
         # Pre-fills for the date / month period pickers — non-empty only when the
         # current period IS that kind of selection (so the inputs reflect where
@@ -241,6 +268,7 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         }
 
     trend, trend_granularity = _trend(sales, rooms, all_time)
+    payables = db.get_outstanding_payables()
 
     view = {
         "period_label": period_label,
@@ -269,6 +297,20 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         "trend": trend,
         "trend_granularity": trend_granularity,
         "position": cash_position(),  # 'as of now', not period-filtered
+        # Performance for the selected period …
+        "rooms_metrics": metrics.compute_room_metrics(rooms, _total_rooms(), period_days),
+        "break_even": metrics.compute_break_even(sales, expenses, cost_map),
+        "rooms_target": metrics.compute_rooms_target(sales, rooms, expenses, cost_map),
+        "menu": metrics.menu_engineering(sales, stock, window_days=max(period_days, 1)),
+        "variance": metrics.summarize_variance(counts, cost_map),
+        # … and working capital 'as of now'. A cycle length measured over a
+        # part-finished month would swing wildly day to day, so like the cash
+        # position it always uses the trailing 30-day window.
+        "working_capital": working_capital(),
+        "menu_actions": metrics.QUADRANT_ACTIONS,
+        "payables": payables,
+        "payables_owed": round(
+            sum(float(p["amount"]) - float(p.get("amount_paid") or 0) for p in payables), 2),
     }
     return view
 

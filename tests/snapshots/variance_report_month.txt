@@ -1,0 +1,15 @@
+🔍 *Hotel 85 — Stock Variance*
+📅 Period: June 2026 (current month)
+──────────────────────────────
+  Counts taken: 2 across 2 drinks
+  🔻 *Shortages: 2 units — ₦600*
+  _Money lost to breakage, unrecorded sales or theft._
+  Net position: 2 units short (₦600)
+──────────────────────────────
+*BY DRINK*
+  🔻 Heineken: 2 short (₦600)
+  🎯 Coke: exact
+──────────────────────────────
+_Count weekly, same day, before opening — a variance only means_
+_something if the count is routine._
+_Generated 29 Jun 2026 14:30_

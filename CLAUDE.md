@@ -48,7 +48,7 @@ dashboard/ (separate FastAPI web service, read-only) → metrics.py + database.p
 
 **`reports.py`** — Telegram formatting: reads data from `database.py`/`inventory.py`, runs the numbers through `metrics.py`, builds Telegram MarkdownV2 strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses *current* cost price (not historical per-sale cost). Salary expenses are always split out separately from other expenses. Profit calcs exclude `restock` (inventory purchase) and owner draws — see "Profit vs Cash vs Stock" below.
 
-**`metrics.py`** — Pure financial calc core (no DB, no formatting). Functions take already-fetched rows + a cost-price map and return dataclasses (`compute_pnl` → `PnL`/`AccountPnL`, `summarize_outstanding`, plus shared row helpers `apply_filter`/`active`/`operating_expenses`/`cost_of_drinks_sold`/…). This is the **single source of truth** for the math, shared by `reports.py` (Telegram) and `dashboard/` (web) so the two can never disagree. The full report, position, allocation, and staff reports consume it (`compute_pnl`, `compute_cash_position`, `compute_allocation`, `staff_breakdown`). Golden-master tests in `tests/` assert the Telegram output is byte-for-byte unchanged.
+**`metrics.py`** — Pure financial calc core (no DB, no formatting). Functions take already-fetched rows + a cost-price map and return dataclasses (`compute_pnl` → `PnL`/`AccountPnL`, `summarize_outstanding`, plus shared row helpers `apply_filter`/`active`/`operating_expenses`/`cost_of_drinks_sold`/…). This is the **single source of truth** for the math, shared by `reports.py` (Telegram) and `dashboard/` (web) so the two can never disagree. The full report, position, allocation, and staff reports consume it (`compute_pnl`, `compute_cash_position`, `compute_allocation`, `staff_breakdown`), as do the performance reports (`compute_working_capital`, `compute_break_even`, `compute_room_metrics`, `menu_engineering`, `summarize_variance`). Golden-master tests in `tests/` assert the Telegram output is byte-for-byte unchanged.
 
 **`config.py`** — All env var loading via `python-dotenv`. Also holds allocation defaults (`ALLOC_*`) used as fallback when DB settings are not yet set.
 
@@ -65,6 +65,11 @@ Two roles: `admin` and `staff`. Role lookup hits the `users` table on every requ
 - `/expense`, `/add_debtor`, `/pay_debtor`, `/restock`, `/transfer`, `/delete`
 - `/sales_report`, `/expense_report`, `/staff_report`, `/allocation`, `/setallocation`
 - `/setthreshold`, `/addstaff`, `/removestaff`, `/dailyreport`
+- `/cashcycle`, `/menu`, `/roomstats`, `/setrooms` — performance analysis
+- `/count`, `/variance` — stocktakes and shrinkage
+- `/restock_credit`, `/payables`, `/pay_supplier` — supplier credit
+
+The five analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable).
 
 Staff cannot delete anything — audit trail is preserved. Mistakes are corrected by admin via `/delete` then re-entry.
 
@@ -96,6 +101,15 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/transfer <drink> <qty> [YYYY-MM-DD]` | Move store → bar. Logged to the `transfers` audit table; the optional date backdates that log row |
 | `/delete <sale\|room\|expense\|draw> <id>` | Remove an entry |
 | `/staff_report [today\|YYYY-MM-DD\|YYYY-MM]` | Sales per staff member |
+| `/cashcycle [days]` | Cash conversion cycle (DIO + DSO − DPO), receivables aging, idle stock, bar break-even and the room-revenue target. Default window 30 days |
+| `/menu [days]` | Menu engineering — every priced drink ranked into star / plow-horse / puzzle / dog with the action for each |
+| `/roomstats [period]` | Occupancy, ADR and RevPAR, split by room type |
+| `/setrooms <n>` | Record the lettable room count — the denominator for occupancy and RevPAR |
+| `/count <drink> <units> [note] [YYYY-MM-DD]` | Physical stocktake: logs the variance vs what the books expected, then corrects bar stock to the counted figure |
+| `/variance [period]` | Shrinkage report built from stocktakes |
+| `/restock_credit <drink> <qty> <cost> <supplier> [YYYY-MM-DD]` | Receive stock on supplier credit. Stock in now, **no cash out** — trailing date is the due date |
+| `/payables` | Outstanding supplier invoices, soonest due first |
+| `/pay_supplier <id> [amount]` | Settle an invoice fully or partially. **This** is where cash moves (writes a `supplier` expense row) |
 | `/position [set <amount> [YYYY-MM-DD]]` | "What you have" snapshot — cash at hand (headline), stock value & receivables, profit as a one-line footnote. `set <amount> <YYYY-MM-DD>` anchors cash to your real bank balance **on that day**; only flows on/after it are counted, so earlier months are ignored and you can **re-anchor safely each period**. `set <amount>` without a date = all-time starting balance (before the first entry) — set once, never to a current balance |
 | `/allocation [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Revenue allocation + profit distribution |
 | `/setallocation <key> <percent>` | Adjust allocation percentages (see below) |
@@ -126,6 +140,11 @@ All date-filtered reports accept the same arguments:
 | `generate_draws_report()` | `/draws` |
 | `generate_stock_report()` | `/stock` |
 | `generate_debtors_report()` | `/debtors` |
+| `generate_cashcycle_report()` | `/cashcycle` |
+| `generate_menu_report()` | `/menu` |
+| `generate_room_stats_report()` | `/roomstats` |
+| `generate_variance_report()` | `/variance` |
+| `generate_payables_report()` | `/payables` |
 
 ### Profit vs Cash vs Stock (accounting model)
 
@@ -135,7 +154,37 @@ Three figures are tracked separately and must never be conflated:
 2. **Cash in bank (estimate)** — running balance: `opening + collected sales − operating expenses − stock purchases − owner draws`. Draws and restock **do** reduce cash. The `opening` anchor works two ways: with an **anchor date** (`/position set <amount> <YYYY-MM-DD>`, stored in `cash_opening_date`) only flows on/after that day are counted — `opening` is your real balance on that day, earlier months are ignored, and you can re-anchor each period without double-counting. Without a date, `opening` is the all-time starting balance before the first entry and every flow is added on top (set once; never to a current balance). Assumes sales are cash unless an outstanding debtor exists.
 3. **Stock value on hand (asset)** — `Σ (store + bar units) × cost_price`. Shown as `TOTAL VALUE` in `/stock` and line ③ of `/position`.
 
-`/position` shows all three side by side plus outstanding receivables. Owner draws live in the dedicated `owner_draws` table, never in `expenses`, so they can never touch profit.
+`/position` shows all three side by side plus outstanding receivables and (when any exist) unpaid supplier invoices. Owner draws live in the dedicated `owner_draws` table, never in `expenses`, so they can never touch profit.
+
+### Margins
+
+`metrics.AccountPnL` and `metrics.PnL` expose margins as computed properties, so every surface divides identically:
+
+- **Gross margin** = `(revenue − COGS) / revenue` — pricing and purchasing health, before any expense.
+- **Net margin** = `profit / revenue` — whole-operation health.
+
+The rooms account has `cogs = 0.0` by construction, so its gross margin is always 100% (read it as *contribution* margin). The blended `PnL.gross_margin_pct` is therefore inflated by room mix — **the per-account figures are the ones to act on**. `metrics.pct_of()` is the single divide-by-zero-safe helper behind all of them.
+
+### Cash conversion cycle (`/cashcycle`)
+
+`CCC = DIO + DSO − DPO`, in days: how long cash is trapped between paying for stock and banking the proceeds. This is what explains a profitable month with an empty account. All of it lives in `metrics.compute_working_capital()`, which takes **all-time** rows and applies the trailing window internally so the three legs can never be windowed inconsistently.
+
+- **DIO** — `avg stock value / daily COGS`. Uses the mean of `inventory_snapshots` when ≥2 days exist (`dio_basis == "snapshots"`), otherwise falls back to today's shelf (`"current"`). `inventory` is overwritten in place, so without snapshots there is no stock history at all.
+- **DSO** — ratio estimate (`receivables / daily credit sales`) feeds the cycle; `collection_days` is the separately reported *measured* figure, **amount-weighted across `debtor_payments` events** so part-payments count. Falls back from window to all-time basis, flagged via `collection_basis`.
+- **DPO** — from the `payables` table. When nothing has been bought on credit, `dpo_tracked` is `False` and the report says so rather than silently treating it as zero (which would overstate the cycle).
+
+`compute_rooms_target()` answers the owner's actual monthly question — *how much must rooms bring in?* — by mirroring how a small hotel really runs: the bar carries only the costs it causes (its staff, its freezer), and room revenue carries the shared overheads (rent, diesel, security, room staff) that exist whether or not the bar opens. Because a room sale has no stock behind it, this is a **subtraction, not a division by a margin**: `room_sales_needed = shared_costs − bar_contribution`, clamped at 0. A loss-making bar has a negative contribution, which correctly *raises* the room target. `bar_contribution` equals `PnL.bar.profit` by construction and `surplus` equals `PnL.net_profit` — both pinned by tests, so the target can never drift from the P&L on the same screen.
+
+`compute_break_even()` is **bar-account only** on every side: bar revenue, bar gross margin, bar operating expenses (treated as fixed for the period). Rooms are excluded deliberately — their zero-COGS revenue pushes a blended margin toward 100% and makes break-even look far easier than it is. Scoping only the *margin* to the bar while keeping whole-hotel costs would be worse still: it applies the bar's margin to room revenue that really does convert at ~100%, and reports "below break-even" in months that turned a genuine profit. Because costs and revenue move to the bar too, the figure can never disagree with the bar P&L — there's a regression test asserting the signs agree.
+
+### Supplier credit and the two stock-purchase categories
+
+`NON_PNL_CATEGORIES` is now `STOCK_PURCHASE_CATEGORIES = {"restock", "supplier"}`. Both are cash-out-not-cost:
+
+- `restock` — paid on delivery (`/restock`).
+- `supplier` — settlement of an earlier credit purchase (`/pay_supplier`).
+
+`/restock_credit` deliberately writes **no** expense row: the stock arrives but no cash has moved. `restock_spend()` sums both categories so the `/position` cash estimate stays right, and `compute_working_capital` excludes `supplier` rows from `purchases_window` (they settle stock bought earlier — counting them would double-count).
 
 ### Salary expenses
 Record with category `salary`:
@@ -186,6 +235,10 @@ The `inventory` table tracks two separate stock locations:
 
 `/stock` renders a monospace table with Store and Bar columns. ⚠️ = low bar stock, 🔴 = empty store.
 
+**Stocktakes.** `/count <drink> <units>` records what is *physically* in the bar. The database can never detect breakage or theft on its own — it only ever believes its own arithmetic — so a physical count is the one independent observation that makes loss visible. `db.record_stock_count()` does both halves in one transaction: it logs the variance (preserving the evidence) **and** corrects `current_stock` to the counted figure (stopping one bad count cascading). `/variance` rolls the counts up; `metrics.summarize_variance()` reports losses (`shrink_*`) separately from the net, since an overage in one drink must not mask a shortage in another.
+
+**Nightly snapshots.** `_schedule_inventory_snapshot()` runs `db.record_inventory_snapshot()` at 23:55 local for every hotel, unconditionally (independent of whether the daily report is on). It is idempotent per day via `ON CONFLICT (snapshot_date, drink_name)`, so restarts and manual runs are safe.
+
 ## Backdated Entries
 
 Any recording command accepts an optional `YYYY-MM-DD` as the **last argument**:
@@ -225,7 +278,10 @@ on execution — the date records *when the move happened*, not when stock exist
 | `debtor_payments` | `id`, `debtor_id`, `timestamp`, `amount`, `recorded_by` — one row per payment event |
 | `inventory` | `drink_name`, `current_stock`, `store_stock`, `total_purchased`, `total_sold`, `cost_price`, `low_stock_threshold` |
 | `users` | `user_id`, `username`, `role`, `added_at` |
-| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`) and `cash_opening_date` (optional anchor date; cash counts only flows on/after it) |
+| `stock_counts` | `id`, `timestamp`, `drink_name`, `expected`, `counted`, `variance`, `cost_price`, `note`, `recorded_by` — one physical stocktake; the only independent check on the books |
+| `payables` | `id`, `timestamp`, `supplier`, `drink_name`, `quantity`, `amount`, `amount_paid`, `due_date`, `status`, `paid_at`, `recorded_by` — supplier credit; makes DPO computable |
+| `inventory_snapshots` | `snapshot_date`, `drink_name`, `bar_stock`, `store_stock`, `cost_price`, `stock_value` — PK `(snapshot_date, drink_name)`; nightly stock history for true DIO |
+| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it) and `total_rooms` (occupancy/RevPAR denominator) |
 
 All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases upgrade safely on next startup.
 

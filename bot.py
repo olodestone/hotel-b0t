@@ -231,6 +231,23 @@ def _to_int(value: str, label: str) -> tuple[int | None, str]:
         return None, f"❌ *{label}* must be a positive whole number. Got: `{value}`"
 
 
+def _to_count(value: str, label: str) -> tuple[int | None, str]:
+    """Like _to_int but allows 0 — a stocktake of an empty shelf is valid data."""
+    try:
+        v = int(value)
+        if v < 0:
+            raise ValueError
+        return v, ""
+    except ValueError:
+        return None, f"❌ *{label}* must be a whole number of 0 or more. Got: `{value}`"
+
+
+def _actor(update: Update) -> str:
+    """Who is performing this action, as stored in `recorded_by`."""
+    user = update.effective_user
+    return user.username or user.first_name or str(user.id)
+
+
 def _to_float(value: str, label: str) -> tuple[float | None, str]:
     try:
         v = float(value)
@@ -406,7 +423,22 @@ def _help_text(is_admin: bool = False) -> str:
         "`/addstaff <user_id> <username>` | `/removestaff <user_id>`\n"
         "`/dailyreport on|off`\n"
         "`/activity` | `/activity YYYY-MM-DD` | `/activity username`\n"
-        "`/export` — download full hotel data as Excel file"
+        "`/export` — download full hotel data as Excel file\n"
+        "\n"
+        "*📈 Performance* _(also under_ ⚙️ Manage → 📈 Insights_)_\n"
+        "`/cashcycle [days]` — how long cash is locked in stock & debtors, + break-even\n"
+        "`/menu [days]` — which drinks to protect, push, reprice or drop\n"
+        "`/roomstats [period]` — occupancy, ADR & RevPAR\n"
+        "`/setrooms <n>` — your room count _(needed for occupancy & RevPAR)_\n"
+        "\n"
+        "*🔍 Stock control*\n"
+        "`/count <drink> <units> [note]` — physical stocktake; logs the variance\n"
+        "`/variance [period]` — shortages found by counting _(breakage/theft)_\n"
+        "\n"
+        "*🧾 Supplier credit*\n"
+        "`/restock_credit <drink> <qty> <cost> <supplier> [due YYYY-MM-DD]`\n"
+        "`/payables` — what you owe suppliers\n"
+        "`/pay_supplier <id> [amount]` — settle an invoice _(cash moves here)_"
     )
     return staff_cmds + admin_cmds
 
@@ -1312,6 +1344,188 @@ async def cmd_allocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await _reply_long(update, text)
 
 
+# ── Performance & working-capital commands (admin) ────────────────────
+
+def _period_kwargs(arg: str) -> dict | None:
+    """Map a period argument to generate_*_report kwargs, or None if unparseable.
+
+    The older report commands each inline this ladder; the newer ones share it.
+    """
+    from datetime import datetime
+    arg = (arg or "").lower()
+    if not arg:
+        now = datetime.now()
+        return {"for_month": (now.year, now.month)}
+    if arg == "today":
+        return {"for_date": datetime.now().date()}
+    if arg == "all":
+        return {"all_time": True}
+    for fmt, key in (("%Y-%m-%d", "for_date"), ("%Y-%m", "for_month")):
+        try:
+            dt = datetime.strptime(arg, fmt)
+        except ValueError:
+            continue
+        return {key: dt.date()} if key == "for_date" else {key: (dt.year, dt.month)}
+    return None
+
+
+@_require_admin
+async def cmd_cashcycle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """How long cash is trapped in stock and debtors, plus break-even."""
+    args = _parse_args(ctx)
+    window = 30
+    if args:
+        parsed, err = _to_int(args[0], "window in days")
+        if err:
+            await _reply(update, f"Usage: `/cashcycle [days]` — default 30.\n\n{err}")
+            return
+        window = min(parsed, 365)
+    await _reply_long(update, reports.generate_cashcycle_report(window_days=window))
+
+
+@_require_admin
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menu engineering — which drinks to protect, push, reprice or drop."""
+    args = _parse_args(ctx)
+    window = 30
+    if args:
+        parsed, err = _to_int(args[0], "window in days")
+        if err:
+            await _reply(update, f"Usage: `/menu [days]` — default 30.\n\n{err}")
+            return
+        window = min(parsed, 365)
+    await _reply_long(update, reports.generate_menu_report(window_days=window))
+
+
+@_require_admin
+async def cmd_roomstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Occupancy, ADR and RevPAR."""
+    args = _parse_args(ctx)
+    kwargs = _period_kwargs(args[0] if args else "")
+    if kwargs is None:
+        await _reply(update, "Usage: `/roomstats` | `/roomstats today` | `/roomstats YYYY-MM-DD` | `/roomstats YYYY-MM` | `/roomstats all`")
+        return
+    await _reply_long(update, reports.generate_room_stats_report(**kwargs))
+
+
+@_require_admin
+async def cmd_setrooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record how many lettable rooms the hotel has — the occupancy denominator."""
+    args = _parse_args(ctx)
+    if not args:
+        current = reports._total_rooms()
+        now = f"Currently set to *{current}* rooms." if current else "Not set yet."
+        await _reply(
+            update,
+            f"Usage: `/setrooms <number of rooms>`\n\n{now}\n\n"
+            "_Occupancy and RevPAR need this number — without it there's no_\n"
+            "_denominator to divide room-nights sold by._",
+        )
+        return
+    total, err = _to_int(args[0], "room count")
+    if err:
+        await _reply(update, err)
+        return
+    ok, msg = logic.process_set_rooms(total)
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record a physical bar count; logs the variance and trues the books up."""
+    args, custom_date = _extract_date(_parse_args(ctx))
+    if len(args) < 2:
+        await _reply(
+            update,
+            "Usage: `/count <drink> <units counted> [note] [YYYY-MM-DD]`\n\n"
+            "Example: `/count heineken 18 friday count`\n\n"
+            "_Counts what's physically in the bar, logs any difference against_\n"
+            "_what the books expected, then corrects the stock to your count._",
+        )
+        return
+    counted, err = _to_count(args[1], "counted units")
+    if err:
+        await _reply(update, err)
+        return
+    note = " ".join(args[2:])
+    ok, msg = logic.process_stock_count(
+        args[0], counted, note=note,
+        recorded_by=_actor(update), timestamp=custom_date,
+    )
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_variance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shrinkage report built from stocktakes."""
+    args = _parse_args(ctx)
+    kwargs = _period_kwargs(args[0] if args else "")
+    if kwargs is None:
+        await _reply(update, "Usage: `/variance` | `/variance today` | `/variance YYYY-MM-DD` | `/variance YYYY-MM` | `/variance all`")
+        return
+    await _reply_long(update, reports.generate_variance_report(**kwargs))
+
+
+@_require_admin
+async def cmd_restock_credit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receive stock on supplier credit — stock in now, cash out at /pay_supplier."""
+    args, due_date = _extract_date(_parse_args(ctx))
+    if len(args) < 4:
+        await _reply(
+            update,
+            "Usage: `/restock_credit <drink> <qty> <cost_price> <supplier> [YYYY-MM-DD]`\n\n"
+            "Example: `/restock_credit heineken 24 300 nbl 2026-08-15`\n\n"
+            "_Adds the stock and records what you owe. No cash leaves until you run_\n"
+            "`/pay_supplier <id>`_. The trailing date is the payment due date._",
+        )
+        return
+    qty, err = _to_int(args[1], "quantity")
+    if err:
+        await _reply(update, err)
+        return
+    cost, err = _to_float(args[2], "cost price")
+    if err:
+        await _reply(update, err)
+        return
+    supplier = " ".join(args[3:])
+    ok, msg = logic.process_restock_credit(
+        args[0], qty, cost, supplier, due_date=due_date, recorded_by=_actor(update),
+    )
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_pay_supplier(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Settle a supplier invoice — this is where the cash actually moves."""
+    args = _parse_args(ctx)
+    if not args:
+        await _reply(
+            update,
+            "Usage: `/pay_supplier <invoice id> [amount]`\n\n"
+            "Leave the amount out to settle the invoice in full.\n"
+            "See what's owed with `/payables`.",
+        )
+        return
+    payable_id, err = _to_int(args[0], "invoice ID")
+    if err:
+        await _reply(update, err)
+        return
+    amount = None
+    if len(args) > 1:
+        amount, err = _to_float(args[1], "amount")
+        if err:
+            await _reply(update, err)
+            return
+    ok, msg = logic.process_pay_supplier(payable_id, amount=amount, paid_by=_actor(update))
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_payables(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Outstanding supplier invoices."""
+    await _reply_long(update, reports.generate_payables_report())
+
+
 # ── /setallocation (admin) ────────────────────────────────────────────
 
 _ALLOC_KEYS = ("buffer", "restock", "draw", "reinvest", "float")
@@ -1552,6 +1766,34 @@ def _schedule_daily_report(
         data=(chat_id, schema),
     )
     logger.info("Daily report scheduled at %s %s for chat_id=%s schema=%s", time_str, tz_str, chat_id, schema)
+
+
+async def _snapshot_inventory(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Freeze today's stock levels so DIO can use a real period average.
+
+    `inventory` is overwritten in place, so without a nightly snapshot there is
+    no stock history at all and the cash cycle can only ever estimate from
+    today's shelf. Silent by design — nobody needs a message about it.
+    """
+    schema = ctx.job.data
+    db._hotel_schema_var.set(schema)
+    try:
+        rows = db.record_inventory_snapshot()
+        logger.info("Inventory snapshot saved: %s drinks, schema=%s", rows, schema)
+    except Exception:   # never let a snapshot failure take the bot down
+        logger.exception("Inventory snapshot failed for schema=%s", schema)
+
+
+def _schedule_inventory_snapshot(job_queue, schema: str, tz_str: str = "Africa/Lagos") -> None:
+    """Nightly at 23:55 local — late enough to capture the day's trading."""
+    tz = pytz.timezone(tz_str)
+    job_queue.run_daily(
+        _snapshot_inventory,
+        time=dtime(hour=23, minute=55, tzinfo=tz),
+        name="inventory_snapshot",
+        data=schema,
+    )
+    logger.info("Inventory snapshot scheduled at 23:55 %s for schema=%s", tz_str, schema)
 
 
 # ── /hotels (app owner only) ─────────────────────────────────────────
@@ -2505,6 +2747,33 @@ async def _cb_history_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await _reply_long_cb(q, "\n".join(lines))
 
 
+async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """📈 Insights submenu — each entry mirrors its slash command exactly."""
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+
+    from datetime import datetime as _dt
+    action = q.data[4:]
+    now = _dt.now()
+
+    if action == "cashcycle":
+        text = reports.generate_cashcycle_report()
+    elif action == "menu":
+        text = reports.generate_menu_report()
+    elif action == "roomstats":
+        text = reports.generate_room_stats_report(for_month=(now.year, now.month))
+    elif action == "variance":
+        text = reports.generate_variance_report(for_month=(now.year, now.month))
+    elif action == "payables":
+        text = reports.generate_payables_report()
+    else:
+        return
+    await _reply_long_cb(q, text)
+
+
 # ── Keyboard shortcut handlers ────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2527,7 +2796,20 @@ def _manage_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📈 Restock Plan", callback_data="mgr:restock_plan")],
         [InlineKeyboardButton("🛠 Fix Stock",    callback_data="mgr:fixstock"),
          InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings")],
-        [InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff")],
+        [InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff"),
+         InlineKeyboardButton("📈 Insights",     callback_data="mgr:insights")],
+    ])
+
+
+def _insights_menu_keyboard() -> InlineKeyboardMarkup:
+    """Performance analysis — the "why" behind the numbers, one level down so the
+    Manage menu doesn't turn into a wall of buttons."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Cash Cycle",   callback_data="ins:cashcycle"),
+         InlineKeyboardButton("🍽 Menu",         callback_data="ins:menu")],
+        [InlineKeyboardButton("🛏 Room Stats",   callback_data="ins:roomstats"),
+         InlineKeyboardButton("🔍 Variance",     callback_data="ins:variance")],
+        [InlineKeyboardButton("🧾 Supplier Bills", callback_data="ins:payables")],
     ])
 
 
@@ -3938,6 +4220,13 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=_settings_menu_keyboard(),
         )
 
+    elif action == "insights":
+        await q.edit_message_text(
+            "📈 *Insights*\n_Margins, cash cycle and what to do about them._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_insights_menu_keyboard(),
+        )
+
     elif action == "staff":
         access_users, report_names = _staff_overview()
         lines = ["👥 *Staff*", "", "*Bot access* _(can log sales)_:"]
@@ -4737,7 +5026,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
     app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
     app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
-    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|insights|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_insights_menu, pattern="^ins:(cashcycle|menu|roomstats|variance|payables)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))
@@ -4775,6 +5065,15 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("setallocation", cmd_setallocation))
     app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("restock_plan", cmd_restock_plan))
+    app.add_handler(CommandHandler("cashcycle", cmd_cashcycle))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("roomstats", cmd_roomstats))
+    app.add_handler(CommandHandler("setrooms", cmd_setrooms))
+    app.add_handler(CommandHandler("count", cmd_count))
+    app.add_handler(CommandHandler("variance", cmd_variance))
+    app.add_handler(CommandHandler("restock_credit", cmd_restock_credit))
+    app.add_handler(CommandHandler("pay_supplier", cmd_pay_supplier))
+    app.add_handler(CommandHandler("payables", cmd_payables))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("transfer", cmd_transfer))
@@ -4821,6 +5120,9 @@ def _build_app(
         "daily_report_time": daily_report_time,
     })
     _register_handlers(app, schema, admin_ids)
+    # Unconditional: the stock history it builds feeds /cashcycle regardless of
+    # whether this hotel has the daily report switched on.
+    _schedule_inventory_snapshot(app.job_queue, schema, timezone)
     if report_chat_id:
         _schedule_daily_report(app.job_queue, report_chat_id, schema, timezone, daily_report_time)
     if is_owner_bot:

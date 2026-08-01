@@ -5,6 +5,7 @@ All monetary values are in ₦ (Naira) — change the symbol in _fmt() if needed
 """
 from __future__ import annotations
 
+from calendar import monthrange
 from datetime import datetime, date, timedelta
 from math import ceil
 from typing import Any
@@ -36,6 +37,21 @@ _SEP = "─" * 30
 
 def _fmt(amount: float) -> str:
     return f"₦{amount:,.0f}"
+
+
+def _pct(value: float | None, dash: str = "—") -> str:
+    """Format a percentage; `dash` when the ratio is undefined (no denominator)."""
+    return dash if value is None else f"{value:.1f}%"
+
+
+def _days(value: float | None, dash: str = "—") -> str:
+    if value is None:
+        return dash
+    return f"{value:.0f} day" + ("" if f"{value:.0f}" == "1" else "s")
+
+
+def _plural(count: int, word: str, suffix: str = "s") -> str:
+    return f"{count} {word}" + ("" if count == 1 else suffix)
 
 
 def _esc(text: str) -> str:
@@ -136,6 +152,36 @@ def _period_label(for_date: date | None, for_month: tuple[int, int] | None, all_
     return f"{label} (current month)" if (year, month) == (now.year, now.month) else label
 
 
+# Number of lettable rooms — the denominator for occupancy and RevPAR.
+TOTAL_ROOMS_KEY = "total_rooms"
+
+
+def _total_rooms() -> int:
+    try:
+        return int(float(db.get_setting(TOTAL_ROOMS_KEY, "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _period_days(for_date: date | None, for_month: tuple[int, int] | None,
+                 all_time: bool, rows: list[dict] | tuple = ()) -> int:
+    """Days a period actually covers — the denominator for occupancy/RevPAR.
+
+    The current month counts only elapsed days: charging a half-finished month
+    for its unsold future nights would understate occupancy every time.
+    """
+    now = datetime.now()
+    if for_date:
+        return 1
+    if all_time:
+        days = [dt.date() for dt in (_parse_ts(r.get("timestamp")) for r in rows) if dt]
+        return (now.date() - min(days)).days + 1 if days else 0
+    year, month = for_month if for_month else (now.year, now.month)
+    if (year, month) == (now.year, now.month):
+        return now.day
+    return monthrange(year, month)[1]
+
+
 def _cost_price_map() -> dict[str, float]:
     """Current cost price per drink (lower-cased name → cost) from inventory."""
     return {r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")}
@@ -190,9 +236,10 @@ def generate_full_report(
         "🍺 *BAR ACCOUNT*",
         f"  Revenue: {_fmt(bar.revenue)}",
         f"  Cost of Stock Sold: {_fmt(bar.cogs)}",
+        f"  Gross Profit: {_fmt(bar.gross_profit)}  ({_pct(bar.gross_margin_pct)} margin)",
         f"  Salaries: {_fmt(bar.salary)}",
         f"  Other Expenses: {_fmt(bar.other_expense)}",
-        f"  {bar_emoji} *Profit: {_fmt(bar.profit)}*",
+        f"  {bar_emoji} *Profit: {_fmt(bar.profit)}*  ({_pct(bar.net_margin_pct)} net)",
     ]
 
     if bar.other_breakdown:
@@ -206,8 +253,19 @@ def generate_full_report(
         f"  Revenue: {_fmt(rooms.revenue)}",
         f"  Salaries: {_fmt(rooms.salary)}",
         f"  Other Expenses: {_fmt(rooms.other_expense)}",
-        f"  {room_emoji} *Profit: {_fmt(rooms.profit)}*",
+        f"  {room_emoji} *Profit: {_fmt(rooms.profit)}*  ({_pct(rooms.net_margin_pct)} net)",
     ]
+
+    # Yield metrics — only meaningful once the hotel's room count is recorded.
+    rm = metrics.compute_room_metrics(
+        room_rows, _total_rooms(), _period_days(for_date, for_month, all_time, room_rows)
+    )
+    if rm.room_nights_sold:
+        lines.append(f"  Room-nights sold: {rm.room_nights_sold}  ·  ADR {_fmt(rm.adr)}")
+        if rm.available_room_nights:
+            lines.append(f"  Occupancy: {_pct(rm.occupancy_pct)}  ·  RevPAR {_fmt(rm.revpar)}")
+        else:
+            lines.append("  _Set the room count with_ `/setrooms <n>` _for occupancy & RevPAR._")
 
     if rooms.other_breakdown:
         lines.append("  _Other breakdown:_")
@@ -220,6 +278,7 @@ def generate_full_report(
         f"  Total Revenue:   {_fmt(pnl.total_revenue)}",
         f"  Total Outgoings: {_fmt(pnl.total_outgoings)}",
         f"  {net_emoji} *Net Profit:    {_fmt(pnl.net_profit)}*",
+        f"  Net Margin:      {_pct(pnl.net_margin_pct)}  _(₦ kept per ₦100 of sales)_",
         _SEP,
     ]
 
@@ -786,11 +845,416 @@ def generate_position_report() -> str:
         f"  Bar + store @ cost:  {_fmt(pos.stock_value)}",
         "💳 *OWED TO US* _(receivables)_",
         f"  Outstanding debtors: {_fmt(pos.receivables)}  ({pos.outstanding_count} owing)",
+    ]
+
+    # Supplier credit is a claim on cash you already have — show it so the
+    # headline balance is never mistaken for money that's free to spend.
+    payables = db.get_outstanding_payables()
+    if payables:
+        owed = round(sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in payables), 2)
+        lines += [
+            "🧾 *WE OWE* _(supplier credit)_",
+            f"  Unpaid invoices:     {_fmt(owed)}  ({len(payables)} outstanding)",
+            f"  _Cash free of supplier claims: {_fmt(round(pos.cash - owed, 2))}_",
+        ]
+
+    lines += [
         _SEP,
         f"📊 _Profit (not cash): this month {_fmt(pos.month_profit)} · all-time {_fmt(pos.profit_all)}_",
         "_Performance only — owner draws & stock buys are excluded from profit._",
         _SEP,
         "_Anchor cash to a real balance: /position set <amount> <YYYY-MM-DD>_",
+        f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Cash conversion cycle / working capital ───────────────────────────
+
+_CCC_WINDOW_DAYS = 30
+
+_DIO_BASIS_NOTE = {
+    "snapshots": "from daily stock snapshots",
+    "current": "from today's shelf — snapshots are still building history",
+    "none": "nothing sold in the window",
+}
+
+
+def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
+    """How many days cash is locked up between paying for stock and banking it.
+
+    All arithmetic lives in metrics.compute_working_capital / compute_break_even
+    (shared with the dashboard).
+    """
+    now = datetime.now()
+    cost_map = _cost_price_map()
+    stock_rows = inv.get_inventory_summary()
+    since = (now.date() - timedelta(days=window_days - 1)).strftime("%Y-%m-%d")
+
+    wc = metrics.compute_working_capital(
+        sales_all=db.read_all("sales"),
+        expense_all=db.read_all("expenses"),
+        debtor_rows=db.read_all("debtors"),
+        payment_rows=db.read_all("debtor_payments"),
+        stock_rows=stock_rows,
+        cost_map=cost_map,
+        payable_rows=db.read_all("payables"),
+        snapshot_rows=db.get_inventory_snapshots(since),
+        window_days=window_days,
+        now=now,
+    )
+
+    lines = [
+        f"🔄 *{HOTEL_NAME} — Cash Conversion Cycle*",
+        f"📅 Last {window_days} days · as of {now.strftime('%d %b %Y')}",
+        _SEP,
+        "⏱ *THE CYCLE*",
+    ]
+
+    if wc.ccc_days is None:
+        lines += [
+            "  _Not enough trading in this window to measure._",
+            "  Record some sales and it fills in automatically.",
+            _SEP,
+        ]
+    else:
+        lines += [
+            f"  ① Stock sits:        {_days(wc.dio_days)}",
+            f"  ② Debtors pay in:  + {_days(wc.dso_days, '0 days')}",
+            f"  ③ Supplier credit: − {_days(wc.dpo_days, '0 days')}",
+            f"  = 🔄 *{wc.ccc_days:.0f} days of cash locked up*",
+            f"  _Every ₦1 spent on stock comes back {wc.ccc_days:.0f} days later._",
+            _SEP,
+        ]
+
+    lines += [
+        "📦 *① STOCK (DIO)*",
+        f"  Stock at cost:     {_fmt(wc.stock_value)}",
+        f"  Sold at cost:      {_fmt(wc.cogs_window)}  ({_fmt(wc.daily_cogs)}/day)",
+        f"  _Basis: {_DIO_BASIS_NOTE[wc.dio_basis]}._",
+        _SEP,
+        "💳 *② DEBTORS (DSO)*",
+        f"  Owed to us now:    {_fmt(wc.receivables)}",
+        f"  Sales on credit:   {_fmt(wc.credit_sales_window)}",
+    ]
+    if wc.collection_days is not None:
+        basis = "in window" if wc.collection_basis == "window" else "all-time"
+        lines.append(
+            f"  Actual collection: {_days(wc.collection_days)} avg "
+            f"({_plural(wc.settled_count, 'payment')}, {basis})"
+        )
+    if wc.receivables > 0:
+        aged = "  ·  ".join(f"{b.label}: {_fmt(b.amount)}" for b in wc.aging if b.amount)
+        if aged:
+            lines.append(f"  Aging → {aged}")
+        old = next((b for b in wc.aging if b.label.startswith("61")), None)
+        if old and old.amount:
+            lines.append(f"  ⚠️ {_fmt(old.amount)} is over 60 days old — chase it or write it off.")
+    lines.append(_SEP)
+
+    lines.append("🧾 *③ SUPPLIER CREDIT (DPO)*")
+    if not wc.dpo_tracked:
+        lines += [
+            "  Not tracked — every restock is recorded as paid on the spot.",
+            f"  Stock bought: {_fmt(wc.purchases_window)}",
+            "  _Buying on terms is the cheapest way to shorten the cycle:_",
+            "  _it costs nothing but a conversation with your supplier._",
+            "  _Record credit purchases with_ `/restock_credit` _to measure it._",
+        ]
+    else:
+        lines += [
+            f"  Owed to suppliers: {_fmt(wc.payables_outstanding)}",
+            f"  Stock bought:      {_fmt(wc.purchases_window)}",
+        ]
+    lines.append(_SEP)
+
+    if wc.dead_stock:
+        lines.append("💤 *IDLE STOCK* _(nothing sold this window)_")
+        lines.append(f"  {len(wc.dead_stock)} drinks · {_fmt(wc.dead_stock_value)} tied up")
+        for d in wc.dead_stock[:5]:
+            lines.append(f"    • {_esc(d['drink'])}: {d['units']} units ({_fmt(d['value'])})")
+        if len(wc.dead_stock) > 5:
+            lines.append(f"    _…and {len(wc.dead_stock) - 5} more._")
+        lines.append(_SEP)
+
+    # Break-even on the current month — the horizon the owner actually budgets to.
+    month_sales = _filter_by_month(_active(db.read_all("sales")), now.year, now.month)
+    month_rooms = _filter_by_month(_active(db.read_all("rooms")), now.year, now.month)
+    month_exp = _filter_by_month(_active(db.read_all("expenses")), now.year, now.month)
+    be = metrics.compute_break_even(month_sales, month_exp, cost_map)
+
+    lines.append(f"⚖️ *BAR BREAK-EVEN* _({now.strftime('%B %Y')})_")
+    if be.break_even_revenue is None:
+        lines.append(f"  Bar fixed costs: {_fmt(be.fixed_costs)}")
+        if be.actual_revenue <= 0:
+            lines.append("  _No bar sales this period — no margin to work from._")
+        else:
+            lines.append("  _No positive gross margin yet — check cost vs selling prices._")
+    else:
+        verdict = "✅ above break-even" if be.surplus >= 0 else "🔻 below break-even"
+        lines += [
+            f"  Bar fixed costs: {_fmt(be.fixed_costs)}",
+            f"  Bar gross margin:{be.gross_margin_ratio * 100:>7.1f}%",
+            f"  Bar sales needed:{_fmt(be.break_even_revenue):>12}",
+            f"  Actual bar sales:{_fmt(be.actual_revenue):>12}  → {verdict} by {_fmt(abs(be.surplus))}",
+        ]
+        if be.surplus >= 0:
+            lines.append(f"  _Safety margin: {_pct(be.margin_of_safety_pct)} — how far bar sales can fall before a loss._")
+        lines.append("  _Bar only — room revenue carries no stock cost, so blending the_")
+        lines.append("  _two would flatter this number badly._")
+
+    # What rooms have to bring in, once the bar has done its bit. This is the
+    # month's real target: the shared overheads (rent, diesel, security, room
+    # staff) exist whether or not the bar opens, so rooms carry them.
+    rt = metrics.compute_rooms_target(month_sales, month_rooms, month_exp, cost_map)
+    lines += [_SEP, f"🛏 *ROOMS MUST COVER* _({now.strftime('%B %Y')})_"]
+    if rt.bar_contribution >= 0:
+        bar_line = f"  − Bar contribution:  {_fmt(rt.bar_contribution)}"
+    else:
+        bar_line = f"  + Bar shortfall:     {_fmt(abs(rt.bar_contribution))}  _(rooms cover this too)_"
+    lines += [
+        f"  Shared costs:        {_fmt(rt.shared_costs)}",
+        bar_line,
+        f"  = *Room sales needed: {_fmt(rt.room_sales_needed)}*",
+        f"  Actual room sales:   {_fmt(rt.actual_room_revenue)}",
+    ]
+    if rt.covered:
+        lines.append(f"  ✅ Covered — {_fmt(rt.surplus)} clear.")
+    else:
+        lines.append(f"  🔻 Short by {_fmt(abs(rt.surplus))} — the month isn't paid for yet.")
+    lines.append("  _Rooms carry the shared overheads; a room sale has no stock cost._")
+
+    lines += [_SEP, f"_Generated {now.strftime('%d %b %Y %H:%M')}_"]
+    return "\n".join(lines)
+
+
+# ── Stocktake variance (shrinkage) ────────────────────────────────────
+
+def generate_variance_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """Physical counts vs what the books expected — the only view of shrinkage."""
+    rows = _apply_filter(db.read_all("stock_counts"), for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+
+    if not rows:
+        return (
+            f"🔍 *Stock Variance — {label}*\n\n"
+            "No stocktakes recorded for this period.\n"
+            "Count the bar with `/count <drink> <units>` — the books can't spot "
+            "breakage or theft on their own."
+        )
+
+    vs = metrics.summarize_variance(rows, _cost_price_map())
+    lines = [
+        f"🔍 *{HOTEL_NAME} — Stock Variance*",
+        f"📅 Period: {label}",
+        _SEP,
+        f"  Counts taken: {vs.counts} across {vs.drinks} drinks",
+    ]
+
+    if vs.shrink_units:
+        lines += [
+            f"  🔻 *Shortages: {abs(vs.shrink_units)} units — {_fmt(abs(vs.shrink_value))}*",
+            "  _Money lost to breakage, unrecorded sales or theft._",
+        ]
+    else:
+        lines.append("  ✅ No shortages recorded — every count matched or ran over.")
+
+    net_word = "short" if vs.total_units < 0 else "over"
+    lines += [
+        f"  Net position: {abs(vs.total_units)} units {net_word} ({_fmt(abs(vs.total_value))})",
+        _SEP,
+        "*BY DRINK*",
+    ]
+    for d in vs.by_drink:
+        if d["units"] == 0:
+            mark, detail = "🎯", "exact"
+        elif d["units"] < 0:
+            mark, detail = "🔻", f"{abs(d['units'])} short ({_fmt(abs(d['value']))})"
+        else:
+            mark, detail = "🔺", f"{d['units']} over ({_fmt(d['value'])})"
+        lines.append(f"  {mark} {_esc(d['drink'])}: {detail}")
+
+    lines += [
+        _SEP,
+        "_Count weekly, same day, before opening — a variance only means_",
+        "_something if the count is routine._",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Room performance (occupancy / ADR / RevPAR) ───────────────────────
+
+def generate_room_stats_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """Occupancy, ADR and RevPAR — the three standard hotel yield metrics."""
+    room_rows = _apply_filter(_active(db.read_all("rooms")), for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+    total_rooms = _total_rooms()
+    days = _period_days(for_date, for_month, all_time, room_rows)
+    rm = metrics.compute_room_metrics(room_rows, total_rooms, days)
+
+    lines = [
+        f"🛏 *{HOTEL_NAME} — Room Performance*",
+        f"📅 Period: {label}",
+        _SEP,
+    ]
+
+    if not room_rows:
+        lines.append("No room bookings recorded for this period.")
+        return "\n".join(lines)
+
+    lines += [
+        f"  Revenue:          {_fmt(rm.revenue)}",
+        f"  Room-nights sold: {rm.room_nights_sold}",
+        f"  📈 *ADR:  {_fmt(rm.adr)}*  _(average rate per night sold)_",
+    ]
+
+    if not total_rooms:
+        lines += [
+            _SEP,
+            "⚠️ *Occupancy and RevPAR need your room count.*",
+            "  Run `/setrooms <number of rooms>` once — then they appear here",
+            "  and in every /report.",
+        ]
+    else:
+        lines += [
+            f"  🏨 *Occupancy: {_pct(rm.occupancy_pct)}*  "
+            f"({rm.room_nights_sold} of {rm.available_room_nights} room-nights)",
+            f"  💰 *RevPAR: {_fmt(rm.revpar)}*  _(revenue per available room-night)_",
+            f"  _Basis: {total_rooms} rooms × {days} days._",
+        ]
+
+    if rm.by_type:
+        lines += [_SEP, "*BY ROOM TYPE*"]
+        for rtype, d in sorted(rm.by_type.items(), key=lambda kv: -kv[1]["revenue"]):
+            lines.append(
+                f"  • {_esc(rtype)}: {d['nights']} nights · {_fmt(d['revenue'])} · ADR {_fmt(d['adr'])}"
+            )
+
+    lines += [
+        _SEP,
+        "_RevPAR is the honest one: discounting to fill rooms lifts occupancy_",
+        "_while RevPAR stays flat._",
+        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Supplier invoices (payables) ──────────────────────────────────────
+
+def generate_payables_report() -> str:
+    """Outstanding supplier invoices, soonest due first."""
+    rows = db.get_outstanding_payables()
+    now = datetime.now()
+
+    if not rows:
+        return (
+            "🧾 *Supplier Invoices*\n\n"
+            "Nothing owed to suppliers.\n"
+            "_Received stock on credit? Record it with_\n"
+            "`/restock_credit <drink> <qty> <cost> <supplier> [YYYY-MM-DD]`"
+        )
+
+    total = round(sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in rows), 2)
+    lines = [
+        f"🧾 *{HOTEL_NAME} — Supplier Invoices*",
+        f"📅 As of {now.strftime('%d %b %Y')}",
+        _SEP,
+        f"  *Total owed: {_fmt(total)}* across {_plural(len(rows), 'invoice')}",
+        _SEP,
+    ]
+
+    for r in rows:
+        remaining = round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
+        opened = _parse_ts(r.get("timestamp"))
+        age = f"{(now.date() - opened.date()).days}d old" if opened else ""
+        flag = ""
+        due = str(r.get("due_date") or "")
+        if due:
+            try:
+                due_date = datetime.strptime(due, "%Y-%m-%d").date()
+                overdue = (now.date() - due_date).days
+                flag = f" ⚠️ *{overdue}d overdue*" if overdue > 0 else f" · due {due}"
+            except ValueError:
+                pass
+        lines.append(f"  #{r['id']} {_esc(str(r['supplier']).title())} — {_fmt(remaining)}{flag}")
+        detail = str(r.get("description") or "")
+        if detail:
+            lines.append(f"      _{_esc(detail)}_  ·  {age}")
+        if float(r.get("amount_paid") or 0) > 0:
+            lines.append(f"      _part-paid {_fmt(float(r['amount_paid']))} of {_fmt(float(r['amount']))}_")
+
+    lines += [
+        _SEP,
+        "_Settle with_ `/pay_supplier <id> [amount]` _— cash only moves then._",
+        f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Menu engineering ──────────────────────────────────────────────────
+
+_QUADRANT_DISPLAY = (
+    ("star",       "⭐ STARS",       "High margin, high volume"),
+    ("plow-horse", "🐴 PLOW-HORSES", "Popular but thin margin"),
+    ("puzzle",     "🧩 PUZZLES",     "Good margin, few sales"),
+    ("dog",        "🐕 DOGS",        "Low margin, low volume"),
+)
+
+
+def generate_menu_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
+    """Rank every drink by margin against popularity, and say what to do about it."""
+    now = datetime.now()
+    stock_rows = inv.get_inventory_summary()
+    start = now.date() - timedelta(days=window_days - 1)
+    sales_rows = metrics.filter_by_range(_active(db.read_all("sales")), start, now.date())
+
+    items = metrics.menu_engineering(sales_rows, stock_rows, window_days=window_days)
+    if not items:
+        return (
+            "🍽 *Menu Analysis*\n\n"
+            "No drinks have a selling price yet.\n"
+            "Set one with `/setprice <drink> <amount>`."
+        )
+
+    total_gp = round(sum(i.gross_profit for i in items), 2)
+    lines = [
+        f"🍽 *{HOTEL_NAME} — Menu Analysis*",
+        f"📅 Last {window_days} days · as of {now.strftime('%d %b %Y')}",
+        _SEP,
+        f"  Gross profit from drinks: {_fmt(total_gp)}",
+        _SEP,
+    ]
+
+    for key, heading, blurb in _QUADRANT_DISPLAY:
+        group = [i for i in items if i.quadrant == key]
+        if not group:
+            continue
+        lines.append(f"{heading} _({blurb})_")
+        lines.append(f"  ➜ {metrics.QUADRANT_ACTIONS[key]}")
+        for i in group:
+            lines.append(
+                f"  • {_esc(i.drink)}: {i.units} sold · {_fmt(i.unit_margin)}/unit "
+                f"({_pct(i.margin_pct)}) · GP {_fmt(i.gross_profit)}"
+            )
+        if key == "dog":
+            tied = round(sum(i.tied_value for i in group), 2)
+            if tied:
+                lines.append(f"  _{_fmt(tied)} of cash is sitting in these._")
+        lines.append("")
+
+    lines += [
+        _SEP,
+        "_Quadrants compare each drink to the menu average, so they shift as_",
+        "_sales change. Act on the ranking, not on one week's noise._",
         f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)

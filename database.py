@@ -281,6 +281,58 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
                 deleted_at  TEXT DEFAULT ''
             )
         """))
+        # Physical stocktakes. The books can only ever believe their own
+        # arithmetic, so a counted figure is the one independent observation
+        # that makes breakage/theft visible. `expected` is what the system
+        # thought was in the bar at count time; `counted` is what was there.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS stock_counts (
+                id          SERIAL PRIMARY KEY,
+                timestamp   TEXT,
+                drink_name  TEXT,
+                expected    INTEGER NOT NULL DEFAULT 0,
+                counted     INTEGER NOT NULL DEFAULT 0,
+                variance    INTEGER NOT NULL DEFAULT 0,
+                cost_price  FLOAT   NOT NULL DEFAULT 0,
+                note        TEXT DEFAULT '',
+                recorded_by TEXT DEFAULT ''
+            )
+        """))
+        # Supplier credit. A credit purchase puts stock on the shelf without
+        # cash leaving the account, so it must NOT create an expense row on
+        # delivery — /pay_supplier writes the `supplier` expense (cash out) when
+        # the invoice is actually settled. This table is what makes DPO (and so
+        # a truthful cash conversion cycle) computable at all.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS payables (
+                id          SERIAL PRIMARY KEY,
+                timestamp   TEXT,
+                supplier    TEXT,
+                drink_name  TEXT DEFAULT '',
+                quantity    INTEGER NOT NULL DEFAULT 0,
+                amount      FLOAT   NOT NULL DEFAULT 0,
+                amount_paid FLOAT   NOT NULL DEFAULT 0,
+                due_date    TEXT DEFAULT '',
+                status      TEXT DEFAULT 'outstanding',
+                paid_at     TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                recorded_by TEXT DEFAULT ''
+            )
+        """))
+        # Daily inventory snapshots. `inventory` is overwritten in place, so
+        # without this there is no stock history and DIO can only ever be
+        # estimated from today's shelf. One row per drink per day.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS inventory_snapshots (
+                snapshot_date TEXT NOT NULL,
+                drink_name    TEXT NOT NULL,
+                bar_stock     INTEGER NOT NULL DEFAULT 0,
+                store_stock   INTEGER NOT NULL DEFAULT 0,
+                cost_price    FLOAT   NOT NULL DEFAULT 0,
+                stock_value   FLOAT   NOT NULL DEFAULT 0,
+                PRIMARY KEY (snapshot_date, drink_name)
+            )
+        """))
         conn.commit()
 
 
@@ -1114,6 +1166,167 @@ def get_last_staff_entry(username: str, window_minutes: int = 2) -> dict[str, An
     return best
 
 
+# ── Stocktakes ────────────────────────────────────────────────────────
+
+def record_stock_count(drink: str, expected: int, counted: int, cost_price: float,
+                       note: str = "", recorded_by: str = "",
+                       timestamp: str | None = None) -> dict[str, Any]:
+    """Log one physical count and true the bar stock up to what was counted.
+
+    Both halves matter: the log preserves the variance for the shrinkage report
+    (overwriting the stock alone would erase the evidence), and the correction
+    stops one bad count cascading into every later figure.
+    """
+    name = drink.strip().lower()
+    variance = int(counted) - int(expected)
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO stock_counts
+                (timestamp, drink_name, expected, counted, variance, cost_price, note, recorded_by)
+            VALUES (:ts, :name, :expected, :counted, :variance, :cost, :note, :recorded_by)
+        """), {
+            "ts": _ts(timestamp), "name": name,
+            "expected": int(expected), "counted": int(counted), "variance": variance,
+            "cost": round(float(cost_price), 2), "note": note, "recorded_by": recorded_by,
+        })
+        conn.execute(text(
+            "UPDATE inventory SET current_stock = :counted WHERE lower(drink_name) = :name"
+        ), {"counted": int(counted), "name": name})
+        conn.commit()
+    return {
+        "drink": name, "expected": int(expected), "counted": int(counted),
+        "variance": variance, "value": round(variance * float(cost_price), 2),
+    }
+
+
+# ── Supplier credit (payables) ────────────────────────────────────────
+
+def record_payable(supplier: str, amount: float, drink_name: str = "", quantity: int = 0,
+                   due_date: str = "", description: str = "", recorded_by: str = "",
+                   timestamp: str | None = None) -> int:
+    """Log stock received on supplier credit. Returns the new payable's id.
+
+    Deliberately writes no expense row: the stock is on the shelf but no cash
+    has left the account yet. `pay_supplier` records the cash movement later.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            INSERT INTO payables
+                (timestamp, supplier, drink_name, quantity, amount, amount_paid,
+                 due_date, status, description, recorded_by)
+            VALUES (:ts, :supplier, :drink, :qty, :amount, 0, :due, 'outstanding', :desc, :by)
+            RETURNING id
+        """), {
+            "ts": _ts(timestamp), "supplier": supplier.strip(), "drink": drink_name.strip().lower(),
+            "qty": int(quantity), "amount": round(float(amount), 2),
+            "due": due_date, "desc": description, "by": recorded_by,
+        }).fetchone()
+        conn.commit()
+    return int(row[0])
+
+
+def get_outstanding_payables() -> list[dict[str, Any]]:
+    return _rows(
+        "SELECT * FROM payables WHERE status = 'outstanding' ORDER BY "
+        "CASE WHEN due_date = '' THEN 1 ELSE 0 END, due_date, timestamp"
+    )
+
+
+def pay_supplier(payable_id: int, amount: float | None = None,
+                 paid_by: str = "") -> dict[str, Any] | None:
+    """Settle a supplier invoice (fully or partially).
+
+    Writes the matching `supplier` expense row so cash falls at the moment the
+    money actually leaves — the whole point of tracking credit separately.
+    Returns None if the id is unknown or already settled.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT * FROM payables WHERE id = :id AND status = 'outstanding'"
+        ), {"id": payable_id}).fetchone()
+        if row is None:
+            return None
+
+        bill = dict(row._mapping)
+        original = float(bill["amount"])
+        already = float(bill.get("amount_paid") or 0)
+        remaining_before = round(original - already, 2)
+
+        if amount is not None and round(amount, 2) > remaining_before:
+            return {"error": "overpayment", "remaining": remaining_before, "payable_id": payable_id}
+
+        pay_now = round(amount if amount is not None else remaining_before, 2)
+        total_paid = round(already + pay_now, 2)
+        remaining = round(original - total_paid, 2)
+        fully_paid = remaining <= 0
+
+        if fully_paid:
+            conn.execute(text("""
+                UPDATE payables SET amount_paid = :paid, status = 'paid', paid_at = :ts
+                WHERE id = :id
+            """), {"paid": total_paid, "ts": now_str(), "id": payable_id})
+        else:
+            conn.execute(text(
+                "UPDATE payables SET amount_paid = :paid WHERE id = :id"
+            ), {"paid": total_paid, "id": payable_id})
+
+        supplier = str(bill["supplier"])
+        conn.execute(text("""
+            INSERT INTO expenses (timestamp, account, category, amount, description, recorded_by)
+            VALUES (:ts, 'bar', 'supplier', :amount, :desc, :by)
+        """), {
+            "ts": now_str(), "amount": pay_now,
+            "desc": f"payment to {supplier} (invoice #{payable_id})", "by": paid_by,
+        })
+        conn.commit()
+
+    return {
+        "payable_id": payable_id, "supplier": supplier,
+        "original_amount": original, "amount_paid_now": pay_now,
+        "total_paid": total_paid, "remaining": max(remaining, 0),
+        "is_fully_paid": fully_paid,
+    }
+
+
+# ── Inventory snapshots ───────────────────────────────────────────────
+
+def record_inventory_snapshot(snapshot_date: str | None = None) -> int:
+    """Freeze today's stock levels into `inventory_snapshots`. Returns row count.
+
+    Idempotent per day — re-running overwrites that day's rows rather than
+    duplicating them, so a restart or a manual run is always safe.
+    """
+    day = snapshot_date or datetime.now().strftime("%Y-%m-%d")
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            INSERT INTO inventory_snapshots
+                (snapshot_date, drink_name, bar_stock, store_stock, cost_price, stock_value)
+            SELECT :day, drink_name, current_stock, store_stock, cost_price,
+                   ROUND(((current_stock + store_stock) * cost_price)::numeric, 2)
+              FROM inventory
+            ON CONFLICT (snapshot_date, drink_name) DO UPDATE SET
+                bar_stock   = EXCLUDED.bar_stock,
+                store_stock = EXCLUDED.store_stock,
+                cost_price  = EXCLUDED.cost_price,
+                stock_value = EXCLUDED.stock_value
+        """), {"day": day})
+        conn.commit()
+        return result.rowcount
+
+
+def get_inventory_snapshots(since: str) -> list[dict[str, Any]]:
+    """Snapshot rows on/after `since` (YYYY-MM-DD). Scoped so the table can grow
+    without every cash-cycle report dragging its whole history into memory."""
+    return _rows(
+        "SELECT * FROM inventory_snapshots WHERE snapshot_date >= :since ORDER BY snapshot_date",
+        {"since": since},
+    )
+
+
 # ── Settings ─────────────────────────────────────────────────────────
 
 def get_setting(key: str, default: str = "") -> str:
@@ -1217,6 +1430,7 @@ def remove_user(user_id: int) -> bool:
 _RECORDED_BY_TABLES = (
     "sales", "rooms", "expenses", "owner_draws",
     "debtors", "debtor_payments", "transfers",
+    "stock_counts", "payables",
 )
 
 

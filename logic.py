@@ -251,6 +251,129 @@ def process_restock(drink: str, qty: int, cost_price: float, recorded_by: str = 
     return result.ok, result.message
 
 
+# ── Stocktake ─────────────────────────────────────────────────────────
+
+def process_stock_count(drink: str, counted: int, note: str = "", recorded_by: str = "",
+                        timestamp: str | None = None) -> tuple[bool, str]:
+    """Record a physical bar count, log the variance, and true the books up.
+
+    Variance is the only signal the system has for breakage, unrecorded sales
+    or theft — every other number is derived from what was keyed in.
+    """
+    if counted < 0:
+        return False, "❌ Counted units cannot be negative."
+
+    name = drink.strip().lower()
+    existing = db.get_drink(name)
+    if existing is None:
+        return False, f"❌ '{drink}' not found in inventory. Restock it first with /restock."
+
+    expected = int(existing["current_stock"])
+    cost = float(existing.get("cost_price") or 0)
+    result = db.record_stock_count(
+        name, expected=expected, counted=counted, cost_price=cost,
+        note=note, recorded_by=recorded_by, timestamp=timestamp,
+    )
+
+    variance, value = result["variance"], result["value"]
+    header = f"✅ Counted *{drink.title()}*: {counted} units (books said {expected})."
+    if variance == 0:
+        return True, f"{header}\n🎯 Exact match — no variance."
+    if variance < 0:
+        return True, (
+            f"{header}\n"
+            f"🔻 *Short by {abs(variance)} units* — ₦{abs(value):,.2f} at cost.\n"
+            f"Bar stock corrected to {counted}. Check breakage, unrecorded sales or theft."
+        )
+    return True, (
+        f"{header}\n"
+        f"🔺 *Over by {variance} units* — ₦{value:,.2f} at cost.\n"
+        f"Bar stock corrected to {counted}. Usually a missed transfer or a sale keyed twice."
+    )
+
+
+# ── Supplier credit ───────────────────────────────────────────────────
+
+def process_restock_credit(drink: str, qty: int, cost_price: float, supplier: str,
+                           due_date: str | None = None, recorded_by: str = "",
+                           timestamp: str | None = None) -> tuple[bool, str]:
+    """Receive stock on supplier credit: stock in now, cash out later.
+
+    No expense row is written here — the money hasn't moved. /pay_supplier
+    records the cash when the invoice is settled.
+    """
+    if qty <= 0:
+        return False, "❌ Quantity must be a positive integer."
+    if cost_price <= 0:
+        return False, "❌ Cost price must be a positive number."
+    if not supplier.strip():
+        return False, "❌ Supplier name is required."
+    if due_date and not parse_date(due_date):
+        return False, "❌ Due date must be in YYYY-MM-DD format."
+
+    result: StockResult = inv.restock_drink(drink.strip(), qty, cost_price)
+    if not result.ok:
+        return False, result.message
+
+    total = round(qty * cost_price, 2)
+    payable_id = db.record_payable(
+        supplier=supplier, amount=total, drink_name=drink.strip(), quantity=qty,
+        due_date=due_date or "",
+        description=f"{drink.strip().title()} ×{qty} @ ₦{cost_price:,.2f}",
+        recorded_by=recorded_by, timestamp=timestamp,
+    )
+    due_note = f"\n📅 Due: {due_date}" if due_date else ""
+    return True, (
+        f"{result.message}\n\n"
+        f"🧾 *On credit from {supplier.strip().title()}* — ₦{total:,.2f} owed (invoice #{payable_id}).{due_note}\n"
+        f"_No cash has left yet. Settle with_ `/pay_supplier {payable_id}`_._"
+    )
+
+
+def process_pay_supplier(payable_id: int, amount: float | None = None,
+                         paid_by: str = "") -> tuple[bool, str]:
+    if amount is not None and amount <= 0:
+        return False, "❌ Payment amount must be a positive number."
+
+    result = db.pay_supplier(payable_id, amount=amount, paid_by=paid_by)
+    if result is None:
+        return False, f"❌ No outstanding supplier invoice with ID `{payable_id}`."
+    if result.get("error") == "overpayment":
+        return False, (
+            f"❌ That's more than is owed on invoice #{payable_id}.\n"
+            f"Remaining: ₦{result['remaining']:,.2f}"
+        )
+
+    supplier = str(result["supplier"]).title()
+    if result["is_fully_paid"]:
+        return True, (
+            f"✅ Invoice #{payable_id} to *{supplier}* fully settled.\n"
+            f"  Paid now: ₦{result['amount_paid_now']:,.2f}\n"
+            f"  Total: ₦{result['total_paid']:,.2f}"
+        )
+    return True, (
+        f"✅ Part payment to *{supplier}* on invoice #{payable_id}.\n"
+        f"  Paid now: ₦{result['amount_paid_now']:,.2f}\n"
+        f"  Still owed: ₦{result['remaining']:,.2f}"
+    )
+
+
+# ── Room count (occupancy basis) ──────────────────────────────────────
+
+def process_set_rooms(total: int) -> tuple[bool, str]:
+    """Record how many lettable rooms the hotel has.
+
+    Without it occupancy and RevPAR are undefined — there's no denominator.
+    """
+    if total <= 0:
+        return False, "❌ Room count must be a positive whole number."
+    db.set_setting(reports.TOTAL_ROOMS_KEY, str(int(total)))
+    return True, (
+        f"✅ Hotel room count set to *{int(total)}*.\n"
+        f"Occupancy, ADR and RevPAR now show in /report and /roomstats."
+    )
+
+
 # ── Entry deletion ───────────────────────────────────────────────────
 
 _VALID_ENTRY_TYPES = ("sale", "room", "expense", "draw")

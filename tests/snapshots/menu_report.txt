@@ -1,0 +1,17 @@
+🍽 *Hotel 85 — Menu Analysis*
+📅 Last 30 days · as of 29 Jun 2026
+──────────────────────────────
+  Gross profit from drinks: ₦2,800
+──────────────────────────────
+⭐ STARS _(High margin, high volume)_
+  ➜ Protect — keep it always in stock
+  • Heineken: 10 sold · ₦200/unit (40.0%) · GP ₦2,000
+
+🐴 PLOW-HORSES _(Popular but thin margin)_
+  ➜ Raise price or renegotiate cost
+  • Coke: 10 sold · ₦80/unit (40.0%) · GP ₦800
+
+──────────────────────────────
+_Quadrants compare each drink to the menu average, so they shift as_
+_sales change. Act on the ranking, not on one week's noise._
+_Generated 29 Jun 2026 14:30_

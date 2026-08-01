@@ -4,9 +4,10 @@
 🍺 *BAR ACCOUNT*
   Revenue: ₦7,000
   Cost of Stock Sold: ₦4,200
+  Gross Profit: ₦2,800  (40.0% margin)
   Salaries: ₦50,000
   Other Expenses: ₦10,000
-  📉 *Profit: ₦-57,200*
+  📉 *Profit: ₦-57,200*  (-817.1% net)
   _Other breakdown:_
     • Utilities: ₦10,000
 ──────────────────────────────
@@ -14,7 +15,9 @@
   Revenue: ₦140,000
   Salaries: ₦45,000
   Other Expenses: ₦6,000
-  📈 *Profit: ₦89,000*
+  📈 *Profit: ₦89,000*  (63.6% net)
+  Room-nights sold: 8  ·  ADR ₦17,500
+  Occupancy: 3.4%  ·  RevPAR ₦603
   _Other breakdown:_
     • Laundry: ₦6,000
 ──────────────────────────────
@@ -22,6 +25,7 @@
   Total Revenue:   ₦147,000
   Total Outgoings: ₦115,200
   📈 *Net Profit:    ₦31,800*
+  Net Margin:      21.6%  _(₦ kept per ₦100 of sales)_
 ──────────────────────────────
 📦 Stock purchased: ₦30,000
   _Inventory buy — cash → stock, not a profit cost. See /position._

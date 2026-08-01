@@ -87,11 +87,33 @@ def _dataset() -> dict:
         "transfers": [
             {"id": 1, "timestamp": "2026-06-06 08:00:00", "drink_name": "heineken", "quantity": 12, "recorded_by": "john"},
         ],
+        # One shortage and one exact match, so the variance report exercises both branches.
+        "stock_counts": [
+            {"id": 1, "timestamp": "2026-06-21 08:00:00", "drink_name": "heineken", "expected": 14, "counted": 12, "variance": -2, "cost_price": 300, "note": "weekly count", "recorded_by": "john"},
+            {"id": 2, "timestamp": "2026-06-21 08:05:00", "drink_name": "coke",     "expected": 3,  "counted": 3,  "variance": 0,  "cost_price": 120, "note": "", "recorded_by": "john"},
+        ],
+        # One unpaid invoice (drives DPO + the /position liability line) and one settled.
+        "payables": [
+            {"id": 1, "timestamp": "2026-06-16 09:00:00", "supplier": "nbl", "drink_name": "heineken", "quantity": 24, "amount": 7200, "amount_paid": 0, "due_date": "2026-07-15", "status": "outstanding", "paid_at": "", "description": "Heineken ×24 @ ₦300.00", "recorded_by": "john"},
+            {"id": 2, "timestamp": "2026-06-02 09:00:00", "supplier": "coca cola", "drink_name": "coke", "quantity": 12, "amount": 1440, "amount_paid": 1440, "due_date": "", "status": "paid", "paid_at": "2026-06-12 10:00:00", "description": "Coke ×12 @ ₦120.00", "recorded_by": "john"},
+        ],
+        # Three consecutive days → enough for compute_working_capital to use the
+        # "snapshots" DIO basis rather than falling back to today's shelf.
+        "inventory_snapshots": [
+            {"snapshot_date": "2026-06-26", "drink_name": "heineken", "bar_stock": 14, "store_stock": 24, "cost_price": 300, "stock_value": 11400},
+            {"snapshot_date": "2026-06-26", "drink_name": "coke",     "bar_stock": 5,  "store_stock": 0,  "cost_price": 120, "stock_value": 600},
+            {"snapshot_date": "2026-06-27", "drink_name": "heineken", "bar_stock": 13, "store_stock": 24, "cost_price": 300, "stock_value": 11100},
+            {"snapshot_date": "2026-06-27", "drink_name": "coke",     "bar_stock": 4,  "store_stock": 0,  "cost_price": 120, "stock_value": 480},
+            {"snapshot_date": "2026-06-28", "drink_name": "heineken", "bar_stock": 12, "store_stock": 24, "cost_price": 300, "stock_value": 10800},
+            {"snapshot_date": "2026-06-28", "drink_name": "coke",     "bar_stock": 3,  "store_stock": 0,  "cost_price": 120, "stock_value": 360},
+        ],
     }
 
 
-# Settings empty → reports fall back to config allocation defaults (deterministic).
-_SETTINGS: dict = {}
+# Allocation percentages stay unset → reports fall back to the config defaults
+# (deterministic). `total_rooms` IS set so occupancy/RevPAR render in the golden
+# reports rather than silently taking the "not configured" branch.
+_SETTINGS: dict = {"total_rooms": "8"}
 
 
 @pytest.fixture(autouse=True)
@@ -105,8 +127,20 @@ def patch_db_and_time(monkeypatch):
     def fake_get_setting(key, default=""):
         return _SETTINGS.get(key, default)
 
+    # These two read via targeted SQL rather than read_all, so they need their
+    # own stubs — otherwise they reach for a live engine and the whole suite
+    # fails on a missing DATABASE_URL.
+    def fake_outstanding_payables():
+        return [copy.deepcopy(p) for p in data["payables"] if p["status"] == "outstanding"]
+
+    def fake_inventory_snapshots(since):
+        return [copy.deepcopy(s) for s in data["inventory_snapshots"]
+                if str(s["snapshot_date"]) >= since]
+
     monkeypatch.setattr(database, "read_all", fake_read_all)
     monkeypatch.setattr(database, "get_setting", fake_get_setting)
+    monkeypatch.setattr(database, "get_outstanding_payables", fake_outstanding_payables)
+    monkeypatch.setattr(database, "get_inventory_snapshots", fake_inventory_snapshots)
     monkeypatch.setattr(reports, "datetime", _FrozenDateTime)
     monkeypatch.setattr(metrics, "datetime", _FrozenDateTime)
     monkeypatch.setattr(dashboard_data, "datetime", _FrozenDateTime)

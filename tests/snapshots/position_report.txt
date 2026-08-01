@@ -14,6 +14,9 @@
   Bar + store @ cost:  ₦11,160
 💳 *OWED TO US* _(receivables)_
   Outstanding debtors: ₦33,000  (2 owing)
+🧾 *WE OWE* _(supplier credit)_
+  Unpaid invoices:     ₦7,200  (1 outstanding)
+  _Cash free of supplier claims: ₦-68,199_
 ──────────────────────────────
 📊 _Profit (not cash): this month ₦31,800 · all-time ₦37,201_
 _Performance only — owner draws & stock buys are excluded from profit._
