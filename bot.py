@@ -2272,6 +2272,7 @@ _SMN_OLD, _SMN_NEW = range(65, 67)  # staff-merge flow: pick duplicate → name 
 _DSF_DEBT, _DSF_STAFF = range(67, 69)  # edit-debt-staff flow: pick debt → pick/type correct staff
 _SUP_DRINK, _SUP_DRINK_TEXT, _SUP_QTY, _SUP_QTY_TEXT, _SUP_COST, _SUP_WHO, _SUP_WHO_TEXT, _SUP_DUE, _SUP_DUE_TEXT = range(69, 78)
 _SPY_INV, _SPY_AMT = range(78, 80)  # pay-supplier flow: pick invoice → full/partial
+_SRC_PICK, _SRC_TYPE_TEXT, _SRC_COUNT = range(80, 83)  # room-count flow: pick total/type → how many
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2944,10 +2945,11 @@ def _existing_drink_kb(prefix: str) -> InlineKeyboardMarkup:
 def _settings_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 Drink Prices",    callback_data="sset:price"),
-         InlineKeyboardButton("🛏 Room Types",      callback_data="sset:roomtype")],
-        [InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold"),
-         InlineKeyboardButton("📊 Allocation %",    callback_data="sset:allocation")],
-        [InlineKeyboardButton("📅 Daily Report",    callback_data="sset:dailyreport")],
+         InlineKeyboardButton("🛏 Room Prices",     callback_data="sset:roomtype")],
+        [InlineKeyboardButton("🏨 Room Counts",     callback_data="sset:roomcount"),
+         InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold")],
+        [InlineKeyboardButton("📊 Allocation %",    callback_data="sset:allocation"),
+         InlineKeyboardButton("📅 Daily Report",    callback_data="sset:dailyreport")],
     ])
 
 
@@ -4099,6 +4101,133 @@ async def _srt_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         f"✅ *{reports._esc(rtype.title())}* set to ₦{price:,.0f}/night.\nStaff can book with: `/room {rtype.lower()} <qty> <nights>`",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_get_keyboard(update.effective_user.id),
+    )
+    return ConversationHandler.END
+
+
+# ── Set Room Counts flow ───────────────────────────────────────────────
+# How many rooms exist, not what they cost — the denominator for occupancy,
+# RevPAR and GOPPAR. Types are referenced by index: they are free text and can
+# contain spaces ("short time"), so they cannot ride in callback_data.
+
+_AGAIN_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🏨 Set another room count", callback_data="sset:roomcount")]]
+)
+
+
+def _known_room_types() -> list[str]:
+    """Every room type the hotel has priced, counted, or actually booked."""
+    seen: dict[str, None] = {}
+    for p in db.get_all_room_type_prices():
+        seen.setdefault(str(p["room_type"]).strip().lower(), None)
+    for t in db.get_all_room_type_counts():
+        seen.setdefault(str(t).strip().lower(), None)
+    for r in db.read_all("rooms"):
+        if not r.get("deleted_at"):
+            rt = str(r.get("room_type") or "").strip().lower()
+            if rt:
+                seen.setdefault(rt, None)
+    return sorted(seen)
+
+
+@_require_admin
+async def _src_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    counts = db.get_all_room_type_counts()
+    total = reports._total_rooms()
+    types = _known_room_types()
+    ctx.user_data["src_types"] = types
+
+    listed = sum(counts.values())
+    lines = ["🏨 *Room Counts*", "_How many rooms you have — not what they cost._", ""]
+    lines.append(f"  Hotel total: *{total or '—'}*")
+    for t in types:
+        n = counts.get(t)
+        lines.append(f"  {reports._esc(t.title())}: *{n if n else '—'}*")
+    if listed and total and listed != total:
+        lines.append(f"\n  ⚠️ _Per-type counts add up to {listed}, not {total}._")
+    lines.append("\n_Tap what to set:_")
+
+    rows = [[InlineKeyboardButton(
+        f"🏨 Hotel total{f' ({total})' if total else ''}", callback_data="src_tp:__total__")]]
+    rows += [
+        [InlineKeyboardButton(
+            f"{t.title()}{f' ({counts[t]})' if t in counts else ' — not set'}",
+            callback_data=f"src_tp:{i}",
+        )]
+        for i, t in enumerate(types)
+    ]
+    rows.append([InlineKeyboardButton("➕ Other room type", callback_data="src_tp:__new__")])
+
+    await q.edit_message_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _SRC_PICK
+
+
+async def _src_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[7:]
+
+    if val == "__total__":
+        ctx.user_data["src_target"] = None      # None = the hotel-wide total
+        await q.edit_message_text(
+            "🏨 *How many lettable rooms does the hotel have in total?*",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return _SRC_COUNT
+
+    if val == "__new__":
+        await q.edit_message_text("Type the room type name (e.g. executive, short time):")
+        return _SRC_TYPE_TEXT
+
+    types = ctx.user_data.get("src_types", [])
+    idx = int(val)
+    if idx >= len(types):
+        await q.edit_message_text("❌ Selection expired — open Room Counts again.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    ctx.user_data["src_target"] = types[idx]
+    await q.edit_message_text(
+        f"🏨 *How many {reports._esc(types[idx].title())} rooms do you have?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _SRC_COUNT
+
+
+async def _src_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip().lower()
+    if not name:
+        await update.message.reply_text("❌ Room type can't be blank:")
+        return _SRC_TYPE_TEXT
+    ctx.user_data["src_target"] = name
+    await update.message.reply_text(
+        f"🏨 *How many {reports._esc(name.title())} rooms do you have?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _SRC_COUNT
+
+
+async def _src_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    count, err = _to_int(update.message.text.strip(), "room count")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number (e.g. 5):")
+        return _SRC_COUNT
+
+    target = ctx.user_data.pop("src_target", None)
+    ctx.user_data.pop("src_types", None)
+    if target is None:
+        ok, msg = logic.process_set_rooms(count)
+    else:
+        ok, msg = logic.process_set_room_type_count(target, count)
+
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_AGAIN_KB if ok else _get_keyboard(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -5324,6 +5453,16 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    src_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_src_start, pattern="^sset:roomcount$")],
+        states={
+            _SRC_PICK:      [CallbackQueryHandler(_src_pick, pattern="^src_tp:")],
+            _SRC_TYPE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _src_type_text)],
+            _SRC_COUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _src_count)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     sthr_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_sthr_start, pattern="^sset:threshold$")],
         states={
@@ -5449,7 +5588,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
                  rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv,
-                 sup_conv, spy_conv):
+                 sup_conv, spy_conv, src_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
