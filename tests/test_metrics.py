@@ -599,3 +599,247 @@ def test_stranded_needs_stock_in_the_store_not_merely_an_empty_bar():
     m = metrics.menu_engineering([], [empty])[0]
     assert m.stranded_in_store is False      # nothing anywhere — nothing to transfer
     assert m.tied_value == 0
+
+
+# ── Room yield: per-type RevPAR ───────────────────────────────────────
+
+def _room(rtype, qty, nights, revenue):
+    return {"room_type": rtype, "quantity": qty, "nights": nights,
+            "total_revenue": revenue, "timestamp": "2026-07-05 12:00:00"}
+
+
+def test_revpar_by_type_divides_each_type_by_its_own_room_count():
+    """The trap ADR alone can't show: the premium type charges the most per
+    night and yields the least per room the hotel actually owns."""
+    rows = [_room("standard", 1, 20, 300_000),   # 20 nights @ 15k
+            _room("executive", 1, 2,  50_000)]   # 2 nights  @ 25k
+    rm = metrics.compute_room_metrics(
+        rows, total_rooms=7, days=30, rooms_by_type={"standard": 5, "executive": 2},
+    )
+    std, exe = rm.by_type["Standard"], rm.by_type["Executive"]
+
+    assert exe["adr"] == 25_000 and std["adr"] == 15_000      # Executive looks best …
+    assert std["revpar"] == 2000.0     # 300k / (5 × 30)
+    assert exe["revpar"] == round(50_000 / 60, 2)   # 833.33 — … and yields a third
+    assert exe["revpar"] < std["revpar"]
+
+    assert std["rooms"] == 5 and std["available"] == 150
+    assert std["occupancy_pct"] == round(20 / 150 * 100, 1)
+
+
+def test_type_without_a_room_count_gets_no_revpar_rather_than_the_hotel_total():
+    """Borrowing total_rooms would credit every room in the building to one type."""
+    rows = [_room("standard", 1, 4, 60_000), _room("short-time", 1, 6, 18_000)]
+    rm = metrics.compute_room_metrics(
+        rows, total_rooms=8, days=10, rooms_by_type={"standard": 5},
+    )
+    assert rm.by_type["Standard"]["revpar"] == 1200.0        # 60k / (5 × 10)
+    st = rm.by_type["Short-Time"]
+    assert st["rooms"] == 0 and st["revpar"] == 0.0 and st["occupancy_pct"] == 0.0
+    assert st["adr"] == 3000.0        # ADR needs no denominator, so it still works
+
+
+def test_room_metrics_without_type_counts_is_unchanged():
+    rows = [_room("standard", 2, 3, 90_000)]
+    bare = metrics.compute_room_metrics(rows, 8, 29)
+    assert bare.by_type["Standard"]["revpar"] == 0.0
+    assert bare.revpar == round(90_000 / (8 * 29), 2)   # hotel-wide unaffected
+
+
+# ── Room yield: period-over-period trend ──────────────────────────────
+
+def _metrics(revenue, nights, rooms=10, days=30):
+    return metrics.compute_room_metrics(
+        [_room("standard", 1, nights, revenue)] if nights else [], rooms, days,
+    )
+
+
+def test_discounting_to_fill_rooms_is_called_out_not_congratulated():
+    """Occupancy up, RevPAR down — the exact self-deception RevPAR exists for."""
+    prior = _metrics(200_000, 10)      # ADR 20,000
+    now   = _metrics(180_000, 15)      # ADR 12,000 — more nights, less money
+    t = metrics.compare_room_metrics(now, prior)
+
+    assert (t.occupancy_dir, t.revpar_dir) == ("up", "down")
+    assert "discount cost more" in t.verdict
+    assert t.adr_dir == "down"
+    assert "RevPAR followed it down" in t.rate_note
+
+
+def test_filling_up_at_a_flat_revpar_reads_as_underpriced():
+    prior = _metrics(200_000, 10)
+    now   = _metrics(204_000, 15)      # 50% more nights, RevPAR barely moved
+    t = metrics.compare_room_metrics(now, prior)
+    assert (t.occupancy_dir, t.revpar_dir) == ("up", "flat")
+    assert "underpriced" in t.verdict
+
+
+def test_rate_rise_that_does_not_reach_revpar_is_flagged():
+    """Point of the fuel pass-through check: did the higher rate survive
+    contact with bookings, or did the lost nights cancel it out?"""
+    prior = _metrics(200_000, 10)      # ADR 20,000
+    now   = _metrics(198_000, 6)       # ADR 33,000 — big rate rise, RevPAR flat
+    t = metrics.compare_room_metrics(now, prior)
+
+    assert t.adr_dir == "up" and t.revpar_dir == "flat"
+    assert "not reaching RevPAR" in t.rate_note
+
+    # …and when it does hold up, it says so instead.
+    held = metrics.compare_room_metrics(_metrics(300_000, 12), prior)
+    assert held.adr_dir == "up" and held.revpar_dir == "up"
+    assert "sticking" in held.rate_note
+
+
+def test_healthy_growth_and_soft_demand_read_opposite_ways():
+    prior = _metrics(200_000, 10)
+    healthy = metrics.compare_room_metrics(_metrics(300_000, 14), prior)
+    assert (healthy.occupancy_dir, healthy.revpar_dir) == ("up", "up")
+    assert "healthy" in healthy.verdict
+
+    soft = metrics.compare_room_metrics(_metrics(120_000, 7), prior)
+    assert (soft.occupancy_dir, soft.revpar_dir) == ("down", "down")
+    assert "overpriced, or demand" in soft.verdict
+
+
+def test_small_moves_fall_inside_the_dead_band():
+    """One extra booking must not produce a fresh 'raise your prices' verdict."""
+    prior = _metrics(200_000, 10)
+    now   = _metrics(204_000, 10)      # +2%
+    t = metrics.compare_room_metrics(now, prior)
+    assert (t.occupancy_dir, t.revpar_dir, t.adr_dir) == ("flat", "flat", "flat")
+    assert t.verdict == metrics.TREND_VERDICTS[("flat", "flat")]
+    assert t.rate_note == ""
+
+
+def test_an_empty_prior_period_reports_no_baseline_rather_than_infinite_growth():
+    t = metrics.compare_room_metrics(_metrics(200_000, 10), _metrics(0, 0))
+    assert t.comparable is False
+    assert t.verdict == "" and t.rate_note == ""
+    assert t.revpar_delta_pct == 0.0        # no division by zero
+
+
+def test_occupancy_delta_is_reported_in_points_and_percent():
+    prior = _metrics(200_000, 10, rooms=10, days=30)   # 10/300 = 3.3%
+    now   = _metrics(300_000, 20, rooms=10, days=30)   # 20/300 = 6.7%
+    t = metrics.compare_room_metrics(now, prior)
+    assert t.occupancy_delta_pt == round(6.7 - 3.3, 1)     # 3.4 points
+    assert t.occupancy_delta_pct == round((6.7 - 3.3) / 3.3 * 100, 1)
+
+
+def test_a_rate_cut_that_revpar_absorbed_is_not_reported_as_a_fall():
+    """Regression: 'rate fell and RevPAR followed it down' fired whenever RevPAR
+    merely failed to rise — contradicting the flat verdict printed beside it."""
+    prior = _metrics(200_000, 10)      # ADR 20,000
+    now   = _metrics(204_000, 20)      # ADR 10,200 — halved rate, RevPAR flat
+    t = metrics.compare_room_metrics(now, prior)
+
+    assert t.adr_dir == "down" and t.revpar_dir == "flat"
+    assert "followed it down" not in t.rate_note
+    assert "held" in t.rate_note
+
+
+def test_a_rate_rise_that_lost_more_than_it_gained_reads_worse_than_flat():
+    prior = _metrics(200_000, 10)      # ADR 20,000
+    now   = _metrics(150_000, 5)       # ADR 30,000, RevPAR down 25%
+    t = metrics.compare_room_metrics(now, prior)
+    assert t.adr_dir == "up" and t.revpar_dir == "down"
+    assert "backfired" in t.rate_note
+
+
+# ── GOPPAR: the bottom-line twin of RevPAR ────────────────────────────
+
+def _pnl(drink_rev=0.0, room_rev=0.0, cogs_units=0, expenses=()):
+    sales = [{"drink_name": "beer", "quantity": cogs_units, "total_revenue": drink_rev}]
+    rooms = [{"room_type": "standard", "quantity": 1, "nights": 1,
+              "total_revenue": room_rev}] if room_rev else []
+    return metrics.compute_pnl(sales, rooms, list(expenses), {"beer": 300})
+
+
+def test_goppar_is_the_pnl_divided_by_available_room_nights():
+    """The invariant that stops the two disagreeing on the same screen."""
+    pnl = _pnl(drink_rev=100_000, room_rev=200_000, cogs_units=100, expenses=[
+        {"account": "bar",   "category": "salary", "amount": 20_000},
+        {"account": "rooms", "category": "diesel", "amount": 50_000},
+        {"account": "bar",   "category": "restock", "amount": 90_000},   # excluded
+    ])
+    gp = metrics.compute_goppar(pnl, available_room_nights=240)
+
+    assert gp.gop == pnl.net_profit
+    assert gp.rooms_gop == pnl.rooms.profit
+    assert gp.bar_gop == pnl.bar.profit
+    assert gp.goppar == round(pnl.net_profit / 240, 2)
+    assert gp.rooms_goppar == round(pnl.rooms.profit / 240, 2)
+    assert gp.revpar == round(200_000 / 240, 2)
+
+    # Restocking is a cash→stock move, never a cost — it must not reach GOPPAR.
+    assert pnl.net_profit == 100_000 + 200_000 - 30_000 - 20_000 - 50_000
+
+
+def test_rooms_conversion_is_the_rooms_net_margin():
+    """Both divide by the same denominator, so the ratio must survive it."""
+    pnl = _pnl(room_rev=200_000, expenses=[
+        {"account": "rooms", "category": "diesel", "amount": 50_000},
+    ])
+    gp = metrics.compute_goppar(pnl, available_room_nights=240)
+    assert gp.rooms_conversion_pct == pnl.rooms.net_margin_pct == 75.0
+
+
+def test_goppar_survives_a_zero_denominator():
+    gp = metrics.compute_goppar(_pnl(room_rev=1000), available_room_nights=0)
+    assert gp.goppar == 0.0 and gp.revpar == 0.0 and gp.conversion_pct == 0.0
+
+
+def test_a_rate_rise_swallowed_by_fuel_shows_revpar_up_and_goppar_flat():
+    """The case RevPAR alone cannot see: rooms earned more, the diesel took it."""
+    before = metrics.compute_goppar(
+        _pnl(room_rev=200_000, expenses=[{"account": "rooms", "category": "diesel", "amount": 60_000}]),
+        available_room_nights=240,
+    )
+    after = metrics.compute_goppar(
+        _pnl(room_rev=260_000, expenses=[{"account": "rooms", "category": "diesel", "amount": 122_000}]),
+        available_room_nights=240,
+    )
+    t = metrics.compare_goppar(after, before)
+
+    assert t.revpar_dir == "up"          # RevPAR says the rate rise worked …
+    assert t.goppar_dir == "flat"        # … GOPPAR says none of it was kept
+    assert "absorbing the whole gain" in t.verdict
+
+
+def test_revenue_up_while_profit_falls_is_called_out(monkeypatch):
+    before = metrics.compute_goppar(
+        _pnl(room_rev=200_000, expenses=[{"account": "rooms", "category": "diesel", "amount": 50_000}]),
+        available_room_nights=240,
+    )
+    after = metrics.compute_goppar(
+        _pnl(room_rev=240_000, expenses=[{"account": "rooms", "category": "diesel", "amount": 150_000}]),
+        available_room_nights=240,
+    )
+    t = metrics.compare_goppar(after, before)
+    assert (t.revpar_dir, t.goppar_dir) == ("up", "down")
+    assert "costs are rising faster than rates" in t.verdict
+
+
+def test_recovering_from_a_loss_reports_a_direction_not_a_percentage():
+    """−₦5,000 → +₦5,000 is not '−200% growth'."""
+    loss = metrics.compute_goppar(
+        _pnl(room_rev=100_000, expenses=[{"account": "rooms", "category": "diesel", "amount": 150_000}]),
+        available_room_nights=240,
+    )
+    profit = metrics.compute_goppar(
+        _pnl(room_rev=200_000, expenses=[{"account": "rooms", "category": "diesel", "amount": 50_000}]),
+        available_room_nights=240,
+    )
+    assert loss.goppar < 0
+    t = metrics.compare_goppar(profit, loss)
+    assert t.goppar_dir == "up"
+    assert t.goppar_delta_pct == 0.0        # deliberately not reported
+
+
+def test_conversion_can_exceed_100_percent_when_the_bar_carries_the_rooms():
+    pnl = _pnl(drink_rev=400_000, room_rev=100_000, cogs_units=100, expenses=[
+        {"account": "rooms", "category": "diesel", "amount": 40_000},
+    ])
+    gp = metrics.compute_goppar(pnl, available_room_nights=240)
+    assert gp.conversion_pct > 100          # whole-hotel profit exceeds room revenue
+    assert gp.rooms_conversion_pct == 60.0  # rooms alone stay under it

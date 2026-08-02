@@ -1373,6 +1373,40 @@ def get_all_room_type_prices() -> list[dict[str, Any]]:
     return rows
 
 
+# ── Room type inventory (how many of each type exist) ─────────────────
+#
+# Separate from the price preset above: this is the *denominator* that makes
+# RevPAR computable per type. Two Executive rooms at a high rate can out-earn
+# five Standards on ADR while yielding far less per room the hotel owns, and
+# only a per-type room count can show that.
+
+def get_room_type_count(room_type: str) -> int | None:
+    val = get_setting(f"roomtype_rooms:{room_type.strip().lower()}")
+    try:
+        return int(float(val)) if val else None
+    except ValueError:
+        return None
+
+
+def set_room_type_count(room_type: str, count: int) -> None:
+    set_setting(f"roomtype_rooms:{room_type.strip().lower()}", str(int(count)))
+
+
+def get_all_room_type_counts() -> dict[str, int]:
+    """All configured per-type room counts as {lower-cased type: count}."""
+    raw = _rows("SELECT key, value FROM settings WHERE key LIKE 'roomtype_rooms:%' ORDER BY key")
+    out: dict[str, int] = {}
+    for r in raw:
+        rtype = str(r["key"]).replace("roomtype_rooms:", "").strip().lower()
+        try:
+            count = int(float(r["value"]))
+        except (TypeError, ValueError):
+            continue
+        if rtype and count > 0:
+            out[rtype] = count
+    return out
+
+
 # ── User management ───────────────────────────────────────────────────
 
 def get_all_staff() -> list[str]:

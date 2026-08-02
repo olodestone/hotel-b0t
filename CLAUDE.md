@@ -69,7 +69,7 @@ Two roles: `admin` and `staff`. Role lookup hits the `users` table on every requ
 - `/count`, `/variance` — stocktakes and shrinkage
 - `/restock_credit`, `/payables`, `/pay_supplier` — supplier credit
 
-The five analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable). Supplier credit has its own **⚙️ Manage → 🧾 Suppliers** submenu — see below.
+The five analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable); 🛏 Room Stats there opens a period picker (this week / last week / this month / all time) rather than jumping straight to the month. Supplier credit has its own **⚙️ Manage → 🧾 Suppliers** submenu — see below.
 
 Staff cannot delete anything — audit trail is preserved. Mistakes are corrected by admin via `/delete` then re-entry.
 
@@ -103,8 +103,9 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/staff_report [today\|YYYY-MM-DD\|YYYY-MM]` | Sales per staff member |
 | `/cashcycle [days]` | Cash conversion cycle (DIO + DSO − DPO), receivables aging, idle stock, bar break-even and the room-revenue target. Default window 30 days |
 | `/menu [days]` | Menu engineering — every priced drink ranked into star / plow-horse / puzzle / dog with the action for each |
-| `/roomstats [period]` | Occupancy, ADR and RevPAR, split by room type |
+| `/roomstats [week\|lastweek\|period]` | Occupancy, ADR, RevPAR **and GOPPAR** read against the previous like-for-like period, with a raise/hold verdict, plus RevPAR split by room type |
 | `/setrooms <n>` | Record the lettable room count — the denominator for occupancy and RevPAR |
+| `/setrooms <type> <n>` | Rooms of one type — the denominator for **RevPAR per room type** |
 | `/count <drink> <units> [note] [YYYY-MM-DD]` | Physical stocktake: logs the variance vs what the books expected, then corrects bar stock to the counted figure |
 | `/variance [period]` | Shrinkage report built from stocktakes |
 | `/restock_credit <drink> <qty> <cost> <supplier> [YYYY-MM-DD]` | Receive stock on supplier credit. Stock in now, **no cash out** — trailing date is the due date |
@@ -164,6 +165,40 @@ Three figures are tracked separately and must never be conflated:
 - **Net margin** = `profit / revenue` — whole-operation health.
 
 The rooms account has `cogs = 0.0` by construction, so its gross margin is always 100% (read it as *contribution* margin). The blended `PnL.gross_margin_pct` is therefore inflated by room mix — **the per-account figures are the ones to act on**. `metrics.pct_of()` is the single divide-by-zero-safe helper behind all of them.
+
+### Room yield (`/roomstats`) — RevPAR and GOPPAR
+
+One period's RevPAR is a number; two make it a signal. `/roomstats` reports the current window **against the previous like-for-like one** and turns the pair into an instruction.
+
+**Windows.** `reports._room_windows()` returns `(current, prior)` as `(start, end, label)` triples, with `end` capped at today. Both windows are cut to the **same elapsed length** — comparing two finished days of a new month against a whole finished month would make every month start look like a collapse. Day → previous day; week (Mon–Sun) → same weekdays 7 days back; month → the equal-length slice of the previous month; `all` → no predecessor, so no comparison. Weeks are `/roomstats`-only (`week` / `lastweek`): rate-versus-volume moves show up week to week, while a discount is still worth reversing.
+
+**The verdict.** `metrics.compare_room_metrics()` reads the *direction* of occupancy against the direction of RevPAR — the rate/volume trade RevPAR exists to expose, read over time:
+
+| | RevPAR ↑ | RevPAR → | RevPAR ↓ |
+|---|---|---|---|
+| **occupancy ↑** | growing properly, hold rates | underpriced — the extra rooms earn nothing | the discount cost more than it brought in |
+| **occupancy →** | clean rate gain | steady | rate has slipped |
+| **occupancy ↓** | rate-led: fewer rooms, each worth more | rate is absorbing the drop | overpriced, or demand is soft |
+
+Moves inside `metrics.TREND_BAND` (5%) read as flat — without a dead band a hotel this size gets a fresh "raise your prices" verdict from one extra booking. Direction is judged on *relative* change (at 3% occupancy, one point is enormous); the report shows occupancy in percentage **points** and everything else in percent. `RoomTrend.comparable` is `False` when the prior window sold nothing, and the report says there is no baseline rather than printing `▲ ∞%`.
+
+`rate_note` is the separate pass-through check: **did a rate change reach RevPAR?** ADR up + RevPAR up = sticking; ADR up + RevPAR flat = lost bookings are cancelling it out; ADR up + RevPAR down = it backfired. All six ADR×RevPAR combinations are spelled out, because "not up" covers held-flat and fell — two very different outcomes, and collapsing them once produced a "RevPAR followed it down" note beside a flat verdict.
+
+**RevPAR by room type** needs a per-type denominator, stored as `roomtype_rooms:<type>` in `settings` (`db.get_all_room_type_counts()`), set with `/setrooms <type> <n>`. Each type divides by *its own* room count — borrowing `total_rooms` would credit every room in the building to one category — so a type with no count recorded shows `RevPAR n/a` and a prompt, never a wrong number. By-type ADR needs no denominator and is always populated. If `total_rooms` is unset but per-type counts exist, their sum becomes the hotel-wide denominator; if both are set and disagree, `/setrooms` warns (legitimate when rooms are out of service).
+
+**GOPPAR — the bottom-line twin.** RevPAR is a revenue metric: it cannot see fuel, wages, restocking or maintenance, so a hotel can post a rising RevPAR straight through a month it lost money on. `metrics.compute_goppar()` divides *profit* by the same denominator and prints directly beneath it, so the gap between the two lines **is** the cost base.
+
+GOP is taken straight from `compute_pnl` — whole-hotel GOP **is** `PnL.net_profit`, rooms GOP **is** `PnL.rooms.profit` — so GOPPAR can never drift from the P&L (pinned by tests, the same invariant as `compute_rooms_target`). Stock purchases and owner draws are already excluded upstream by `operating_expenses()`, so buying stock never depresses GOPPAR.
+
+- **GOPPAR** — whole-hotel profit per available room-night. The headline.
+- **Rooms only** — `PnL.rooms.profit` per available room-night, isolating the rooms department.
+- **Conversion** — `goppar / revpar`, the share of RevPAR that survives as profit. It can exceed 100% when the bar carries the rooms, and the report says so rather than letting it look like an error. `rooms_conversion_pct` equals `PnL.rooms.net_margin_pct` exactly (same denominator both sides) and stays ≤ 100%.
+
+Caveat worth keeping in mind: Hotel 85's expense categories don't separate fixed charges (rent, insurance) from operating ones, so this is nearer *net operating profit* per available room than strict USALI GOP.
+
+`compare_goppar()` answers the question RevPAR alone cannot — **did a revenue gain reach the bottom line?** RevPAR ↑ + GOPPAR ↑ = the gain is real; RevPAR ↑ + GOPPAR → = rising costs absorbed the whole thing (the fuel-pass-through case: a rate rise that only covers the diesel it was raised for); RevPAR ↑ + GOPPAR ↓ = costs are rising faster than rates. When the prior period's GOP was zero or negative, the direction is reported without a percentage — coming back from a loss is a direction, not "−200% growth". The whole block is suppressed when no room count is set, since there is no denominator.
+
+`reports._yield_gap_note()` flags the trap the split exists for: the type charging the **most** per night being out-earned per room owned by a **cheaper** one. A cheap type yielding least is not the trap — that is just a cheap room — so the note fires only when the winner's ADR is lower and the gap clears `TREND_BAND`.
 
 ### Cash conversion cycle (`/cashcycle`)
 
@@ -293,7 +328,7 @@ on execution — the date records *when the move happened*, not when stock exist
 | `stock_counts` | `id`, `timestamp`, `drink_name`, `expected`, `counted`, `variance`, `cost_price`, `note`, `recorded_by` — one physical stocktake; the only independent check on the books |
 | `payables` | `id`, `timestamp`, `supplier`, `drink_name`, `quantity`, `amount`, `amount_paid`, `due_date`, `status`, `paid_at`, `recorded_by` — supplier credit; makes DPO computable |
 | `inventory_snapshots` | `snapshot_date`, `drink_name`, `bar_stock`, `store_stock`, `cost_price`, `stock_value` — PK `(snapshot_date, drink_name)`; nightly stock history for true DIO |
-| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it) and `total_rooms` (occupancy/RevPAR denominator) |
+| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it), `total_rooms` (occupancy/RevPAR denominator) and `roomtype_rooms:<type>` (per-type RevPAR denominator) |
 
 All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases upgrade safely on next startup.
 

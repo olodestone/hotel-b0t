@@ -136,3 +136,52 @@ def test_set_rooms_requires_a_positive_count(monkeypatch):
 
     ok, msg = logic.process_set_rooms(12)
     assert ok is True and written["total_rooms"] == "12"
+
+
+def test_set_rooms_warns_when_the_total_contradicts_the_per_type_counts(monkeypatch):
+    """Not an error — rooms can be out of service — but it must not pass silently."""
+    monkeypatch.setattr(logic.db, "set_setting", lambda k, v: None)
+    monkeypatch.setattr(logic.db, "get_all_room_type_counts", lambda: {"standard": 6, "deluxe": 2})
+
+    ok, msg = logic.process_set_rooms(12)
+    assert ok is True
+    assert "add up to 8, not 12" in msg
+
+    ok, msg = logic.process_set_rooms(8)          # agrees → no noise
+    assert ok is True and "add up to" not in msg
+
+
+def test_set_room_type_count_validates_before_writing(monkeypatch):
+    writes = []
+    monkeypatch.setattr(logic.db, "set_room_type_count", lambda t, n: writes.append((t, n)))
+    monkeypatch.setattr(logic.db, "get_all_room_type_counts", lambda: {})
+
+    assert logic.process_set_room_type_count("", 5)[0] is False
+    assert logic.process_set_room_type_count("standard", 0)[0] is False
+    assert logic.process_set_room_type_count("standard", -2)[0] is False
+    assert writes == []                            # nothing reached the DB
+
+
+def test_set_room_type_count_lowercases_and_lists_the_breakdown(monkeypatch):
+    writes = []
+    monkeypatch.setattr(logic.db, "set_room_type_count", lambda t, n: writes.append((t, n)))
+    monkeypatch.setattr(logic.db, "get_all_room_type_counts",
+                        lambda: {"standard": 6, "executive": 2})
+    monkeypatch.setattr(logic.db, "get_setting", lambda k, d="": "8")
+
+    ok, msg = logic.process_set_room_type_count("  Executive  ", 2)
+    assert ok is True
+    assert writes == [("executive", 2)]            # trimmed + lower-cased
+    assert "Standard: 6" in msg and "Executive: 2" in msg
+    assert "Total listed: 8" in msg
+    assert "add up to" not in msg                  # matches the hotel total
+
+
+def test_set_room_type_count_points_at_the_missing_hotel_total(monkeypatch):
+    monkeypatch.setattr(logic.db, "set_room_type_count", lambda t, n: None)
+    monkeypatch.setattr(logic.db, "get_all_room_type_counts", lambda: {"standard": 5})
+    monkeypatch.setattr(logic.db, "get_setting", lambda k, d="": "")
+
+    ok, msg = logic.process_set_room_type_count("standard", 5)
+    assert ok is True
+    assert "will use 5" in msg

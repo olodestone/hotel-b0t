@@ -1,16 +1,29 @@
 🛏 *Hotel 85 — Room Performance*
-📅 Period: June 2026 (current month)
+📅 June 2026 (current month)  vs  1–29 May 2026
 ──────────────────────────────
-  Revenue:          ₦140,000
+  Revenue:          ₦140,000  ▲ 833%  _(was ₦15,000)_
   Room-nights sold: 8
-  📈 *ADR:  ₦17,500*  _(average rate per night sold)_
-  🏨 *Occupancy: 3.4%*  (8 of 232 room-nights)
-  💰 *RevPAR: ₦603*  _(revenue per available room-night)_
+  📈 *ADR:  ₦17,500*  ▲ 17%  _(was ₦15,000)_
+  🏨 *Occupancy: 3.4%*  ▲ 3.0pt  (8 of 232 room-nights)
+  💰 *RevPAR: ₦603*  ▲ 833%  _(was ₦65)_
   _Basis: 8 rooms × 29 days._
+
+  ✅ Growing the healthy way — hold rates.
+  _The rate rise is sticking — it reached RevPAR._
+──────────────────────────────
+*PROFIT PER AVAILABLE ROOM*
+  🏦 *GOPPAR: ₦137*  ▲ 536%  _(was ₦22)_
+  🛏 _Rooms only: ₦384 per available room-night_
+  _22.7% of RevPAR survives as profit (63.6% from rooms alone)_
+
+  ✅ Revenue up and profit up — the gain is reaching the bottom line.
+  _After every recorded cost: fuel, wages, restocking, maintenance._
 ──────────────────────────────
 *BY ROOM TYPE*
-  • Standard: 6 nights · ₦90,000 · ADR ₦15,000
-  • Deluxe: 2 nights · ₦50,000 · ADR ₦25,000
+  • *Standard* — ADR ₦15,000 · RevPAR ₦517
+      _6 rooms · 6 nights sold · 3.4% full · ₦90,000_
+  • *Deluxe* — ADR ₦25,000 · RevPAR ₦862
+      _2 rooms · 2 nights sold · 3.4% full · ₦50,000_
 ──────────────────────────────
 _RevPAR is the honest one: discounting to fill rooms lifts occupancy_
 _while RevPAR stays flat._

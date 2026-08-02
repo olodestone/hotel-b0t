@@ -428,8 +428,9 @@ def _help_text(is_admin: bool = False) -> str:
         "*📈 Performance* _(also under_ ⚙️ Manage → 📈 Insights_)_\n"
         "`/cashcycle [days]` — how long cash is locked in stock & debtors, + break-even\n"
         "`/menu [days]` — which drinks to protect, push, reprice or drop\n"
-        "`/roomstats [period]` — occupancy, ADR & RevPAR\n"
+        "`/roomstats [week|lastweek|period]` — occupancy, ADR, RevPAR & GOPPAR vs the period before\n"
         "`/setrooms <n>` — your room count _(needed for occupancy & RevPAR)_\n"
+        "`/setrooms <type> <n>` — rooms of one type _(unlocks RevPAR per room type)_\n"
         "\n"
         "*🔍 Stock control*\n"
         "`/count <drink> <units> [note]` — physical stocktake; logs the variance\n"
@@ -1399,11 +1400,25 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @_require_admin
 async def cmd_roomstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Occupancy, ADR and RevPAR."""
+    """Occupancy, ADR and RevPAR, against the previous like-for-like period."""
     args = _parse_args(ctx)
-    kwargs = _period_kwargs(args[0] if args else "")
+    arg = (args[0] if args else "").lower()
+
+    # Weeks are roomstats-only: rate/volume moves show up week to week long
+    # before a month closes, which is when a discount is still worth reversing.
+    if arg in ("week", "lastweek", "last_week"):
+        today = date.today()
+        kwargs = {"for_week": today - timedelta(days=7) if arg != "week" else today}
+    else:
+        kwargs = _period_kwargs(arg)
+
     if kwargs is None:
-        await _reply(update, "Usage: `/roomstats` | `/roomstats today` | `/roomstats YYYY-MM-DD` | `/roomstats YYYY-MM` | `/roomstats all`")
+        await _reply(
+            update,
+            "Usage: `/roomstats` | `/roomstats week` | `/roomstats lastweek`\n"
+            "       `/roomstats today` | `/roomstats YYYY-MM-DD`\n"
+            "       `/roomstats YYYY-MM` | `/roomstats all`",
+        )
         return
     await _reply_long(update, reports.generate_room_stats_report(**kwargs))
 
@@ -1414,19 +1429,43 @@ async def cmd_setrooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     if not args:
         current = reports._total_rooms()
+        counts = reports._room_type_counts()
         now = f"Currently set to *{current}* rooms." if current else "Not set yet."
+        if counts:
+            listed = "\n".join(f"  • {t.title()}: {n}" for t, n in sorted(counts.items()))
+            now += f"\n\n*Rooms by type*\n{listed}"
+        else:
+            now += "\n\n_No per-type counts yet — RevPAR by room type needs them._"
         await _reply(
             update,
-            f"Usage: `/setrooms <number of rooms>`\n\n{now}\n\n"
-            "_Occupancy and RevPAR need this number — without it there's no_\n"
-            "_denominator to divide room-nights sold by._",
+            "Usage: `/setrooms <number of rooms>`  — the hotel total\n"
+            "       `/setrooms <type> <number>`    — rooms of one type\n\n"
+            f"{now}\n\n"
+            "_Occupancy and RevPAR need the total — without it there's no_\n"
+            "_denominator to divide room-nights sold by. Per-type counts unlock_\n"
+            "_RevPAR per room type, which is what shows a high-rate, low-volume_\n"
+            "_category earning less than its rate suggests._",
         )
         return
-    total, err = _to_int(args[0], "room count")
+
+    # One numeric arg is the hotel total; "<type> <n>" sets one type's count.
+    if len(args) == 1:
+        total, err = _to_int(args[0], "room count")
+        if err:
+            await _reply(
+                update,
+                f"{err}\n\n_For a single room type use_ `/setrooms {args[0].lower()} <number>`_._",
+            )
+            return
+        ok, msg = logic.process_set_rooms(total)
+        await _reply(update, msg)
+        return
+
+    count, err = _to_int(args[-1], "room count")
     if err:
         await _reply(update, err)
         return
-    ok, msg = logic.process_set_rooms(total)
+    ok, msg = logic.process_set_room_type_count(" ".join(args[:-1]), count)
     await _reply(update, msg)
 
 
@@ -2766,7 +2805,13 @@ async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     elif action == "menu":
         text = reports.generate_menu_report()
     elif action == "roomstats":
-        text = reports.generate_room_stats_report(for_month=(now.year, now.month))
+        await q.edit_message_text(
+            "🛏 *Room Performance* — which period?\n"
+            "_Each one is read against the period before it._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_roomstats_period_keyboard(),
+        )
+        return
     elif action == "variance":
         text = reports.generate_variance_report(for_month=(now.year, now.month))
     elif action == "payables":
@@ -2774,6 +2819,28 @@ async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     else:
         return
     await _reply_long_cb(q, text)
+
+
+async def _cb_roomstats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """📈 Insights → 🛏 Room Stats → period. Mirrors /roomstats exactly."""
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+
+    from datetime import datetime as _dt
+    choice = q.data[4:]
+    today = _dt.now().date()
+    kwargs = {
+        "week":     {"for_week": today},
+        "lastweek": {"for_week": today - timedelta(days=7)},
+        "month":    {"for_month": (today.year, today.month)},
+        "all":      {"all_time": True},
+    }.get(choice)
+    if kwargs is None:
+        return
+    await _reply_long_cb(q, reports.generate_room_stats_report(**kwargs))
 
 
 async def _cb_suppliers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2823,6 +2890,17 @@ def _insights_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛏 Room Stats",   callback_data="ins:roomstats"),
          InlineKeyboardButton("🔍 Variance",     callback_data="ins:variance")],
         [InlineKeyboardButton("🧾 Supplier Bills", callback_data="ins:payables")],
+    ])
+
+
+def _roomstats_period_keyboard() -> InlineKeyboardMarkup:
+    """Room yield is the one report worth reading weekly — a discount is still
+    worth reversing mid-month, long before the month closes."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📆 This week",  callback_data="rms:week"),
+         InlineKeyboardButton("⏪ Last week",  callback_data="rms:lastweek")],
+        [InlineKeyboardButton("📅 This month", callback_data="rms:month"),
+         InlineKeyboardButton("🔁 All time",   callback_data="rms:all")],
     ])
 
 
@@ -5390,6 +5468,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|insights|suppliers|addstaff|removestaff)$"))
     app.add_handler(CallbackQueryHandler(_cb_insights_menu, pattern="^ins:(cashcycle|menu|roomstats|variance|payables)$"))
     app.add_handler(CallbackQueryHandler(_cb_suppliers_list, pattern="^sup:list$"))
+    app.add_handler(CallbackQueryHandler(_cb_roomstats_period, pattern="^rms:(week|lastweek|month|all)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))

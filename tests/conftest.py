@@ -115,6 +115,10 @@ def _dataset() -> dict:
 # reports rather than silently taking the "not configured" branch.
 _SETTINGS: dict = {"total_rooms": "8"}
 
+# Per-type room counts — the RevPAR-by-type denominator. Sums to total_rooms so
+# the golden report exercises the happy path; the mismatch warning has its own test.
+_ROOM_TYPE_COUNTS: dict = {"standard": 6, "deluxe": 2}
+
 
 @pytest.fixture(autouse=True)
 def patch_db_and_time(monkeypatch):
@@ -141,6 +145,7 @@ def patch_db_and_time(monkeypatch):
     monkeypatch.setattr(database, "get_setting", fake_get_setting)
     monkeypatch.setattr(database, "get_outstanding_payables", fake_outstanding_payables)
     monkeypatch.setattr(database, "get_inventory_snapshots", fake_inventory_snapshots)
+    monkeypatch.setattr(database, "get_all_room_type_counts", lambda: dict(_ROOM_TYPE_COUNTS))
     monkeypatch.setattr(reports, "datetime", _FrozenDateTime)
     monkeypatch.setattr(metrics, "datetime", _FrozenDateTime)
     monkeypatch.setattr(dashboard_data, "datetime", _FrozenDateTime)

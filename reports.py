@@ -163,6 +163,87 @@ def _total_rooms() -> int:
         return 0
 
 
+def _room_type_counts() -> dict[str, int]:
+    """Rooms per type (lower-cased) — the per-type RevPAR denominator."""
+    return db.get_all_room_type_counts()
+
+
+def _range_label(start: date, end: date) -> str:
+    """Name a window the way an owner would say it out loud."""
+    if start == end:
+        return start.strftime("%d %b %Y")
+    if start.day == 1 and end.day == monthrange(end.year, end.month)[1] \
+            and (start.year, start.month) == (end.year, end.month):
+        return start.strftime("%B %Y")
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.day}–{end.day} {end.strftime('%b %Y')}"
+    return f"{start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"
+
+
+def _room_windows(
+    for_date: date | None, for_month: tuple[int, int] | None, all_time: bool,
+    for_week: date | None, rows: list[dict],
+) -> tuple[tuple[date, date, str], tuple[date, date, str] | None]:
+    """The window to report, and the one to compare it against.
+
+    Both windows are truncated to the same elapsed length. Comparing two
+    finished days of a new month against a whole finished month would make
+    every month start look like a collapse — the prior window is cut to match
+    so the two are genuinely like-for-like.
+
+    All-time has no meaningful predecessor, so it compares against nothing.
+    """
+    today = datetime.now().date()
+
+    if for_date:
+        prev = for_date - timedelta(days=1)
+        return ((for_date, for_date, _range_label(for_date, for_date)),
+                (prev, prev, _range_label(prev, prev)))
+
+    if for_week:
+        monday = for_week - timedelta(days=for_week.weekday())
+        sunday = monday + timedelta(days=6)
+        end = min(sunday, today)
+        label = "This week" if monday <= today <= sunday else _range_label(monday, sunday)
+        p_start = monday - timedelta(days=7)
+        p_end = p_start + (end - monday)
+        return ((monday, end, label), (p_start, p_end, _range_label(p_start, p_end)))
+
+    if all_time:
+        seen = [dt.date() for dt in (_parse_ts(r.get("timestamp")) for r in rows) if dt]
+        return ((min(seen) if seen else today, today, "ALL-TIME"), None)
+
+    year, month = for_month if for_month else (today.year, today.month)
+    start = date(year, month, 1)
+    end = min(date(year, month, monthrange(year, month)[1]), today)
+    label = start.strftime("%B %Y")
+    if (year, month) == (today.year, today.month):
+        label += " (current month)"
+
+    p_year, p_month = (year - 1, 12) if month == 1 else (year, month - 1)
+    p_start = date(p_year, p_month, 1)
+    p_end = min(p_start + (end - start), date(p_year, p_month, monthrange(p_year, p_month)[1]))
+    return ((start, end, label), (p_start, p_end, _range_label(p_start, p_end)))
+
+
+# Direction pairs → the tone to lead the verdict with. Presentation only; the
+# verdict wording itself is metrics.TREND_VERDICTS so the two surfaces agree.
+_TREND_ICONS = {
+    ("up", "up"): "✅", ("flat", "up"): "✅", ("down", "up"): "✅",
+    ("up", "flat"): "💡", ("flat", "flat"): "➖", ("down", "flat"): "➖",
+    ("up", "down"): "⚠️", ("flat", "down"): "⚠️", ("down", "down"): "🔻",
+}
+
+
+def _delta_tag(pct: float) -> str:
+    """'▲ 29%' / '▼ 12%' / '→ flat', with the same dead band metrics judges on."""
+    if pct > metrics.TREND_BAND:
+        return f"▲ {pct:,.0f}%"
+    if pct < -metrics.TREND_BAND:
+        return f"▼ {abs(pct):,.0f}%"
+    return "→ flat"
+
+
 def _period_days(for_date: date | None, for_month: tuple[int, int] | None,
                  all_time: bool, rows: list[dict] | tuple = ()) -> int:
     """Days a period actually covers — the denominator for occupancy/RevPAR.
@@ -1119,29 +1200,83 @@ def generate_room_stats_report(
     for_date: date | None = None,
     for_month: tuple[int, int] | None = None,
     all_time: bool = False,
+    for_week: date | None = None,
 ) -> str:
-    """Occupancy, ADR and RevPAR — the three standard hotel yield metrics."""
-    room_rows = _apply_filter(_active(db.read_all("rooms")), for_date, for_month, all_time)
-    label = _period_label(for_date, for_month, all_time)
-    total_rooms = _total_rooms()
-    days = _period_days(for_date, for_month, all_time, room_rows)
-    rm = metrics.compute_room_metrics(room_rows, total_rooms, days)
+    """Occupancy, ADR and RevPAR — read against the previous like-for-like period.
 
-    lines = [
-        f"🛏 *{HOTEL_NAME} — Room Performance*",
-        f"📅 Period: {label}",
-        _SEP,
-    ]
+    One period's RevPAR is a number; two make it a signal. The direction of
+    occupancy against the direction of RevPAR is what says raise, hold or cut.
+    """
+    all_rooms = _active(db.read_all("rooms"))
+    (start, end, label), prior = _room_windows(for_date, for_month, all_time, for_week, all_rooms)
+    room_rows = metrics.filter_by_range(all_rooms, start, end)
+    days = max((end - start).days + 1, 0)
+
+    counts = _room_type_counts()
+    total_rooms = _total_rooms()
+    derived = sum(counts.values())
+    rooms_from_types = not total_rooms and derived > 0
+    if rooms_from_types:
+        total_rooms = derived
+
+    rm = metrics.compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=counts)
+
+    header = f"📅 Period: {label}"
+    if prior:
+        header = f"📅 {label}  vs  {prior[2]}"
+
+    lines = [f"🛏 *{HOTEL_NAME} — Room Performance*", header, _SEP]
 
     if not room_rows:
         lines.append("No room bookings recorded for this period.")
         return "\n".join(lines)
 
+    # GOPPAR needs the whole P&L, not just rooms — RevPAR cannot see fuel, wages
+    # or restocking, which is exactly what makes the pair worth reading together.
+    all_sales = _active(db.read_all("sales"))
+    all_expenses = _active(db.read_all("expenses"))
+    cost_map = _cost_price_map()
+
+    def _goppar_for(w_start, w_end, room_slice, available):
+        pnl = metrics.compute_pnl(
+            metrics.filter_by_range(all_sales, w_start, w_end),
+            room_slice,
+            metrics.filter_by_range(all_expenses, w_start, w_end),
+            cost_map,
+        )
+        return metrics.compute_goppar(pnl, available, room_revenue=pnl.rooms.revenue)
+
+    gp = _goppar_for(start, end, room_rows, rm.available_room_nights)
+
+    trend = gp_trend = None
+    if prior:
+        p_start, p_end, p_label = prior
+        p_days = max((p_end - p_start).days + 1, 0)
+        p_rooms = metrics.filter_by_range(all_rooms, p_start, p_end)
+        p_rm = metrics.compute_room_metrics(
+            p_rooms, total_rooms, p_days, rooms_by_type=counts,
+        )
+        trend = metrics.compare_room_metrics(rm, p_rm, label, p_label)
+        gp_trend = metrics.compare_goppar(
+            gp, _goppar_for(p_start, p_end, p_rooms, p_rm.available_room_nights)
+        )
+
+    def _with_delta(text: str, delta_pct: float, was: str) -> str:
+        if not (trend and trend.comparable):
+            return text
+        return f"{text}  {_delta_tag(delta_pct)}  _(was {was})_"
+
     lines += [
-        f"  Revenue:          {_fmt(rm.revenue)}",
+        _with_delta(f"  Revenue:          {_fmt(rm.revenue)}",
+                    trend.revenue_delta_pct if trend else 0.0,
+                    _fmt(trend.prior.revenue) if trend else ""),
         f"  Room-nights sold: {rm.room_nights_sold}",
-        f"  📈 *ADR:  {_fmt(rm.adr)}*  _(average rate per night sold)_",
+        _with_delta(f"  📈 *ADR:  {_fmt(rm.adr)}*",
+                    trend.adr_delta_pct if trend else 0.0,
+                    _fmt(trend.prior.adr) if trend else ""),
     ]
+    if not (trend and trend.comparable):
+        lines[-1] += "  _(average rate per night sold)_"
 
     if not total_rooms:
         lines += [
@@ -1151,19 +1286,55 @@ def generate_room_stats_report(
             "  and in every /report.",
         ]
     else:
-        lines += [
-            f"  🏨 *Occupancy: {_pct(rm.occupancy_pct)}*  "
-            f"({rm.room_nights_sold} of {rm.available_room_nights} room-nights)",
-            f"  💰 *RevPAR: {_fmt(rm.revpar)}*  _(revenue per available room-night)_",
-            f"  _Basis: {total_rooms} rooms × {days} days._",
-        ]
+        occ = f"  🏨 *Occupancy: {_pct(rm.occupancy_pct)}*"
+        if trend and trend.comparable:
+            sign = "▲" if trend.occupancy_delta_pt > 0 else ("▼" if trend.occupancy_delta_pt < 0 else "→")
+            occ += f"  {sign} {abs(trend.occupancy_delta_pt):,.1f}pt"
+        occ += f"  ({rm.room_nights_sold} of {rm.available_room_nights} room-nights)"
+        lines.append(occ)
+        lines.append(_with_delta(
+            f"  💰 *RevPAR: {_fmt(rm.revpar)}*",
+            trend.revpar_delta_pct if trend else 0.0,
+            _fmt(trend.prior.revpar) if trend else "",
+        ))
+        if not (trend and trend.comparable):
+            lines[-1] += "  _(revenue per available room-night)_"
+        basis = f"  _Basis: {total_rooms} rooms × {days} days"
+        basis += " — from your per-type counts._" if rooms_from_types else "._"
+        lines.append(basis)
+
+    # The verdict — the whole reason for comparing two windows.
+    if trend and trend.comparable and total_rooms:
+        icon = _TREND_ICONS[(trend.occupancy_dir, trend.revpar_dir)]
+        lines += ["", f"  {icon} {_esc(trend.verdict)}"]
+        if trend.rate_note:
+            lines.append(f"  _{_esc(trend.rate_note)}_")
+    elif trend and not trend.comparable:
+        lines += ["", f"  _No bookings in {_esc(trend.prior_label)} — no baseline to compare against yet._"]
+
+    if total_rooms:
+        lines += _goppar_block(gp, gp_trend)
 
     if rm.by_type:
         lines += [_SEP, "*BY ROOM TYPE*"]
-        for rtype, d in sorted(rm.by_type.items(), key=lambda kv: -kv[1]["revenue"]):
-            lines.append(
-                f"  • {_esc(rtype)}: {d['nights']} nights · {_fmt(d['revenue'])} · ADR {_fmt(d['adr'])}"
-            )
+        ranked = sorted(rm.by_type.items(), key=lambda kv: -kv[1]["revenue"])
+        for rtype, d in ranked:
+            head = f"  • *{_esc(rtype)}* — ADR {_fmt(d['adr'])}"
+            head += f" · RevPAR {_fmt(d['revpar'])}" if d["rooms"] else " · RevPAR _n/a_"
+            lines.append(head)
+            if d["rooms"]:
+                lines.append(
+                    f"      _{_plural(d['rooms'], 'room')} · "
+                    f"{_plural(d['nights'], 'night')} sold · "
+                    f"{_pct(d['occupancy_pct'])} full · {_fmt(d['revenue'])}_"
+                )
+            else:
+                lines.append(
+                    f"      _{_plural(d['nights'], 'night')} sold · {_fmt(d['revenue'])}_  "
+                    f"·  _set rooms:_ `/setrooms {rtype.lower()} <n>`"
+                )
+
+        lines += _yield_gap_note(ranked)
 
     lines += [
         _SEP,
@@ -1172,6 +1343,74 @@ def generate_room_stats_report(
         f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
+
+
+def _goppar_block(gp, gp_trend) -> list[str]:
+    """RevPAR's bottom-line twin, printed directly beneath it.
+
+    RevPAR cannot see fuel, wages, restocking or maintenance. GOPPAR divides
+    profit by the same denominator, so the gap between the two lines *is* the
+    cost base — and a rate rise that only covers the diesel it was raised for
+    shows up here as RevPAR climbing while GOPPAR stands still.
+    """
+    lines = [_SEP, "*PROFIT PER AVAILABLE ROOM*"]
+
+    goppar_line = f"  🏦 *GOPPAR: {_fmt(gp.goppar)}*"
+    if gp_trend and gp_trend.comparable:
+        # A % change is only meaningful off a positive base — coming back from a
+        # loss is a direction, not a percentage (see compare_goppar).
+        if gp_trend.prior.goppar > 0:
+            goppar_line += f"  {_delta_tag(gp_trend.goppar_delta_pct)}"
+        goppar_line += f"  _(was {_fmt(gp_trend.prior.goppar)})_"
+    lines.append(goppar_line)
+    lines.append(f"  🛏 _Rooms only: {_fmt(gp.rooms_goppar)} per available room-night_")
+
+    if gp.revpar:
+        kept = (f"  _{_pct(gp.conversion_pct)} of RevPAR survives as profit "
+                f"({_pct(gp.rooms_conversion_pct)} from rooms alone)_")
+        if gp.conversion_pct > 100:
+            kept += "\n  _— above 100% because the bar is carrying the rooms._"
+        lines.append(kept)
+
+    # The whole point of the pair: did a revenue move reach the bottom line?
+    if gp_trend and gp_trend.comparable:
+        icon = "✅" if gp_trend.goppar_dir == "up" else (
+            "⚠️" if gp_trend.revpar_dir == "up" else "➖")
+        lines += ["", f"  {icon} {_esc(gp_trend.verdict)}"]
+    elif gp.gop < 0:
+        lines.append("  ⚠️ _Negative — the hotel spent more than it earned this period._")
+
+    lines.append("  _After every recorded cost: fuel, wages, restocking, maintenance._")
+    return lines
+
+
+def _yield_gap_note(ranked: list[tuple[str, dict]]) -> list[str]:
+    """Flag the type whose headline rate flatters its actual yield.
+
+    The trap: a premium type charges the most per night sold and so looks like
+    the best category, while a *cheaper* type earns more per room the hotel
+    owns, because the premium rooms sit empty. ADR alone can never show it —
+    the gap only opens once each type is divided by its own room count.
+
+    A cheap type yielding least is not the trap; that is just a cheap room. The
+    signal is specifically being out-earned by something you charge less for,
+    and only once the gap clears the same dead band the trend verdict uses.
+    """
+    priced = [(t, d) for t, d in ranked if d["rooms"] and d["nights"]]
+    if len(priced) < 2:
+        return []
+    name, top = max(priced, key=lambda kv: kv[1]["adr"])
+    best_name, best = max(priced, key=lambda kv: kv[1]["revpar"])
+    if best_name == name or best["adr"] >= top["adr"]:
+        return []
+    if top["revpar"] >= best["revpar"] * (1 - metrics.TREND_BAND / 100):
+        return []      # out-earned, but not by enough to be worth acting on
+    return [
+        f"  ⚠️ _{_esc(name)} charges the most per night ({_fmt(top['adr'])}) but earns_",
+        f"  _{_fmt(top['revpar'])} per room owned — {_esc(best_name)}, at {_fmt(best['adr'])} a night,_",
+        f"  _earns {_fmt(best['revpar'])} from the same space. {_esc(name)} is only "
+        f"{_pct(top['occupancy_pct'])} full._",
+    ]
 
 
 # ── Supplier invoices (payables) ──────────────────────────────────────

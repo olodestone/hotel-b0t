@@ -368,10 +368,63 @@ def process_set_rooms(total: int) -> tuple[bool, str]:
     if total <= 0:
         return False, "❌ Room count must be a positive whole number."
     db.set_setting(reports.TOTAL_ROOMS_KEY, str(int(total)))
-    return True, (
+    msg = (
         f"✅ Hotel room count set to *{int(total)}*.\n"
         f"Occupancy, ADR and RevPAR now show in /report and /roomstats."
     )
+    by_type = db.get_all_room_type_counts()
+    if by_type:
+        listed = sum(by_type.values())
+        if listed != int(total):
+            msg += (
+                f"\n\n⚠️ _Your per-type counts add up to {listed}, not {int(total)}._\n"
+                "_The hotel-wide figures use this total; per-type RevPAR uses each_\n"
+                "_type's own count._"
+            )
+    return True, msg
+
+
+def process_set_room_type_count(room_type: str, count: int) -> tuple[bool, str]:
+    """Record how many rooms of one type exist — the per-type RevPAR denominator.
+
+    Kept separate from the hotel total: RevPAR by type divides each type's
+    revenue by its *own* room count, which is the only way a high-rate,
+    low-volume category shows its real yield.
+    """
+    room_type = room_type.strip().lower()
+    if not room_type:
+        return False, "❌ Room type is required."
+    if count <= 0:
+        return False, "❌ Room count must be a positive whole number."
+
+    db.set_room_type_count(room_type, count)
+    counts = db.get_all_room_type_counts()
+    listed = sum(counts.values())
+    total = 0
+    try:
+        total = int(float(db.get_setting(reports.TOTAL_ROOMS_KEY, "0") or 0))
+    except (TypeError, ValueError):
+        pass
+
+    lines = [
+        f"✅ *{room_type.title()}*: {int(count)} rooms.",
+        "",
+        "*Rooms by type*",
+    ]
+    lines += [f"  • {t.title()}: {n}" for t, n in sorted(counts.items())]
+    lines.append(f"  _Total listed: {listed}_")
+
+    if not total:
+        lines.append(
+            f"\n_No hotel-wide total set — /roomstats will use {listed}._\n"
+            "_Set it explicitly with_ `/setrooms <n>` _if some rooms aren't lettable._"
+        )
+    elif listed != total:
+        lines.append(
+            f"\n⚠️ _These add up to {listed}, but the hotel total is {total}._\n"
+            "_Fine if some rooms are out of service — otherwise fix one of them._"
+        )
+    return True, "\n".join(lines)
 
 
 # ── Entry deletion ───────────────────────────────────────────────────

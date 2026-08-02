@@ -808,7 +808,7 @@ class RoomMetrics:
     by_type: dict
 
 
-def compute_room_metrics(room_rows, total_rooms, days):
+def compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=None):
     """The three standard hotel yield metrics.
 
     ADR says what you charge; occupancy says how full you are; RevPAR combines
@@ -817,10 +817,17 @@ def compute_room_metrics(room_rows, total_rooms, days):
 
     ``total_rooms`` of 0 means the owner hasn't recorded the room count yet, so
     occupancy and RevPAR are undefined (0.0) while ADR still works.
+
+    ``rooms_by_type`` (lower-cased type → room count) unlocks the same split per
+    room type. It is optional and per-type: a type with no recorded count gets
+    ``rooms == 0`` and ``revpar == 0.0`` rather than borrowing the hotel-wide
+    denominator, which would silently credit every room in the building to one
+    category. By-type ADR needs no denominator, so it is always populated.
     """
     revenue = round(sum_revenue(room_rows), 2)
     nights_sold = sum(int(r["quantity"]) * int(r["nights"]) for r in room_rows)
     available = max(int(total_rooms), 0) * max(int(days), 0)
+    counts = {str(k).lower(): int(v) for k, v in (rooms_by_type or {}).items()}
 
     by_type: dict = {}
     for r in room_rows:
@@ -829,8 +836,14 @@ def compute_room_metrics(room_rows, total_rooms, days):
         d["bookings"] += int(r["quantity"])
         d["nights"] += int(r["quantity"]) * int(r["nights"])
         d["revenue"] += float(r["total_revenue"])
-    for d in by_type.values():
+    for rtype, d in by_type.items():
         d["adr"] = round(d["revenue"] / d["nights"], 2) if d["nights"] else 0.0
+        rooms = max(counts.get(rtype.lower(), 0), 0)
+        type_available = rooms * max(int(days), 0)
+        d["rooms"] = rooms
+        d["available"] = type_available
+        d["occupancy_pct"] = pct_of(d["nights"], type_available)
+        d["revpar"] = round(d["revenue"] / type_available, 2) if type_available else 0.0
 
     return RoomMetrics(
         total_rooms=int(total_rooms), days=int(days),
@@ -839,6 +852,234 @@ def compute_room_metrics(room_rows, total_rooms, days):
         adr=round(revenue / nights_sold, 2) if nights_sold else 0.0,
         revpar=round(revenue / available, 2) if available else 0.0,
         revenue=revenue, by_type=by_type,
+    )
+
+
+# ── Period-over-period room trend ─────────────────────────────────────
+#
+# A single period's RevPAR is a number; two periods make it a signal. The
+# direction of occupancy against the direction of RevPAR is what tells you
+# whether to raise, hold or cut — the same rate/volume trade RevPAR exists to
+# expose, read over time:
+#
+#   occupancy ↑  RevPAR ↑   growing properly — hold rates
+#   occupancy ↑  RevPAR →   underpriced — the extra rooms are earning nothing
+#   occupancy ↑  RevPAR ↓   the discount cost more than it brought in
+#   occupancy ↓  RevPAR ↑   rate-led: fewer rooms, each worth more
+#   occupancy ↓  RevPAR ↓   overpriced, or demand is genuinely soft
+#
+# Moves smaller than TREND_BAND% are read as flat. Without a dead band, a hotel
+# this size would get a fresh "raise your prices" verdict from one extra booking.
+
+TREND_BAND = 5.0  # relative % change below which a move is noise, not a trend
+
+TREND_VERDICTS = {
+    ("up",   "up"):   "Growing the healthy way — hold rates.",
+    ("up",   "flat"): "Filling more rooms for the same revenue per room — you look underpriced. Test a rate rise.",
+    ("up",   "down"): "More rooms filled, less earned per available room — the discount cost more than it brought in.",
+    ("flat", "up"):   "Same occupancy, more revenue per room — a clean rate gain.",
+    ("flat", "flat"): "Steady — no real movement either way.",
+    ("flat", "down"): "Same occupancy but earning less per room — rate has slipped.",
+    ("down", "up"):   "Fewer rooms sold but each worth more — the rate rise is carrying it.",
+    ("down", "flat"): "Emptier, but revenue per room held — rate is absorbing the drop.",
+    ("down", "down"): "Emptier and earning less — either overpriced, or demand is genuinely soft.",
+}
+
+
+@dataclass(frozen=True)
+class RoomTrend:
+    current: RoomMetrics
+    prior: RoomMetrics
+    label: str
+    prior_label: str
+    comparable: bool           # False when the prior window has nothing to compare against
+    revpar_delta_pct: float    # relative %
+    adr_delta_pct: float       # relative %
+    occupancy_delta_pt: float  # percentage POINTS — occupancy is already a %
+    occupancy_delta_pct: float # relative %, which is what direction is read from
+    revenue_delta_pct: float
+    occupancy_dir: str         # "up" | "flat" | "down"
+    revpar_dir: str
+    adr_dir: str
+    verdict: str
+    rate_note: str             # the pass-through check; "" when the rate barely moved
+
+
+def _rel_change(now_val, then_val):
+    """Relative % change, or 0.0 when there's no base to divide by."""
+    return round((now_val - then_val) / then_val * 100, 1) if then_val else 0.0
+
+
+def _direction(delta_pct, band=TREND_BAND):
+    if delta_pct > band:
+        return "up"
+    if delta_pct < -band:
+        return "down"
+    return "flat"
+
+
+def compare_room_metrics(current, prior, label="", prior_label=""):
+    """Read two RoomMetrics windows as a trend, with a verdict and a rate check.
+
+    ``comparable`` is False when the prior window sold nothing: every delta
+    would divide by zero, and "RevPAR up ∞%" is worse than saying there is no
+    baseline yet.
+    """
+    comparable = prior.room_nights_sold > 0 and prior.revenue > 0
+
+    revpar_d = _rel_change(current.revpar, prior.revpar)
+    adr_d    = _rel_change(current.adr, prior.adr)
+    occ_d    = _rel_change(current.occupancy_pct, prior.occupancy_pct)
+    rev_d    = _rel_change(current.revenue, prior.revenue)
+
+    occ_dir    = _direction(occ_d) if comparable else "flat"
+    revpar_dir = _direction(revpar_d) if comparable else "flat"
+    adr_dir    = _direction(adr_d) if comparable else "flat"
+
+    verdict = TREND_VERDICTS[(occ_dir, revpar_dir)] if comparable else ""
+
+    # The pass-through check: a rate change only counts for what reaches RevPAR.
+    # Every combination is spelled out because "not up" covers two very different
+    # outcomes — held flat (the rise was cancelled out) and fell (it backfired).
+    rate_note = ""
+    if comparable and adr_dir == "up":
+        rate_note = {
+            "up":   "The rate rise is sticking — it reached RevPAR.",
+            "flat": "The rate rise is not reaching RevPAR — lost bookings are cancelling it out.",
+            "down": "The rate rise backfired — it lost more in bookings than it gained in rate.",
+        }[revpar_dir]
+    elif comparable and adr_dir == "down":
+        rate_note = {
+            "up":   "Rate fell but RevPAR rose — the extra volume more than paid for it.",
+            "flat": "Rate fell and RevPAR held — the extra volume covered it, no more.",
+            "down": "Rate fell and RevPAR followed it down.",
+        }[revpar_dir]
+
+    return RoomTrend(
+        current=current, prior=prior, label=label, prior_label=prior_label,
+        comparable=comparable,
+        revpar_delta_pct=revpar_d, adr_delta_pct=adr_d,
+        occupancy_delta_pt=round(current.occupancy_pct - prior.occupancy_pct, 1),
+        occupancy_delta_pct=occ_d, revenue_delta_pct=rev_d,
+        occupancy_dir=occ_dir, revpar_dir=revpar_dir, adr_dir=adr_dir,
+        verdict=verdict, rate_note=rate_note,
+    )
+
+
+# ── GOPPAR (profit per available room-night) ──────────────────────────
+#
+# RevPAR is a revenue metric. It cannot see fuel, wages, restocking or
+# maintenance, so a hotel can post a rising RevPAR straight through a month it
+# lost money on. GOPPAR divides *profit* by the same denominator and is the
+# bottom-line twin: read side by side, the gap between them is the cost base.
+#
+# This matters most where room rates move with generator diesel — a rate rise
+# that only covers the fuel it was raised for lifts RevPAR and leaves GOPPAR
+# exactly where it was. Only the pair shows that.
+#
+# GOP here is taken straight from compute_pnl: whole-hotel GOP *is*
+# PnL.net_profit and rooms GOP *is* PnL.rooms.profit, so GOPPAR can never drift
+# from the P&L on the same screen (pinned by tests). Note this is profit after
+# *all* recorded operating costs — Hotel 85's expense categories don't separate
+# fixed charges (rent, insurance) from operating ones, so it is nearer "net
+# operating profit per available room" than strict USALI GOP. Owner draws and
+# stock purchases are already excluded upstream by operating_expenses().
+
+
+@dataclass(frozen=True)
+class Goppar:
+    available_room_nights: int
+    revpar: float             # room revenue per available room-night (top line)
+    goppar: float             # whole-hotel profit per available room-night
+    rooms_goppar: float       # rooms-account profit per available room-night
+    bar_par: float            # bar profit per available room-night
+    gop: float                # == PnL.net_profit
+    rooms_gop: float          # == PnL.rooms.profit
+    bar_gop: float            # == PnL.bar.profit
+    conversion_pct: float     # goppar / revpar — can exceed 100% when the bar carries
+    rooms_conversion_pct: float   # rooms_goppar / revpar — the rooms margin, always ≤ 100%
+
+
+def compute_goppar(pnl, available_room_nights, room_revenue=None):
+    """Profit per available room-night, alongside the RevPAR it must be read with.
+
+    ``room_revenue`` defaults to ``pnl.rooms.revenue``; pass it only when the
+    caller already has a RoomMetrics whose revenue it must match exactly.
+    """
+    available = max(int(available_room_nights), 0)
+    revenue = pnl.rooms.revenue if room_revenue is None else room_revenue
+
+    def _par(amount):
+        return round(amount / available, 2) if available else 0.0
+
+    revpar = _par(revenue)
+    goppar = _par(pnl.net_profit)
+    rooms_goppar = _par(pnl.rooms.profit)
+
+    return Goppar(
+        available_room_nights=available,
+        revpar=revpar, goppar=goppar, rooms_goppar=rooms_goppar,
+        bar_par=_par(pnl.bar.profit),
+        gop=round(pnl.net_profit, 2),
+        rooms_gop=round(pnl.rooms.profit, 2),
+        bar_gop=round(pnl.bar.profit, 2),
+        conversion_pct=pct_of(goppar, revpar),
+        rooms_conversion_pct=pct_of(rooms_goppar, revpar),
+    )
+
+
+# What a change in top-line room revenue actually did to the bottom line. This
+# is the question RevPAR alone can never answer: revenue up + profit flat means
+# the increase was eaten on the way through.
+GOPPAR_VERDICTS = {
+    ("up",   "up"):   "Revenue up and profit up — the gain is reaching the bottom line.",
+    ("up",   "flat"): "Revenue up but profit flat — rising costs are absorbing the whole gain.",
+    ("up",   "down"): "Revenue up while profit fell — costs are rising faster than rates.",
+    ("flat", "up"):   "Same revenue, more profit — costs came down.",
+    ("flat", "flat"): "Revenue and profit both steady.",
+    ("flat", "down"): "Same revenue, less profit — costs are creeping up.",
+    ("down", "up"):   "Earning less but keeping more — a leaner month.",
+    ("down", "flat"): "Revenue fell but profit held — costs fell with it.",
+    ("down", "down"): "Revenue and profit both down.",
+}
+
+
+@dataclass(frozen=True)
+class GopparTrend:
+    current: Goppar
+    prior: Goppar
+    comparable: bool
+    revpar_delta_pct: float
+    goppar_delta_pct: float
+    conversion_delta_pt: float   # percentage POINTS of revenue kept
+    revpar_dir: str
+    goppar_dir: str
+    verdict: str
+
+
+def compare_goppar(current, prior):
+    """Did a change in RevPAR reach GOPPAR, or did costs eat it on the way?"""
+    comparable = prior.revpar != 0 and prior.available_room_nights > 0
+
+    revpar_d = _rel_change(current.revpar, prior.revpar)
+    # GOP can cross zero between periods, where a relative % is meaningless
+    # (−₦5,000 → +₦5,000 is not "−200% growth"). Fall back to direction only.
+    if prior.goppar > 0:
+        goppar_d = _rel_change(current.goppar, prior.goppar)
+        goppar_dir = _direction(goppar_d) if comparable else "flat"
+    else:
+        goppar_d = 0.0
+        goppar_dir = ("up" if current.goppar > prior.goppar else
+                      "down" if current.goppar < prior.goppar else "flat") if comparable else "flat"
+
+    revpar_dir = _direction(revpar_d) if comparable else "flat"
+
+    return GopparTrend(
+        current=current, prior=prior, comparable=comparable,
+        revpar_delta_pct=revpar_d, goppar_delta_pct=goppar_d,
+        conversion_delta_pt=round(current.conversion_pct - prior.conversion_pct, 1),
+        revpar_dir=revpar_dir, goppar_dir=goppar_dir,
+        verdict=GOPPAR_VERDICTS[(revpar_dir, goppar_dir)] if comparable else "",
     )
 
 
