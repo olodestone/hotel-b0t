@@ -2231,6 +2231,8 @@ _DRW_AMT, _DRW_NOTE = range(61, 63)  # owner-draw flow: amount → optional note
 _SCS_DRINK, _SCS_COST = range(63, 65)  # set-cost flow: pick drink → new cost price
 _SMN_OLD, _SMN_NEW = range(65, 67)  # staff-merge flow: pick duplicate → name to keep
 _DSF_DEBT, _DSF_STAFF = range(67, 69)  # edit-debt-staff flow: pick debt → pick/type correct staff
+_SUP_DRINK, _SUP_DRINK_TEXT, _SUP_QTY, _SUP_QTY_TEXT, _SUP_COST, _SUP_WHO, _SUP_WHO_TEXT, _SUP_DUE, _SUP_DUE_TEXT = range(69, 78)
+_SPY_INV, _SPY_AMT = range(78, 80)  # pay-supplier flow: pick invoice → full/partial
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2774,6 +2776,16 @@ async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_long_cb(q, text)
 
 
+async def _cb_suppliers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """🧾 Suppliers → What I Owe. The two action entries are conversations."""
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    await _reply_long_cb(q, reports.generate_payables_report())
+
+
 # ── Keyboard shortcut handlers ────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2798,6 +2810,7 @@ def _manage_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings")],
         [InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff"),
          InlineKeyboardButton("📈 Insights",     callback_data="mgr:insights")],
+        [InlineKeyboardButton("🧾 Suppliers",    callback_data="mgr:suppliers")],
     ])
 
 
@@ -2810,6 +2823,20 @@ def _insights_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛏 Room Stats",   callback_data="ins:roomstats"),
          InlineKeyboardButton("🔍 Variance",     callback_data="ins:variance")],
         [InlineKeyboardButton("🧾 Supplier Bills", callback_data="ins:payables")],
+    ])
+
+
+def _suppliers_menu_keyboard() -> InlineKeyboardMarkup:
+    """Supplier credit — the two sides of an invoice plus the list.
+
+    Stock arrives on 📥, cash leaves on ✅. Keeping them one tap apart is the
+    whole point: the bot can only tell profit from cash if the two are logged
+    as separate events.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Stock on Credit", callback_data="sup:credit")],
+        [InlineKeyboardButton("✅ Pay Supplier",    callback_data="sup:pay")],
+        [InlineKeyboardButton("🧾 What I Owe",      callback_data="sup:list")],
     ])
 
 
@@ -2903,6 +2930,46 @@ def _transfer_qty_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(str(n), callback_data=f"tfr_q:{n}") for n in (6, 12, 24)],
         [InlineKeyboardButton("✏️ Other", callback_data="tfr_q:__other__")],
+    ])
+
+
+def _credit_qty_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"sup_q:{n}") for n in (12, 24, 48)],
+        [InlineKeyboardButton("✏️ Other", callback_data="sup_q:__other__")],
+    ])
+
+
+def _known_suppliers(limit: int = 8) -> list[str]:
+    """Suppliers already invoiced, most recently used first."""
+    rows = db.read_all("payables")
+    rows.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
+    seen: list[str] = []
+    for r in rows:
+        name = str(r.get("supplier") or "").strip()
+        if name and name.lower() not in {s.lower() for s in seen}:
+            seen.append(name)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def _supplier_name_kb(names: list[str]) -> InlineKeyboardMarkup:
+    """Referenced by index — supplier names carry spaces and colons freely,
+    so they cannot ride in callback_data the way single-token drink names do."""
+    rows = [[InlineKeyboardButton(n.title(), callback_data=f"sup_who:{i}")]
+            for i, n in enumerate(names)]
+    rows.append([InlineKeyboardButton("✏️ New supplier", callback_data="sup_who:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _due_date_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("7 days",  callback_data="sup_due:7"),
+         InlineKeyboardButton("14 days", callback_data="sup_due:14"),
+         InlineKeyboardButton("30 days", callback_data="sup_due:30")],
+        [InlineKeyboardButton("✏️ Pick a date", callback_data="sup_due:__other__"),
+         InlineKeyboardButton("⏭ No due date",  callback_data="sup_due:__none__")],
     ])
 
 
@@ -3173,6 +3240,257 @@ async def _rst_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ok, msg = logic.process_restock(drink, qty, cost, recorded_by=recorded_by)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
+
+
+# ── Stock on credit flow ───────────────────────────────────────────────
+# The tap-through twin of /restock_credit. Same shape as the restock flow up
+# to the cost, then two extra steps — who supplied it, and when it's due —
+# because those are what make the invoice payable and DPO computable.
+
+@_require_admin
+async def _sup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "📥 *Stock on credit — which drink?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_all_drink_keyboard("sup_dr"),
+    )
+    return _SUP_DRINK
+
+
+async def _sup_ask_qty(target, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    drink = ctx.user_data.get("sup_drink", "")
+    await target(
+        f"📥 *{reports._esc(drink.title())}* — how many units?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_credit_qty_keyboard(),
+    )
+    return _SUP_QTY
+
+
+async def _sup_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    drink = q.data[7:]
+    if drink == "__other__":
+        await q.edit_message_text("Type the drink name:")
+        return _SUP_DRINK_TEXT
+    ctx.user_data["sup_drink"] = drink
+    return await _sup_ask_qty(q.edit_message_text, ctx)
+
+
+async def _sup_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["sup_drink"] = update.message.text.strip().lower()
+    return await _sup_ask_qty(update.message.reply_text, ctx)
+
+
+async def _sup_ask_cost(target, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    qty   = ctx.user_data.get("sup_qty", 0)
+    drink = ctx.user_data.get("sup_drink", "")
+    await target(
+        f"📥 {qty}× {reports._esc(drink.title())} — *cost per unit?* \\(₦\\)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _SUP_COST
+
+
+async def _sup_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val == "__other__":
+        await q.edit_message_text("How many units? (type a number)")
+        return _SUP_QTY_TEXT
+    ctx.user_data["sup_qty"] = int(val)
+    return await _sup_ask_cost(q.edit_message_text, ctx)
+
+
+async def _sup_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        qty = int(update.message.text.strip())
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number:")
+        return _SUP_QTY_TEXT
+    ctx.user_data["sup_qty"] = qty
+    return await _sup_ask_cost(update.message.reply_text, ctx)
+
+
+async def _sup_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    cost, err = _to_float(update.message.text.strip(), "cost")
+    if err:
+        await update.message.reply_text("❌ Enter a valid cost (e.g. 300):")
+        return _SUP_COST
+    ctx.user_data["sup_cost"] = cost
+    names = _known_suppliers()
+    ctx.user_data["sup_names"] = names
+    total = round(cost * ctx.user_data.get("sup_qty", 0), 2)
+    if names:
+        await update.message.reply_text(
+            f"🧾 ₦{total:,.0f} owed — *which supplier?*",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_supplier_name_kb(names),
+        )
+        return _SUP_WHO
+    await update.message.reply_text(f"🧾 ₦{total:,.0f} owed — supplier name?")
+    return _SUP_WHO_TEXT
+
+
+async def _sup_ask_due(target, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    who = ctx.user_data.get("sup_who", "")
+    await target(
+        f"📅 *When is {reports._esc(who.title())} due to be paid?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_due_date_keyboard(),
+    )
+    return _SUP_DUE
+
+
+async def _sup_pick_who(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    raw = q.data.split(":", 1)[1]
+    if raw == "__other__":
+        await q.edit_message_text("Type the supplier name:")
+        return _SUP_WHO_TEXT
+    names = ctx.user_data.get("sup_names", [])
+    idx = int(raw)
+    if idx >= len(names):
+        await q.edit_message_text("❌ Selection expired — start again from 🧾 Suppliers.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    ctx.user_data["sup_who"] = names[idx]
+    return await _sup_ask_due(q.edit_message_text, ctx)
+
+
+async def _sup_who_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Supplier name can't be blank:")
+        return _SUP_WHO_TEXT
+    ctx.user_data["sup_who"] = name
+    return await _sup_ask_due(update.message.reply_text, ctx)
+
+
+async def _sup_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE, due: str | None,
+                      send) -> int:
+    drink = ctx.user_data.pop("sup_drink", "")
+    qty   = ctx.user_data.pop("sup_qty", 0)
+    cost  = ctx.user_data.pop("sup_cost", 0.0)
+    who   = ctx.user_data.pop("sup_who", "")
+    ctx.user_data.pop("sup_names", None)
+    user  = update.effective_user
+    recorded_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_restock_credit(
+        drink, qty, cost, who, due_date=due, recorded_by=recorded_by
+    )
+    await send(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+async def _sup_pick_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data.split(":", 1)[1]
+    if val == "__other__":
+        await q.edit_message_text("Type the due date (YYYY-MM-DD):")
+        return _SUP_DUE_TEXT
+    due = None if val == "__none__" else str(date.today() + timedelta(days=int(val)))
+    return await _sup_finish(update, ctx, due, update.effective_chat.send_message)
+
+
+async def _sup_due_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    due = update.message.text.strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
+        await update.message.reply_text("❌ Use YYYY-MM-DD (e.g. 2026-08-15):")
+        return _SUP_DUE_TEXT
+    return await _sup_finish(update, ctx, due, update.message.reply_text)
+
+
+# ── Pay supplier flow ──────────────────────────────────────────────────
+# Invoice ids are ints, so they ride in callback_data directly.
+
+_SPY_MAX = 30  # cap the invoice picker so the inline keyboard stays usable
+
+
+@_require_admin
+async def _spy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    rows = db.get_outstanding_payables()
+    if not rows:
+        await q.edit_message_text(
+            "✅ Nothing owed to suppliers.",
+            reply_markup=_suppliers_menu_keyboard(),
+        )
+        return ConversationHandler.END
+    buttons = []
+    for r in rows[:_SPY_MAX]:
+        rem = round(float(r["amount"]) - float(r.get("amount_paid") or 0), 2)
+        due = str(r.get("due_date") or "")
+        tag = f" · due {due}" if due else ""
+        buttons.append([InlineKeyboardButton(
+            f"#{r['id']} {str(r['supplier']).title()} — ₦{rem:,.0f}{tag}",
+            callback_data=f"spy_inv:{r['id']}",
+        )])
+    await q.edit_message_text(
+        "✅ *Which invoice are you settling?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return _SPY_INV
+
+
+async def _spy_pick_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    payable_id = int(q.data.split(":", 1)[1])
+    ctx.user_data["spy_id"] = payable_id
+    row = next((r for r in db.get_outstanding_payables() if int(r["id"]) == payable_id), None)
+    if row is None:
+        await q.edit_message_text("❌ That invoice is no longer outstanding.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    rem = round(float(row["amount"]) - float(row.get("amount_paid") or 0), 2)
+    await q.edit_message_text(
+        f"💵 Invoice \\#{payable_id} — *{reports._esc(str(row['supplier']).title())}* "
+        f"is owed *₦{rem:,.0f}*\nHow much are you paying?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ Full — ₦{rem:,.0f}", callback_data="spy_am:full"),
+            InlineKeyboardButton("✏️ Partial amount",      callback_data="spy_am:partial"),
+        ]]),
+    )
+    return _SPY_AMT
+
+
+async def _spy_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                      amount: float | None, send) -> int:
+    payable_id = ctx.user_data.pop("spy_id", 0)
+    user = update.effective_user
+    paid_by = user.username or user.first_name or str(user.id)
+    ok, msg = logic.process_pay_supplier(payable_id, amount=amount, paid_by=paid_by)
+    await send(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
+    return ConversationHandler.END
+
+
+async def _spy_pick_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if q.data == "spy_am:full":
+        return await _spy_settle(update, ctx, None, update.effective_chat.send_message)
+    await q.edit_message_text("Type the partial amount paid (₦):")
+    return _SPY_AMT
+
+
+async def _spy_amt_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    val, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter a valid amount:")
+        return _SPY_AMT
+    return await _spy_settle(update, ctx, val, update.message.reply_text)
 
 
 # ── Transfer flow ──────────────────────────────────────────────────────
@@ -4227,6 +4545,20 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=_insights_menu_keyboard(),
         )
 
+    elif action == "suppliers":
+        owed = sum(
+            float(r["amount"]) - float(r.get("amount_paid") or 0)
+            for r in db.get_outstanding_payables()
+        )
+        headline = (f"You owe *₦{owed:,.0f}*\\." if owed
+                    else "Nothing owed to suppliers\\.")
+        await q.edit_message_text(
+            f"🧾 *Suppliers*\n{headline}\n"
+            "_Stock in on credit, cash out when you settle._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_suppliers_menu_keyboard(),
+        )
+
     elif action == "staff":
         access_users, report_names = _staff_overview()
         lines = ["👥 *Staff*", "", "*Bot access* _(can log sales)_:"]
@@ -5008,9 +5340,38 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    sup_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_sup_start, pattern="^sup:credit$")],
+        states={
+            _SUP_DRINK:      [CallbackQueryHandler(_sup_pick_drink, pattern="^sup_dr:")],
+            _SUP_DRINK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sup_drink_text)],
+            _SUP_QTY:        [CallbackQueryHandler(_sup_pick_qty,   pattern="^sup_q:")],
+            _SUP_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sup_qty_text)],
+            _SUP_COST:       [MessageHandler(filters.TEXT & ~filters.COMMAND, _sup_cost)],
+            _SUP_WHO:        [CallbackQueryHandler(_sup_pick_who,   pattern="^sup_who:")],
+            _SUP_WHO_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sup_who_text)],
+            _SUP_DUE:        [CallbackQueryHandler(_sup_pick_due,   pattern="^sup_due:")],
+            _SUP_DUE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sup_due_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    spy_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_spy_start, pattern="^sup:pay$")],
+        states={
+            _SPY_INV: [CallbackQueryHandler(_spy_pick_invoice, pattern="^spy_inv:")],
+            _SPY_AMT: [
+                CallbackQueryHandler(_spy_pick_amt, pattern="^spy_am:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _spy_amt_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
-                 rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv):
+                 rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv,
+                 sup_conv, spy_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
@@ -5026,8 +5387,9 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_debtors_filter, pattern="^dbt:"))
     app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
     app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
-    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|insights|addstaff|removestaff)$"))
+    app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|insights|suppliers|addstaff|removestaff)$"))
     app.add_handler(CallbackQueryHandler(_cb_insights_menu, pattern="^ins:(cashcycle|menu|roomstats|variance|payables)$"))
+    app.add_handler(CallbackQueryHandler(_cb_suppliers_list, pattern="^sup:list$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))

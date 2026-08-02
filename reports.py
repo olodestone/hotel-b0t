@@ -1185,8 +1185,8 @@ def generate_payables_report() -> str:
         return (
             "🧾 *Supplier Invoices*\n\n"
             "Nothing owed to suppliers.\n"
-            "_Received stock on credit? Record it with_\n"
-            "`/restock_credit <drink> <qty> <cost> <supplier> [YYYY-MM-DD]`"
+            "_Received stock on credit? Tap_ ⚙️ *Manage → 🧾 Suppliers → 📥 Stock on Credit*\n"
+            "_or use_ `/restock_credit <drink> <qty> <cost> <supplier> [YYYY-MM-DD]`"
         )
 
     total = round(sum(float(r["amount"]) - float(r.get("amount_paid") or 0) for r in rows), 2)
@@ -1220,7 +1220,8 @@ def generate_payables_report() -> str:
 
     lines += [
         _SEP,
-        "_Settle with_ `/pay_supplier <id> [amount]` _— cash only moves then._",
+        "_Settle from_ ⚙️ *Manage → 🧾 Suppliers → ✅ Pay Supplier*",
+        "_or_ `/pay_supplier <id> [amount]` _— cash only moves then._",
         f"_Generated {now.strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)

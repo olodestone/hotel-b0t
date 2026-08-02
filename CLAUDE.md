@@ -69,7 +69,7 @@ Two roles: `admin` and `staff`. Role lookup hits the `users` table on every requ
 - `/count`, `/variance` — stocktakes and shrinkage
 - `/restock_credit`, `/payables`, `/pay_supplier` — supplier credit
 
-The five analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable).
+The five analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable). Supplier credit has its own **⚙️ Manage → 🧾 Suppliers** submenu — see below.
 
 Staff cannot delete anything — audit trail is preserved. Mistakes are corrected by admin via `/delete` then re-entry.
 
@@ -185,6 +185,18 @@ The rooms account has `cogs = 0.0` by construction, so its gross margin is alway
 - `supplier` — settlement of an earlier credit purchase (`/pay_supplier`).
 
 `/restock_credit` deliberately writes **no** expense row: the stock arrives but no cash has moved. `restock_spend()` sums both categories so the `/position` cash estimate stays right, and `compute_working_capital` excludes `supplier` rows from `purchases_window` (they settle stock bought earlier — counting them would double-count).
+
+**Tap-through: ⚙️ Manage → 🧾 Suppliers.** The submenu header shows what's currently owed, then offers the two halves of an invoice plus the list:
+
+| Button | Flow | Equivalent |
+|---|---|---|
+| 📥 Stock on Credit | `sup_conv` — drink → qty → cost → supplier → due date | `/restock_credit` |
+| ✅ Pay Supplier | `spy_conv` — pick invoice → full or partial | `/pay_supplier` |
+| 🧾 What I Owe | `_cb_suppliers_list` | `/payables` |
+
+The credit flow mirrors the restock flow up to the cost, then adds the two steps that make an invoice payable and DPO computable. The supplier step offers the 8 most recently used suppliers (`_known_suppliers()`) **by index** — supplier names carry spaces and colons, so they cannot ride in `callback_data` the way single-token drink names do, the same constraint as the staff-merge flow. Due date is quick-pick (7 / 14 / 30 days), a typed `YYYY-MM-DD`, or none. Invoice ids are ints, so the pay flow puts them in `callback_data` directly.
+
+Both flows land on `logic.process_restock_credit()` / `logic.process_pay_supplier()` — the same entry points the slash commands use, so validation and the profit-vs-cash split can't diverge between the two surfaces. `/payables` names the button path first and the command second.
 
 ### Salary expenses
 Record with category `salary`:
