@@ -95,7 +95,8 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/draw <amount> [note] [YYYY-MM-DD]` | Record an owner withdrawal (equity draw). **Not** an expense — reduces cash, never profit |
 | `/draws [today\|YYYY-MM-DD\|YYYY-MM\|all]` | List owner draws for a period (newest first, with IDs) and the total drawn |
 | `/add_debtor <room\|bar> <name> <amount> [note] [YYYY-MM-DD]` | Log debtor |
-| `/pay_debtor <room\|bar> <name> [amount]` | Full or partial debt payment |
+| `/pay_debtor <room\|bar> <name> [amount]` | Full or partial payment against a person's **oldest** outstanding debt |
+| `/pay_debt <id> [amount]` | Full or partial payment against **one specific debt**. This is what **⚙️ Manage → ✅ Pay Debtor** uses — the picker lists one button per outstanding debt (name, remaining, date, note) and the payment lands on the row that was tapped, never on an earlier one |
 | `/debtor_history <bar\|rooms> <name>` | Full payment timeline for a debtor |
 | `/restock <drink> <qty> <cost_price>` | Add inventory to store. Logged as a `restock` expense row but treated as a cash→stock movement, **not** a P&L cost |
 | `/transfer <drink> <qty> [YYYY-MM-DD]` | Move store → bar. Logged to the `transfers` audit table; the optional date backdates that log row |

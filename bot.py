@@ -2255,7 +2255,7 @@ _EXP_ACCT, _EXP_CAT, _EXP_CAT_TEXT, _EXP_AMT, _EXP_NOTE, _EXP_DATE = range(17, 2
 _RST_DRINK, _RST_DRINK_TEXT, _RST_QTY, _RST_QTY_TEXT, _RST_COST = range(23, 28)
 _TFR_DRINK, _TFR_DRINK_TEXT, _TFR_QTY, _TFR_QTY_TEXT = range(28, 32)
 _DEB_ACCT, _DEB_NAME, _DEB_AMT, _DEB_NOTE, _DEB_DATE = range(32, 37)
-_PAY_ACCT, _PAY_NAME, _PAY_AMT = range(37, 40)
+_PAY_ACCT, _PAY_DEBT, _PAY_AMT = range(37, 40)
 _DEL_TYPE, _DEL_ENTRY, _DEL_CONFIRM = range(40, 43)
 _SSET_PRICE_DRINK, _SSET_PRICE_AMT = range(43, 45)
 _SSET_ROOM_TYPE, _SSET_ROOM_TYPE_TEXT, _SSET_ROOM_AMT = range(45, 48)
@@ -3779,6 +3779,23 @@ async def _pay_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return _PAY_ACCT
 
 
+def _pay_debt_label(d: dict, remaining: float) -> str:
+    """One debt as a button label.
+
+    A person can owe several separate debts, and the payment lands on the exact
+    row that was tapped — so the label has to tell two debts of the same name
+    apart. Date always; the note when there is room for it.
+    """
+    ts = str(d.get("timestamp", ""))[:10]
+    label = f"{str(d['name']).title()} — ₦{remaining:,.0f} ({ts})"
+    note = str(d.get("description") or "").strip()
+    if note:
+        room = 58 - len(label)
+        if room > 8:
+            label += f" • {note[:room]}"
+    return label
+
+
 async def _pay_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
@@ -3792,37 +3809,43 @@ async def _pay_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     for d in debtors:
         rem = round(float(d["amount"]) - float(d.get("amount_paid") or 0), 2)
         rows.append([InlineKeyboardButton(
-            f"{d['name'].title()} — ₦{rem:,.0f}",
-            callback_data=f"pay_nm:{d['name'].lower()}",
+            _pay_debt_label(d, rem),
+            callback_data=f"pay_db:{int(d['id'])}",
         )])
     await q.edit_message_text(
-        "✅ *Who paid?*",
+        "✅ *Which debt was paid?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
     )
-    return _PAY_NAME
+    return _PAY_DEBT
 
 
-async def _pay_pick_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def _pay_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    name = q.data[7:]
-    ctx.user_data["pay_name"] = name
+    debt_id = int(q.data.split(":")[1])
+    ctx.user_data["pay_debt_id"] = debt_id
     acct = ctx.user_data.get("pay_acct", "bar")
-    debtors = db.get_debtors(account=acct)
-    debtor = next((d for d in debtors if d["name"].lower() == name), None)
-    if debtor:
-        rem = round(float(debtor["amount"]) - float(debtor.get("amount_paid") or 0), 2)
-        await q.edit_message_text(
-            f"💳 *{reports._esc(name.title())}* owes *₦{rem:,.0f}*\nHow much are they paying?",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"✅ Full — ₦{rem:,.0f}", callback_data="pay_am:full"),
-                InlineKeyboardButton("✏️ Partial amount",      callback_data="pay_am:partial"),
-            ]]),
-        )
-    else:
-        await q.edit_message_text("How much are they paying? (₦)")
+    debtor = next((d for d in db.get_debtors(account=acct) if int(d["id"]) == debt_id), None)
+    if debtor is None:
+        await q.edit_message_text("❌ That debt is no longer outstanding.", parse_mode=ParseMode.MARKDOWN_V2)
+        return ConversationHandler.END
+
+    rem  = round(float(debtor["amount"]) - float(debtor.get("amount_paid") or 0), 2)
+    name = str(debtor["name"]).title()
+    ts   = str(debtor.get("timestamp", ""))[:10]
+    note = str(debtor.get("description") or "").strip()
+    note_line = f"\n_{reports._esc(note)}_" if note else ""
+    await q.edit_message_text(
+        f"💳 Debt `#{debt_id}` — *{reports._esc(name)}* ({ts})\n"
+        f"Outstanding on this debt: *₦{rem:,.0f}*{note_line}\n"
+        "How much are they paying?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ Full — ₦{rem:,.0f}", callback_data="pay_am:full"),
+            InlineKeyboardButton("✏️ Partial amount",      callback_data="pay_am:partial"),
+        ]]),
+    )
     return _PAY_AMT
 
 
@@ -3830,11 +3853,11 @@ async def _pay_pick_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     if q.data == "pay_am:full":
-        acct = ctx.user_data.pop("pay_acct", "bar")
-        name = ctx.user_data.pop("pay_name", "")
+        ctx.user_data.pop("pay_acct", None)
+        debt_id = ctx.user_data.pop("pay_debt_id", 0)
         user = update.effective_user
         paid_by = user.username or user.first_name or str(user.id)
-        ok, msg = logic.process_pay_debtor(acct, name, paid_by=paid_by, amount=None)
+        ok, msg = logic.process_pay_debt_by_id(debt_id, paid_by=paid_by, amount=None)
         await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
         return ConversationHandler.END
     await q.edit_message_text("Type the partial amount paid (₦):")
@@ -3846,11 +3869,11 @@ async def _pay_amt_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if err:
         await update.message.reply_text("❌ Enter a valid amount:")
         return _PAY_AMT
-    acct = ctx.user_data.pop("pay_acct", "bar")
-    name = ctx.user_data.pop("pay_name", "")
+    ctx.user_data.pop("pay_acct", None)
+    debt_id = ctx.user_data.pop("pay_debt_id", 0)
     user = update.effective_user
     paid_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_pay_debtor(acct, name, paid_by=paid_by, amount=val)
+    ok, msg = logic.process_pay_debt_by_id(debt_id, paid_by=paid_by, amount=val)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
 
@@ -5404,7 +5427,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         entry_points=[CallbackQueryHandler(_pay_start, pattern="^mgr:pay_debtor$")],
         states={
             _PAY_ACCT: [CallbackQueryHandler(_pay_pick_acct, pattern="^pay_ac:")],
-            _PAY_NAME: [CallbackQueryHandler(_pay_pick_name, pattern="^pay_nm:")],
+            _PAY_DEBT: [CallbackQueryHandler(_pay_pick_debt, pattern="^pay_db:")],
             _PAY_AMT:  [
                 CallbackQueryHandler(_pay_pick_amt,  pattern="^pay_am:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _pay_amt_text),
