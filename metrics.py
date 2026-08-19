@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+import clock
+
 
 # ── Generic row helpers ───────────────────────────────────────────────
 
@@ -66,7 +68,7 @@ def filter_by_range(rows, start, end):
 
 
 def apply_filter(rows, for_date, for_month, all_time):
-    now = datetime.now()
+    now = clock.now()
     if for_date:
         return filter_by_date(rows, for_date)
     if all_time:
@@ -560,7 +562,7 @@ def compute_working_capital(sales_all, expense_all, debtor_rows, payment_rows,
     are optional: without them DPO is reported as untracked and DIO falls back
     to today's stock level rather than a true period average.
     """
-    now = now or datetime.now()
+    now = now or clock.now()
     end = now.date()
     start = end - timedelta(days=window_days - 1)
 

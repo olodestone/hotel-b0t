@@ -19,6 +19,7 @@ class StockResult:
     message: str
     low_stock_alert: str | None = None
     current_stock: int = 0
+    entry_id: int = 0          # id of the sales row written, for a targeted undo
 
 
 def sell_drink(drink: str, qty: int, timestamp: str | None = None, recorded_by: str = "") -> StockResult:
@@ -50,7 +51,7 @@ def sell_drink(drink: str, qty: int, timestamp: str | None = None, recorded_by: 
         )
 
     updated = db.upsert_drink(drink, qty_sold=qty)
-    db.record_sale(drink, qty, price, timestamp=timestamp, recorded_by=recorded_by)
+    sale_id = db.record_sale(drink, qty, price, timestamp=timestamp, recorded_by=recorded_by)
 
     new_stock = int(updated["current_stock"])
     threshold = int(updated["low_stock_threshold"])
@@ -66,6 +67,7 @@ def sell_drink(drink: str, qty: int, timestamp: str | None = None, recorded_by: 
         message=f"✅ Sold {qty}× *{drink.title()}* @ ₦{price:,.2f} each.\nRemaining stock: {new_stock}",
         low_stock_alert=alert,
         current_stock=new_stock,
+        entry_id=sale_id,
     )
 
 

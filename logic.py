@@ -23,15 +23,17 @@ def parse_date(s: str) -> str | None:
 
 # ── Drink sale ────────────────────────────────────────────────────────
 
-def process_drink_sale(drink: str, qty: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, str | None]:
+def process_drink_sale(drink: str, qty: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, str | None, int]:
     """Validate inputs and delegate to inventory.sell_drink.
     Price is read from inventory (set by admin via /setprice).
-    Returns (ok, message, low_stock_alert) — alert is None if no alert."""
+    Returns (ok, message, low_stock_alert, sale_id) — alert is None if no alert,
+    sale_id is 0 when nothing was written. The id lets the caller offer an undo
+    button bound to *this* sale rather than to whatever the newest one is."""
     if qty <= 0:
-        return False, "❌ Quantity must be a positive integer.", None
+        return False, "❌ Quantity must be a positive integer.", None, 0
 
     result: StockResult = inv.sell_drink(drink.strip(), qty, timestamp=timestamp, recorded_by=recorded_by)
-    return result.ok, result.message, result.low_stock_alert
+    return result.ok, result.message, result.low_stock_alert, result.entry_id
 
 
 # ── Set drink price (admin) ───────────────────────────────────────────
@@ -56,15 +58,16 @@ def process_set_price(drink: str, price: float) -> tuple[bool, str]:
 
 # ── Room sale ─────────────────────────────────────────────────────────
 
-def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
+def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, int]:
+    """Returns (ok, message, room_id) — room_id is 0 when nothing was written."""
     if qty <= 0:
-        return False, "❌ Quantity must be a positive integer."
+        return False, "❌ Quantity must be a positive integer.", 0
     if price <= 0:
-        return False, "❌ Price must be a positive number."
+        return False, "❌ Price must be a positive number.", 0
     if nights <= 0:
-        return False, "❌ Number of nights must be a positive integer."
+        return False, "❌ Number of nights must be a positive integer.", 0
 
-    db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
+    room_id = db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
     total = qty * price * nights
     date_note = f" _(recorded for {timestamp})_" if timestamp else ""
     return True, (
@@ -72,7 +75,7 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
         f"Type: *{room_type.title()}* | Qty: {qty} | "
         f"₦{price:,.2f}/night × {nights} night(s)\n"
         f"Total Revenue: *₦{total:,.2f}*"
-    )
+    ), room_id
 
 
 # ── Expense ───────────────────────────────────────────────────────────
@@ -473,14 +476,35 @@ def process_delete(entry_type: str, entry_id: int, actor: str = "") -> tuple[boo
 # ── Undo last entry ──────────────────────────────────────────────────
 
 def process_undo(username: str) -> tuple[bool, str]:
-    """Soft-void the last sale or room entry by this user if within the 2-min window."""
+    """Soft-void this user's most recent sale or room entry, if still in window."""
     entry = db.get_last_staff_entry(username)
     if entry is None:
         return False, (
             "❌ Nothing to undo.\n"
             "Either you have no recent entries, or the 2-minute window has passed."
         )
+    return _reverse_entry(entry, username)
 
+
+def process_undo_entry(entry_type: str, entry_id: int, username: str) -> tuple[bool, str]:
+    """Soft-void one *specific* sale or room entry — what the inline button uses.
+
+    The button carries the id of the entry it was posted under, so two entries
+    in quick succession each undo themselves. Reversing "the latest entry"
+    instead would let the second one swallow the first one's button.
+    """
+    entry = db.get_undoable_entry(entry_type, entry_id, username)
+    if entry is None:
+        return False, (
+            "❌ Can't undo this one.\n"
+            "It has already been undone, or the 2-minute window has passed. "
+            "Ask an admin to remove it with /delete."
+        )
+    return _reverse_entry(entry, username)
+
+
+def _reverse_entry(entry: dict, username: str) -> tuple[bool, str]:
+    """Void one already-validated sale/room row and restore any stock behind it."""
     entry_type = entry["entry_type"]
 
     if entry_type == "sale":

@@ -10,6 +10,7 @@ from datetime import datetime, date, timedelta
 from math import ceil
 from typing import Any
 
+import clock
 import database as db
 import inventory as inv
 import metrics
@@ -142,7 +143,7 @@ def escape_markdown_v2(s: str) -> str:
 # presentation/formatting helpers remain in this module.
 
 def _period_label(for_date: date | None, for_month: tuple[int, int] | None, all_time: bool) -> str:
-    now = datetime.now()
+    now = clock.now()
     if for_date:
         return for_date.strftime("%d %b %Y")
     if all_time:
@@ -193,7 +194,7 @@ def _room_windows(
 
     All-time has no meaningful predecessor, so it compares against nothing.
     """
-    today = datetime.now().date()
+    today = clock.now().date()
 
     if for_date:
         prev = for_date - timedelta(days=1)
@@ -251,7 +252,7 @@ def _period_days(for_date: date | None, for_month: tuple[int, int] | None,
     The current month counts only elapsed days: charging a half-finished month
     for its unsold future nights would understate occupancy every time.
     """
-    now = datetime.now()
+    now = clock.now()
     if for_date:
         return 1
     if all_time:
@@ -302,7 +303,7 @@ def generate_full_report(
             _SEP,
             f"*Total Revenue:   {_fmt(pnl.total_revenue)}*",
             _SEP,
-            f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+            f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
         ]
         return "\n".join(lines)
 
@@ -380,7 +381,7 @@ def generate_full_report(
         lines.append(f"  Total Owed:    {_fmt(od.total_owed)}")
         lines.append(_SEP)
 
-    lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -446,7 +447,7 @@ def generate_sales_report(
         divider,
         total_line,
         "```",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -528,7 +529,7 @@ def generate_expense_report(
     ]
     if restock_total > 0:
         lines.append(f"📦 Stock purchased: {_fmt(restock_total)} _(inventory buy — not an operating expense)_")
-    lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -582,7 +583,7 @@ def generate_staff_report(
         divider,
         total_line,
         "```",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -591,7 +592,7 @@ def generate_staff_report(
 
 def generate_daily_summary(target: date | None = None, staff_view: bool = False) -> str:
     """Compact one-screen overview of a single day's activity."""
-    today = target or datetime.now().date()
+    today = target or clock.now().date()
     label = today.strftime("%A, %d %b %Y")
 
     sales_rows = _filter_by_date(_active(db.read_all("sales")), today)
@@ -635,7 +636,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
             lines.append(_SEP)
             lines.append(f"⚠️ Low Bar Stock: {', '.join(_esc(d) for d in low_bar)}")
             lines.append("_Ask admin to transfer from store._")
-        lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+        lines.append(f"\n_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
 
     expense_rows = _filter_by_date(_active(db.read_all("expenses")), today)
@@ -697,7 +698,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
         lines.append(f"🏦 Set aside today: *{_fmt(save_amt)}* ({total_pct}% of {_fmt(total_rev)})")
         lines.append(f"_Run /allocation for full breakdown_")
 
-    lines.append(f"\n_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"\n_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -850,7 +851,7 @@ def generate_allocation_report(
     lines += [
         _SEP,
         "_Use /setallocation to adjust percentages_",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
 
     if not total_rev:
@@ -885,7 +886,7 @@ def generate_position_report() -> str:
     expense_all = _active(db.read_all("expenses"))
     draws_all   = _active(db.read_all("owner_draws"))
     debtor_rows = db.read_all("debtors")
-    now = datetime.now()
+    now = clock.now()
 
     # Stock value on hand (asset), plus the cash anchor (opening balance + date).
     stock_value = round(sum(i["stock_value"] for i in inv.get_inventory_summary()), 2)
@@ -967,7 +968,7 @@ def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
     All arithmetic lives in metrics.compute_working_capital / compute_break_even
     (shared with the dashboard).
     """
-    now = datetime.now()
+    now = clock.now()
     cost_map = _cost_price_map()
     stock_rows = inv.get_inventory_summary()
     since = (now.date() - timedelta(days=window_days - 1)).strftime("%Y-%m-%d")
@@ -1189,7 +1190,7 @@ def generate_variance_report(
         _SEP,
         "_Count weekly, same day, before opening — a variance only means_",
         "_something if the count is routine._",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -1340,7 +1341,7 @@ def generate_room_stats_report(
         _SEP,
         "_RevPAR is the honest one: discounting to fill rooms lifts occupancy_",
         "_while RevPAR stays flat._",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -1418,7 +1419,7 @@ def _yield_gap_note(ranked: list[tuple[str, dict]]) -> list[str]:
 def generate_payables_report() -> str:
     """Outstanding supplier invoices, soonest due first."""
     rows = db.get_outstanding_payables()
-    now = datetime.now()
+    now = clock.now()
 
     if not rows:
         return (
@@ -1479,7 +1480,7 @@ _QUADRANT_DISPLAY = (
 
 def generate_menu_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
     """Rank every drink by margin against popularity, and say what to do about it."""
-    now = datetime.now()
+    now = clock.now()
     stock_rows = inv.get_inventory_summary()
     start = now.date() - timedelta(days=window_days - 1)
     sales_rows = metrics.filter_by_range(_active(db.read_all("sales")), start, now.date())
@@ -1583,7 +1584,7 @@ def generate_draws_report(
         _SEP,
         f"*Total drawn: {_fmt(total)}*  ({len(draw_rows)} draw{'s' if len(draw_rows) != 1 else ''})",
         "_Owner draws reduce cash, never profit. Remove one with_ `/delete draw <id>`.",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -1596,7 +1597,7 @@ def _debt_age(timestamp_str: str) -> str:
     if not created:
         return ""
     try:
-        days = (datetime.now() - created).days
+        days = (clock.now() - created).days
     except Exception:
         return ""
     date_str = created.strftime("%d %b")
@@ -1657,7 +1658,7 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
 
     def _days_old(r: dict) -> int:
         dt = _parse_ts(r.get("timestamp"))
-        return (datetime.now() - dt).days if dt else 0
+        return (clock.now() - dt).days if dt else 0
 
     overdue = [r for r in rows if _days_old(r) >= 7]
     lines.append(_SEP)
@@ -1665,7 +1666,7 @@ def generate_debtors_report(account: str | None = None, staff_view: bool = False
         lines.append(f"⚠️ {len(overdue)} debt(s) outstanding for 7+ days — follow up needed.")
     if not staff_view:
         lines.append("_Use_ `/pay_debt <id> [amount]` _to pay a specific debt._")
-    lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"_Updated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -1811,7 +1812,7 @@ def generate_stock_report(staff_view: bool = False) -> str:
             lines.append("⚠️ *Low Bar Stock* — ask admin to transfer:")
             for name in low_bar_items:
                 lines.append(f"  • {_esc(name)}")
-        lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+        lines.append(f"\n_Updated {clock.now().strftime('%d %b %Y %H:%M')}_")
         return "\n".join(lines)
 
     # Admin view — full table with margin
@@ -1868,7 +1869,7 @@ def generate_stock_report(staff_view: bool = False) -> str:
         for name in empty_store_items:
             lines.append(f"  • {_esc(name)}")
 
-    lines.append(f"\n_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"\n_Updated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -1945,7 +1946,7 @@ def generate_restock_plan(
 
     # No explicit period → rolling trailing-30-day window (the intended view).
     rolling = for_date is None and for_month is None and not all_time
-    today = for_date or datetime.now().date()
+    today = for_date or clock.now().date()
     week_no = min((today.day - 1) // 7 + 1, 4)
 
     all_sales = _active(db.read_all("sales"))
@@ -2161,7 +2162,7 @@ def generate_restock_plan(
     L += [_SEP, "_Tip: do transfers first, then only the 🔴 items this week._"]
     if any(r[7] for r in now) or any(r[7] for r in soon):
         L.append("_📈 = selling faster than its 30-day pace; order leans on the recent week._")
-    L.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    L.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(L)
 
 
@@ -2217,7 +2218,7 @@ def generate_price_list() -> str:
             "```",
         ]
 
-    lines.append(f"_Updated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"_Updated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
 
 
@@ -2275,7 +2276,7 @@ def generate_debtor_history(account: str, name: str) -> str:
     lines += [
         _SEP,
         f"*Total still owed: {_fmt(grand_remaining)}*" if grand_remaining > 0 else "✅ All debts cleared.",
-        f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
 
@@ -2376,5 +2377,5 @@ def generate_activity_log(date_str: str, username_filter: str | None = None) -> 
         lines.pop()
 
     lines.append(_SEP)
-    lines.append(f"_Generated {datetime.now().strftime('%d %b %Y %H:%M')}_")
+    lines.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)

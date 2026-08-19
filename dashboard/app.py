@@ -6,7 +6,7 @@ Run it (separate process from the bot):
 
 Security model:
   • Identity  — Telegram Login Widget, verified by HMAC (auth.verify_telegram_login).
-  • Tenancy   — every authenticated request sets database._hotel_schema_var to the
+  • Tenancy   — every authenticated request calls database.set_tenant() to scope to the
                 selected hotel's schema (require_tenant), so all reads are scoped
                 to that hotel and one tenant can never see another's data.
   • Read-only — no route mutates the database.
@@ -75,7 +75,7 @@ async def require_tenant(request: Request):
     back to the session's default. Must be an ASYNC generator: FastAPI resolves
     sync-generator dependencies via anyio.to_thread.run_sync, which runs the
     pre-yield code in a *copy* of the current context — so a plain `def` here
-    would set db._hotel_schema_var in a context the route handler never sees,
+    would call db.set_tenant() in a context the route handler never sees,
     silently leaving every query on the process's default HOTEL_SCHEMA instead
     of the tenant the user actually selected. An async generator runs in the
     same task/context as the route handler, so the set() is visible to it.
@@ -89,12 +89,12 @@ async def require_tenant(request: Request):
     if schema not in allowed:
         schema = sess["schema"]
 
-    tok = db._hotel_schema_var.set(schema)
+    tok = db.set_tenant(schema)
     request.state.schema = schema
     try:
         yield sess
     finally:
-        db._hotel_schema_var.reset(tok)
+        db.reset_tenant(tok)
 
 
 def _role_for(sess: dict, schema) -> str:

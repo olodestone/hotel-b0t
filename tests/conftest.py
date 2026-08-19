@@ -5,11 +5,13 @@ Two things make the financial reports testable without a live database:
 
 1. ``database.read_all`` / ``database.get_setting`` are monkeypatched to serve an
    in-memory fixture dataset, so no PostgreSQL is needed.
-2. ``datetime`` is frozen in ``reports``, ``metrics`` and ``dashboard.data`` so the
-   "Generated …" / "current month" output is deterministic. Every module that reads
-   the wall clock must be frozen: the fixture rows all fall in June 2026, so any
-   unfrozen ``datetime.now()`` silently zeroes out the "current month" figures once
-   the real calendar leaves that month.
+2. ``clock.now()`` / ``clock.today()`` are frozen, and ``datetime`` is frozen in
+   ``reports``, ``metrics`` and ``dashboard.data``, so the "Generated …" /
+   "current month" output is deterministic. Every path that reads the wall clock
+   must be frozen: the fixture rows all fall in June 2026, so any unfrozen "now"
+   silently zeroes out the "current month" figures once the real calendar leaves
+   that month. ``clock`` is the one that matters now — it resolves the *hotel's*
+   timezone, and is what database/reports/metrics/dashboard all call.
 
 The golden-master tests (``test_golden_reports.py``) snapshot the exact Telegram
 strings; these fixtures keep that snapshot reproducible run-to-run.
@@ -28,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import clock      # noqa: E402
 import database  # noqa: E402
 import metrics    # noqa: E402
 import reports    # noqa: E402
@@ -149,6 +152,11 @@ def patch_db_and_time(monkeypatch):
     monkeypatch.setattr(reports, "datetime", _FrozenDateTime)
     monkeypatch.setattr(metrics, "datetime", _FrozenDateTime)
     monkeypatch.setattr(dashboard_data, "datetime", _FrozenDateTime)
+    # Every "what time is it" now routes through clock.now(), so that is the one
+    # that has to be frozen. Patch the module's own attributes, not each caller's
+    # import — reports/metrics/dashboard all call clock.now() by reference.
+    monkeypatch.setattr(clock, "now", lambda: FROZEN_NOW)
+    monkeypatch.setattr(clock, "today", lambda: FROZEN_NOW.date())
     yield
 
 

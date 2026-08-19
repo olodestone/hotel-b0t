@@ -98,11 +98,11 @@ def resolve_access(telegram_id: int) -> list[dict]:
             role = "admin"
         else:
             # Fall back to the hotel's own users table — scope the engine to it.
-            tok = db._hotel_schema_var.set(h["schema"])
+            tok = db.set_tenant(h["schema"])
             try:
                 user = db.get_user(telegram_id)
             finally:
-                db._hotel_schema_var.reset(tok)
+                db.reset_tenant(tok)
             if user:
                 role = user.get("role")
         if role:

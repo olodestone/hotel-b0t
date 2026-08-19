@@ -34,6 +34,7 @@ bot.py  →  logic.py  →  inventory.py  →  database.py
                      →  inventory.py  →  database.py
                      →  database.py
 config.py  (imported by all layers)
+clock.py   (imported by all layers — sits below database.py)
 
 dashboard/ (separate FastAPI web service, read-only) → metrics.py + database.py
 ```
@@ -50,7 +51,51 @@ dashboard/ (separate FastAPI web service, read-only) → metrics.py + database.p
 
 **`metrics.py`** — Pure financial calc core (no DB, no formatting). Functions take already-fetched rows + a cost-price map and return dataclasses (`compute_pnl` → `PnL`/`AccountPnL`, `summarize_outstanding`, plus shared row helpers `apply_filter`/`active`/`operating_expenses`/`cost_of_drinks_sold`/…). This is the **single source of truth** for the math, shared by `reports.py` (Telegram) and `dashboard/` (web) so the two can never disagree. The full report, position, allocation, and staff reports consume it (`compute_pnl`, `compute_cash_position`, `compute_allocation`, `staff_breakdown`), as do the performance reports (`compute_working_capital`, `compute_break_even`, `compute_room_metrics`, `menu_engineering`, `summarize_variance`). Golden-master tests in `tests/` assert the Telegram output is byte-for-byte unchanged.
 
+**`clock.py`** — The single wall clock, answered in the **active hotel's** timezone. `now()` / `today()` return naive local values; the timezone is a ContextVar set per update / web request / scheduled job. Deliberately sits *below* `database.py` so `metrics.py` can ask what "this month" means without taking a database dependency. See "Timezones" below.
+
 **`config.py`** — All env var loading via `python-dotenv`. Also holds allocation defaults (`ALLOC_*`) used as fallback when DB settings are not yet set.
+
+## Timezones
+
+**Every "now" belongs to a hotel, not to the server.** Railway runs UTC. When
+`db.now_str()` was `datetime.now()`, a Lagos bar serving at 00:30 had the sale
+stamped `23:30` the *previous* day — wrong day in `/report`, `/summary`,
+`/history`, the daily report and the allocation, every night the bar traded past
+midnight. Hotels span timezones, so a process-wide `TZ` cannot fix this: one
+process serves them all.
+
+`clock.py` holds the timezone as a **ContextVar**, set per Telegram update, per
+web request and per scheduled job — exactly like `database._hotel_schema_var`.
+The two are set *together* by `database.set_tenant(schema)`, which is the point:
+scoping the engine to a hotel while leaving the clock on the server's timezone is
+precisely how entries ended up filed under the wrong day. `reset_tenant(token)`
+restores both, for nested scopes like the dashboard resolving one user's access
+across several hotels.
+
+- `clock.now()` / `clock.today()` — **naive** local values. Every stored timestamp
+  is a naive local string, so naive-local is what the codebase already speaks;
+  returning an aware datetime would break every comparison against a parsed row.
+- `database._hotel_timezone(schema)` reads `public.hotels.timezone` once per
+  schema and caches it. Unknown, blank or invalid falls back to `config.TIMEZONE`
+  rather than raising — one hotel's bad row must not take its bot down.
+- `/setup` writes the timezone, then calls `db.set_hotel_timezone()` (refreshes
+  the cache and the live context) and `_reschedule_for_timezone()` — the nightly
+  jobs were built at startup on the old clock and would otherwise keep firing on
+  it until a restart.
+
+**Never call `datetime.now()` or `date.today()` in application code.** They read
+the server clock. The only survivors are `scripts/` (manual CLI tools, where
+server time is the right answer for a filename).
+
+**Scheduling was already correct** — `run_daily(..., tzinfo=pytz.timezone(tz))` is
+timezone-aware. What was wrong is that every hotel was scheduled on the *env*
+`TIMEZONE`: `get_all_hotel_configs()` didn't select `timezone` and `main()` passed
+the process default, so the timezone `/setup` collected was written to two places
+and read from neither. Both now carry the hotel's own value.
+
+Tests freeze `clock.now`/`clock.today` (see `tests/conftest.py`); patching a
+module's `datetime` no longer shifts time, since nothing calls `datetime.now()`
+any more. `tests/test_clock.py` pins the midnight-rollover case directly.
 
 ## Access Control
 
@@ -80,6 +125,7 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 |---|---|
 | `/sell_drink <drink> <qty> <price> [YYYY-MM-DD]` | Record drink sale |
 | `/room <type> <qty> <price> <nights> [YYYY-MM-DD]` | Record room booking |
+| `/undo` | Reverse your own most recent sale or booking, within 2 minutes |
 | `/report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Full financial report |
 | `/summary [YYYY-MM-DD]` | Daily overview with set-aside nudge |
 | `/stock` | Inventory table (store + bar columns) |
@@ -306,6 +352,34 @@ Detection: `_extract_date(args)` in `bot.py` checks if the last arg matches `^\d
 counts are a live snapshot rather than a per-date ledger, so the units always move
 on execution — the date records *when the move happened*, not when stock existed where.
 
+### Undo — `timestamp` vs `created_at`
+
+`sales` and `rooms` carry **two** clocks, and conflating them is what broke undo:
+
+- **`timestamp`** — the business date the entry is *for*. Backdating sets it to
+  `YYYY-MM-DD 00:00:00`; every report filters on it.
+- **`created_at`** — when the row was actually keyed in. Set to `now_str()` on
+  insert, never backdated. This is the only column that can say whether the
+  2-minute undo window is still open.
+
+Judging the window on `timestamp` meant a backdated entry was born "days old" and
+could never be undone; it also sorted *behind* today's rows, so `/undo` would reach
+past it to a different entry. Both lookups (`get_last_staff_entry`,
+`get_undoable_entry`) now order and age on `COALESCE(NULLIF(created_at,''), timestamp)`
+— rows predating the migration fall back to `timestamp`, which is correct for
+everything except backdated ones, and those had no working undo before anyway.
+
+**The button is bound to its entry.** `record_sale()` / `record_room()` return the
+new row id, which rides in the callback as `undo:<sale|room>:<id>`, so two entries
+made in quick succession each undo *themselves* — reversing "the latest entry" let
+the second one swallow the first one's button. `logic.process_undo_entry()` is the
+targeted path; `logic.process_undo()` (the `/undo` command) still means "my latest",
+and both share `_reverse_entry()`. `db.get_undoable_entry()` refuses an unknown id,
+an already-voided row, another person's entry, or a closed window.
+
+Undo is a **soft void** (`deleted_at`/`deleted_by`), never a delete — the audit trail
+survives, and drink sales restore bar stock on the way out.
+
 ## Staff Tracking (`recorded_by`)
 
 `/sell_drink` and `/room` record the Telegram username of whoever entered the entry in the `recorded_by` column (`user.username or user.first_name or str(user.id)`). `/staff_report` groups drink **and** room activity by this field.
@@ -318,8 +392,8 @@ on execution — the date records *when the move happened*, not when stock exist
 
 | Table | Key columns |
 |---|---|
-| `sales` | `id`, `timestamp`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by` |
-| `rooms` | `id`, `timestamp`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue` |
+| `sales` | `id`, `timestamp`, `created_at`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at` |
+| `rooms` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at` |
 | `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description` |
 | `owner_draws` | `id`, `timestamp`, `amount`, `account`, `description`, `recorded_by`, `deleted_by`, `deleted_at` — owner equity withdrawals, deliberately separate from `expenses` |
 | `debtors` | `id`, `timestamp`, `account`, `name`, `amount`, `amount_paid`, `description`, `status`, `paid_at` |

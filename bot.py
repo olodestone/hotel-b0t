@@ -61,6 +61,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+import clock
 import database as db
 import inventory as inv
 import logic
@@ -468,7 +469,7 @@ async def cmd_sell_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg, alert = logic.process_drink_sale(drink, qty, timestamp=ts, recorded_by=recorded_by)
+    ok, msg, alert, _sale_id = logic.process_drink_sale(drink, qty, timestamp=ts, recorded_by=recorded_by)
     if ts and ok:
         msg += f"\n_(recorded for {ts})_"
     await _reply(update, msg)
@@ -641,7 +642,7 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts, recorded_by=recorded_by)
+    ok, msg, _room_id = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts, recorded_by=recorded_by)
     if ok and price_note:
         msg += f"\n{price_note}"
     await _reply(update, msg)
@@ -927,10 +928,10 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     staff_view = not _is_admin(update.effective_user.id)
 
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         text = reports.generate_full_report(for_month=(now.year, now.month), staff_view=staff_view)
     elif arg == "today":
-        text = reports.generate_full_report(for_date=datetime.now().date(), staff_view=staff_view)
+        text = reports.generate_full_report(for_date=clock.now().date(), staff_view=staff_view)
     elif arg == "all":
         text = reports.generate_full_report(all_time=True, staff_view=staff_view)
     else:
@@ -959,7 +960,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         date_str = args[0]
     else:
         # Default: yesterday (entries are typically entered the next morning)
-        date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        date_str = (clock.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     entries = db.get_entries_by_date(date_str)
     label = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d %b %Y")
@@ -1049,7 +1050,7 @@ async def cmd_restock_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     if not arg:
         text = reports.generate_restock_plan()   # rolling trailing-30-day view
     elif arg == "today":
-        text = reports.generate_restock_plan(for_date=datetime.now().date())
+        text = reports.generate_restock_plan(for_date=clock.now().date())
     elif arg == "all":
         text = reports.generate_restock_plan(all_time=True)
     else:
@@ -1120,10 +1121,10 @@ async def cmd_sales_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     arg = args[0].lower() if args else ""
 
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         text = reports.generate_sales_report(for_month=(now.year, now.month))
     elif arg == "today":
-        text = reports.generate_sales_report(for_date=datetime.now().date())
+        text = reports.generate_sales_report(for_date=clock.now().date())
     elif arg == "all":
         text = reports.generate_sales_report(all_time=True)
     else:
@@ -1149,10 +1150,10 @@ async def cmd_expense_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     arg = args[0].lower() if args else ""
 
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         text = reports.generate_expense_report(for_month=(now.year, now.month))
     elif arg == "today":
-        text = reports.generate_expense_report(for_date=datetime.now().date())
+        text = reports.generate_expense_report(for_date=clock.now().date())
     elif arg == "all":
         text = reports.generate_expense_report(all_time=True)
     else:
@@ -1178,10 +1179,10 @@ async def cmd_draws(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     arg = args[0].lower() if args else ""
 
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         text = reports.generate_draws_report(for_month=(now.year, now.month))
     elif arg == "today":
-        text = reports.generate_draws_report(for_date=datetime.now().date())
+        text = reports.generate_draws_report(for_date=clock.now().date())
     elif arg == "all":
         text = reports.generate_draws_report(all_time=True)
     else:
@@ -1207,10 +1208,10 @@ async def cmd_staff_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     arg = args[0].lower() if args else ""
 
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         text = reports.generate_staff_report(for_month=(now.year, now.month))
     elif arg == "today":
-        text = reports.generate_staff_report(for_date=datetime.now().date())
+        text = reports.generate_staff_report(for_date=clock.now().date())
     else:
         try:
             dt = datetime.strptime(arg, "%Y-%m-%d")
@@ -1325,10 +1326,10 @@ async def cmd_allocation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     arg = args[0].lower() if args else ""
 
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         text = reports.generate_allocation_report(for_month=(now.year, now.month))
     elif arg == "today":
-        text = reports.generate_allocation_report(for_date=datetime.now().date())
+        text = reports.generate_allocation_report(for_date=clock.now().date())
     elif arg == "all":
         text = reports.generate_allocation_report(all_time=True)
     else:
@@ -1355,10 +1356,10 @@ def _period_kwargs(arg: str) -> dict | None:
     from datetime import datetime
     arg = (arg or "").lower()
     if not arg:
-        now = datetime.now()
+        now = clock.now()
         return {"for_month": (now.year, now.month)}
     if arg == "today":
-        return {"for_date": datetime.now().date()}
+        return {"for_date": clock.now().date()}
     if arg == "all":
         return {"all_time": True}
     for fmt, key in (("%Y-%m-%d", "for_date"), ("%Y-%m", "for_month")):
@@ -1407,7 +1408,7 @@ async def cmd_roomstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Weeks are roomstats-only: rate/volume moves show up week to week long
     # before a month closes, which is when a discount is still worth reversing.
     if arg in ("week", "lastweek", "last_week"):
-        today = date.today()
+        today = clock.today()
         kwargs = {"for_week": today - timedelta(days=7) if arg != "week" else today}
     else:
         kwargs = _period_kwargs(arg)
@@ -1682,7 +1683,7 @@ async def cmd_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             username_filter = arg.lstrip("@")
 
     if date_str is None:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = clock.now().strftime("%Y-%m-%d")
 
     text = reports.generate_activity_log(date_str, username_filter=username_filter)
     await _reply_long(update, text)
@@ -1786,7 +1787,7 @@ async def cmd_dailyreport(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _send_daily_report(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id, schema = ctx.job.data
-    db._hotel_schema_var.set(schema)
+    db.set_tenant(schema)
     text = reports.generate_daily_report()
     await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2)
     logger.info("Daily report sent to chat_id=%s schema=%s", chat_id, schema)
@@ -1815,12 +1816,38 @@ async def _snapshot_inventory(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     today's shelf. Silent by design — nobody needs a message about it.
     """
     schema = ctx.job.data
-    db._hotel_schema_var.set(schema)
+    db.set_tenant(schema)
     try:
         rows = db.record_inventory_snapshot()
         logger.info("Inventory snapshot saved: %s drinks, schema=%s", rows, schema)
     except Exception:   # never let a snapshot failure take the bot down
         logger.exception("Inventory snapshot failed for schema=%s", schema)
+
+
+def _reschedule_for_timezone(app: Application, schema: str, tz_str: str) -> None:
+    """Rebuild this hotel's daily jobs on a new timezone.
+
+    The snapshot and daily-report jobs are created once at startup with the
+    timezone known then. When /setup changes it, those jobs keep firing on the
+    old clock until a restart — so tear them down and re-create them here.
+    """
+    app.bot_data["timezone"] = tz_str
+    jq = app.job_queue
+    if jq is None:
+        return
+
+    for job in jq.get_jobs_by_name("inventory_snapshot"):
+        job.schedule_removal()
+    _schedule_inventory_snapshot(jq, schema, tz_str)
+
+    daily = jq.get_jobs_by_name("daily_report")
+    if daily:
+        chat_id = daily[0].data[0]
+        for job in daily:
+            job.schedule_removal()
+        time_str = app.bot_data.get("daily_report_time") or DAILY_REPORT_TIME
+        _schedule_daily_report(jq, chat_id, schema, tz_str, time_str)
+    logger.info("Rescheduled jobs for schema=%s on timezone=%s", schema, tz_str)
 
 
 def _schedule_inventory_snapshot(job_queue, schema: str, tz_str: str = "Africa/Lagos") -> None:
@@ -1871,7 +1898,7 @@ async def cmd_hotels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _check_subscriptions(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Daily job — warns hotel owner before expiry; notifies all users and auto-suspends on expiry."""
-    today = date.today()
+    today = clock.today()
     hotels = db.get_expiring_hotels()
 
     for h in hotels:
@@ -1936,7 +1963,7 @@ async def _check_subscriptions(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         # On expiry — notify all staff too, then auto-suspend
         if label == "0" and staff_msg:
-            db._hotel_schema_var.set(h["schema"])
+            db.set_tenant(h["schema"])
             try:
                 users = db.read_all("users")
                 for user in users:
@@ -1973,7 +2000,7 @@ async def _broadcast_all(message: str) -> tuple[int, int]:
     """Send message to every user across every hotel. Returns (sent, failed)."""
     sent = failed = 0
     for schema, app in _hotel_apps.items():
-        db._hotel_schema_var.set(schema)
+        db.set_tenant(schema)
         try:
             users = db.read_all("users")
         except Exception:
@@ -2136,7 +2163,7 @@ def _build_export_excel(schema: str) -> io.BytesIO:
             rows.append(("Outstanding Debt (₦)", _q("SELECT COALESCE(SUM(amount - amount_paid),0) FROM debtors WHERE status='outstanding'")))
             rows.append(("Bar Stock Value (₦)",  _q("SELECT COALESCE(SUM(current_stock * cost_price),0) FROM inventory")))
             rows.append(("Store Stock Value (₦)",_q("SELECT COALESCE(SUM(store_stock * cost_price),0) FROM inventory")))
-            rows.append(("Export Date", date.today().strftime("%Y-%m-%d")))
+            rows.append(("Export Date", clock.today().strftime("%Y-%m-%d")))
 
         pd.DataFrame(rows, columns=["Metric", "Value"]).to_excel(writer, sheet_name="Summary", index=False)
 
@@ -2158,7 +2185,7 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, "⏳ Generating export, please wait…")
     try:
         buf = await asyncio.get_event_loop().run_in_executor(None, _build_export_excel, schema)
-        filename = f"{schema}_export_{date.today().strftime('%Y%m%d')}.xlsx"
+        filename = f"{schema}_export_{clock.today().strftime('%Y%m%d')}.xlsx"
         await update.message.reply_document(
             document=buf,
             filename=filename,
@@ -2319,7 +2346,7 @@ def _room_type_keyboard() -> InlineKeyboardMarkup:
 
 
 def _calendar_keyboard(prefix: str, year: int, month: int) -> InlineKeyboardMarkup:
-    today = date.today()
+    today = clock.today()
     rows: list[list[InlineKeyboardButton]] = []
 
     rows.append([InlineKeyboardButton("✅ Today", callback_data=f"{prefix}:today")])
@@ -2357,13 +2384,13 @@ def _calendar_keyboard(prefix: str, year: int, month: int) -> InlineKeyboardMark
 
 
 def _date_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    today = date.today()
+    today = clock.today()
     return _calendar_keyboard(prefix, today.year, today.month)
 
 
 def _staff_date_keyboard(prefix: str) -> InlineKeyboardMarkup:
     """Two-button date picker for staff — today and yesterday only."""
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    yesterday = (clock.today() - timedelta(days=1)).isoformat()
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Today",      callback_data=f"{prefix}:today"),
         InlineKeyboardButton("⬅️ Yesterday", callback_data=f"{prefix}:{yesterday}"),
@@ -2499,11 +2526,12 @@ async def _do_sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
     qty   = ctx.user_data.pop("sell_qty", 1)
     user  = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg, alert = logic.process_drink_sale(drink, qty, timestamp=timestamp, recorded_by=recorded_by)
+    ok, msg, alert, sale_id = logic.process_drink_sale(drink, qty, timestamp=timestamp, recorded_by=recorded_by)
     if timestamp and ok:
         msg += f"\n_(recorded for {timestamp})_"
     if ok:
-        undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo — tap to cancel this entry", callback_data="undo:sell")]])
+        undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "↩️ Undo — tap to cancel this entry", callback_data=f"undo:sale:{sale_id}")]])
         sent = await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=undo_kb)
         ctx.application.job_queue.run_once(
             _remove_undo_button, 120,
@@ -2685,9 +2713,10 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
             reply_markup=_get_keyboard(user.id),
         )
         return ConversationHandler.END
-    ok, msg = logic.process_room_sale(rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
+    ok, msg, room_id = logic.process_room_sale(rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
     if ok:
-        undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Undo — tap to cancel this booking", callback_data="undo:book")]])
+        undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "↩️ Undo — tap to cancel this booking", callback_data=f"undo:room:{room_id}")]])
         sent = await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=undo_kb)
         ctx.application.job_queue.run_once(
             _remove_undo_button, 120,
@@ -2702,18 +2731,35 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
 # ── Inline undo callback ──────────────────────────────────────────────
 
 async def _cb_undo_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reverse the entry this button was posted under.
+
+    The callback carries `undo:<sale|room>:<id>`, so the reversal hits that exact
+    row. Older buttons (`undo:sell` / `undo:book`, from before a restart) carry no
+    id and fall back to "your latest entry".
+
+    Note the single q.answer(): a callback query can only be answered once, so
+    answering up front and *then* raising an alert on failure showed the user
+    nothing at all — the button looked dead.
+    """
     q = update.callback_query
-    await q.answer()
     user = update.effective_user
     username = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_undo(username)
-    if ok:
-        # Cancel the scheduled button-removal job
-        for job in ctx.application.job_queue.get_jobs_by_name(f"undo_{q.message.message_id}"):
-            job.schedule_removal()
-        await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+
+    parts = q.data.split(":")
+    if len(parts) == 3 and parts[2].isdigit():
+        ok, msg = logic.process_undo_entry(parts[1], int(parts[2]), username)
     else:
+        ok, msg = logic.process_undo(username)
+
+    if not ok:
         await q.answer(msg, show_alert=True)
+        return
+
+    await q.answer()
+    # Cancel the scheduled button-removal job
+    for job in ctx.application.job_queue.get_jobs_by_name(f"undo_{q.message.message_id}"):
+        job.schedule_removal()
+    await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
 
 
 # ── History date picker ────────────────────────────────────────────────
@@ -3477,7 +3523,7 @@ async def _sup_pick_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if val == "__other__":
         await q.edit_message_text("Type the due date (YYYY-MM-DD):")
         return _SUP_DUE_TEXT
-    due = None if val == "__none__" else str(date.today() + timedelta(days=int(val)))
+    due = None if val == "__none__" else str(clock.today() + timedelta(days=int(val)))
     return await _sup_finish(update, ctx, due, update.effective_chat.send_message)
 
 
@@ -4927,7 +4973,7 @@ async def _btn_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _report_date_keyboard(rtype: str, year: int, month: int) -> InlineKeyboardMarkup:
     """Calendar picker with Today / This Month / All Time quick buttons."""
-    today = date.today()
+    today = clock.today()
     rows: list[list[InlineKeyboardButton]] = []
 
     rows.append([
@@ -5003,7 +5049,7 @@ def _run_report(rtype: str, for_date=None, for_month=None, all_time: bool = Fals
             return reports.generate_staff_report(for_date=for_date)
         if for_month:
             return reports.generate_staff_report(for_month=for_month)
-        now = datetime.now()
+        now = clock.now()
         return reports.generate_staff_report(for_month=(now.year, now.month))
     return "❌ Unknown report type."
 
@@ -5027,7 +5073,7 @@ async def _cb_report_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
     rtype = q.data[4:]  # strip "rep:"
     labels = {"full": "Full", "sales": "Sales", "expense": "Expense", "staff": "Staff"}
-    today = date.today()
+    today = clock.today()
     await q.edit_message_text(
         f"📅 *{labels.get(rtype, rtype.title())} Report — select period:*",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -5074,7 +5120,7 @@ async def _cb_report_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    today = date.today()
+    today = clock.today()
     if choice == "cal_m":
         ym = parts[3]
         year, month = int(ym[:4]), int(ym[5:7])
@@ -5112,7 +5158,7 @@ async def _cb_report_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 @_require_auth
 async def _btn_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    today = date.today()
+    today = clock.today()
     await update.message.reply_text(
         "📊 *Summary — select period:*",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -5284,15 +5330,22 @@ async def _setup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     tz    = ctx.user_data["setup_tz"]
     user  = q.from_user
 
+    schema = ctx.application.bot_data.get("schema") or HOTEL_SCHEMA
     db.set_setting("hotel_name", name)
     db.set_setting("timezone", tz)
     db.upsert_user(user.id, user.username or str(user.id), role="admin")
     db.register_hotel_details(name, user.id, tz)
+    # register_hotel_details wrote the row; this refreshes the process-level
+    # cache and the current context so the very next entry is stamped in the
+    # new timezone rather than waiting for a restart.
+    db.set_hotel_timezone(schema, tz)
+    _reschedule_for_timezone(ctx.application, schema, tz)
 
     ctx.user_data.clear()
     await q.message.reply_text(
         f"✅ *{reports._esc(name)}* is ready\\!\n\n"
         f"You're registered as admin\\.\n"
+        f"Timezone: `{tz}` — entries and reports use this clock\\.\n"
         f"Add your staff: /addstaff `<user_id>` `<username>`\n"
         f"Run /help to see all commands\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -5308,7 +5361,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
 
     # ── Schema + admin-IDs setter (group -1 — runs before any other handler) ──
     async def _set_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        db._hotel_schema_var.set(schema)
+        db.set_tenant(schema)
         _active_admin_ids.set(admin_ids)
 
     app.add_handler(TypeHandler(Update, _set_context), group=-1)
@@ -5778,13 +5831,15 @@ def main() -> None:
             schema=cfg["schema"],
             admin_ids=ids,
             report_chat_id=REPORT_CHAT_ID if cfg["schema"] == HOTEL_SCHEMA else None,
-            timezone=TIMEZONE,
+            # This hotel's own timezone — the one /setup asked for. Falling back
+            # to the env default only when it has never been set.
+            timezone=cfg.get("timezone") or TIMEZONE,
             daily_report_time=DAILY_REPORT_TIME,
             is_owner_bot=cfg["schema"] == HOTEL_SCHEMA,
         )
         apps.append((app, cfg["schema"]))
         _hotel_apps[cfg["schema"]] = app
-        logger.info("Loaded hotel schema=%s", cfg["schema"])
+        logger.info("Loaded hotel schema=%s timezone=%s", cfg["schema"], cfg.get("timezone") or TIMEZONE)
 
     # ── Run all bots concurrently ───────────────────────────────────────
     async def _run_all() -> None:

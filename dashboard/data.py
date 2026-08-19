@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import clock
 import database as db
 import inventory as inv
 import metrics
@@ -39,7 +40,7 @@ def parse_period(arg: str | None):
     if arg == "all":
         return (None, None, True)
     if arg == "today":
-        return (datetime.now().date(), None, False)
+        return (clock.now().date(), None, False)
     try:
         return (datetime.strptime(arg, "%Y-%m-%d").date(), None, False)
     except ValueError:
@@ -100,7 +101,7 @@ def _trend(sales_rows, room_rows, all_time: bool) -> tuple[list[dict], str]:
 
 def _week_bounds(now: datetime | None = None) -> tuple:
     """(monday, sunday) — the current local week, inclusive, used for period=week."""
-    today = (now or datetime.now()).date()
+    today = (now or clock.now()).date()
     monday = today - timedelta(days=today.weekday())
     return monday, monday + timedelta(days=6)
 
@@ -122,13 +123,13 @@ def cash_position() -> metrics.CashPosition:
     return metrics.compute_cash_position(
         sales_all, rooms_all, expense_all, draws_all, debtor_rows,
         stock_value=stock_value, opening=opening, anchor_dt=anchor_dt,
-        cost_map=_cost_price_map(), now=datetime.now(),
+        cost_map=_cost_price_map(), now=clock.now(),
     )
 
 
 def working_capital(window_days: int = CCC_WINDOW_DAYS) -> metrics.WorkingCapital:
     """Cash conversion cycle 'as of now' — same numbers as the bot's /cashcycle."""
-    now = datetime.now()
+    now = clock.now()
     since = (now.date() - timedelta(days=window_days - 1)).strftime("%Y-%m-%d")
     return metrics.compute_working_capital(
         sales_all=db.read_all("sales"),
@@ -163,7 +164,7 @@ def _outstanding_debtors(debtor_rows, now: datetime | None = None) -> list[dict]
     ``staff`` is the debt's ``staff_name`` (who sold/booked) — NOT ``recorded_by``
     (who keyed the entry, usually an admin). Mirrors the bot's "(by …)" tag.
     """
-    now = now or datetime.now()
+    now = now or clock.now()
     out = []
     for r in debtor_rows:
         if r.get("status") != "outstanding":

@@ -21,6 +21,9 @@ from typing import Any
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+import clock
+from config import TIMEZONE
+
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 # Per-update context variable — set by each bot's schema-setter handler so all
@@ -72,8 +75,70 @@ def _base_engine() -> Engine:
     return engine
 
 
+# ── Tenancy + clock ──────────────────────────────────────────────────
+
+# schema → timezone, resolved once per process. public.hotels is the source of
+# truth; a hotel that has never run /setup falls back to the configured default.
+_tz_cache: dict[str, str] = {}
+
+
+def _hotel_timezone(schema: str) -> str:
+    """The hotel's timezone name, cached. Never raises — a broken row must not
+    take that hotel's bot down, so any failure falls back to config.TIMEZONE."""
+    if schema in _tz_cache:
+        return _tz_cache[schema]
+    tz = ""
+    try:
+        with _base_engine().connect() as conn:
+            row = conn.execute(
+                text("SELECT timezone FROM public.hotels WHERE schema_name = :s"),
+                {"s": schema},
+            ).first()
+        tz = (row[0] or "") if row else ""
+    except Exception:
+        tz = ""
+    _tz_cache[schema] = tz or TIMEZONE
+    return _tz_cache[schema]
+
+
+def set_tenant(schema: str) -> tuple[Any, Any]:
+    """Enter a hotel's context: its schema *and* its clock.
+
+    Every query and every "now" in the work that follows belongs to this hotel.
+    Setting the two together is the point — a handler that scoped the engine but
+    left the clock on the server's timezone is exactly how entries ended up
+    filed under the wrong day.
+
+    Returns a token for ``reset_tenant()``; callers that own the whole context
+    (a bot update, a scheduled job) can ignore it.
+    """
+    schema_tok = _hotel_schema_var.set(schema)
+    tz_tok = clock.enter(_hotel_timezone(schema))
+    return schema_tok, tz_tok
+
+
+def reset_tenant(token: tuple[Any, Any]) -> None:
+    """Restore the tenant context a ``set_tenant()`` replaced."""
+    schema_tok, tz_tok = token
+    _hotel_schema_var.reset(schema_tok)
+    clock.reset(tz_tok)
+
+
+def set_hotel_timezone(schema: str, tz_name: str) -> None:
+    """Persist a hotel's timezone and refresh the cache + current context."""
+    with _base_engine().connect() as conn:
+        conn.execute(
+            text("UPDATE public.hotels SET timezone = :tz WHERE schema_name = :s"),
+            {"tz": tz_name, "s": schema},
+        )
+        conn.commit()
+    _tz_cache[schema] = tz_name
+    clock.use(tz_name)
+
+
 def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Timestamp for a new row — in the hotel's local time, not the server's."""
+    return clock.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _ts(custom: str | None = None) -> str:
@@ -241,6 +306,11 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
+        # Migration: when the row was *keyed in*, as opposed to the business date
+        # it was keyed in for. A backdated entry's `timestamp` is the night it
+        # covers; only `created_at` can say whether the undo window is still open.
+        conn.execute(text("ALTER TABLE sales ADD COLUMN IF NOT EXISTS created_at TEXT DEFAULT ''"))
+        conn.execute(text("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS created_at TEXT DEFAULT ''"))
         # Transfers log table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS transfers (
@@ -438,11 +508,13 @@ def get_all_hotel_configs() -> list[dict]:
     """Return all active hotels that have a bot_token stored — used by the multi-bot runner."""
     with _base_engine().connect() as conn:
         rows = conn.execute(text(
-            "SELECT schema_name, bot_token, admin_ids FROM public.hotels "
+            "SELECT schema_name, bot_token, admin_ids, timezone FROM public.hotels "
             "WHERE is_active = TRUE AND bot_token IS NOT NULL AND bot_token <> '' "
             "ORDER BY id"
         )).fetchall()
-    return [{"schema": r[0], "token": r[1], "admin_ids": r[2] or ""} for r in rows]
+    # timezone drives both this hotel's job schedule and its clock — without it
+    # every hotel would be scheduled on the process default.
+    return [{"schema": r[0], "token": r[1], "admin_ids": r[2] or "", "timezone": r[3] or ""} for r in rows]
 
 
 def add_hotel_config(schema: str, token: str, admin_ids: str = "") -> None:
@@ -484,36 +556,44 @@ def read_all(table: str) -> list[dict[str, Any]]:
 
 # ── Drink-sale record ─────────────────────────────────────────────────
 
-def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> None:
+def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> int:
+    """Insert one sale. Returns the new row id so callers can offer a targeted undo."""
     engine = get_engine()
     with engine.connect() as conn:
-        conn.execute(text("""
-            INSERT INTO sales (timestamp, drink_name, quantity, selling_price, total_revenue, recorded_by)
-            VALUES (:ts, :drink, :qty, :price, :total, :recorded_by)
+        result = conn.execute(text("""
+            INSERT INTO sales (timestamp, created_at, drink_name, quantity, selling_price, total_revenue, recorded_by)
+            VALUES (:ts, :created, :drink, :qty, :price, :total, :recorded_by)
+            RETURNING id
         """), {
-            "ts": _ts(timestamp), "drink": drink.lower(),
+            "ts": _ts(timestamp), "created": now_str(), "drink": drink.lower(),
             "qty": qty, "price": price,
             "total": round(qty * price, 2),
             "recorded_by": recorded_by,
         })
+        new_id = int(result.scalar_one())
         conn.commit()
+        return new_id
 
 
 # ── Room-booking record ───────────────────────────────────────────────
 
-def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> None:
+def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> int:
+    """Insert one booking. Returns the new row id so callers can offer a targeted undo."""
     engine = get_engine()
     with engine.connect() as conn:
-        conn.execute(text("""
-            INSERT INTO rooms (timestamp, room_type, quantity, price_per_night, nights, total_revenue, recorded_by)
-            VALUES (:ts, :rtype, :qty, :price, :nights, :total, :recorded_by)
+        result = conn.execute(text("""
+            INSERT INTO rooms (timestamp, created_at, room_type, quantity, price_per_night, nights, total_revenue, recorded_by)
+            VALUES (:ts, :created, :rtype, :qty, :price, :nights, :total, :recorded_by)
+            RETURNING id
         """), {
-            "ts": _ts(timestamp), "rtype": room_type.lower(),
+            "ts": _ts(timestamp), "created": now_str(), "rtype": room_type.lower(),
             "qty": qty, "price": price, "nights": nights,
             "total": round(qty * price * nights, 2),
             "recorded_by": recorded_by,
         })
+        new_id = int(result.scalar_one())
         conn.commit()
+        return new_id
 
 
 # ── Expense record ────────────────────────────────────────────────────
@@ -1127,43 +1207,76 @@ def get_drink_selling_prices() -> list[dict[str, Any]]:
 
 # ── Undo (last staff entry within window) ────────────────────────────
 
+# When an entry was keyed in. Rows predating the created_at migration have it
+# blank, so fall back to `timestamp` — right for everything except the backdated
+# rows, which had no working undo before the column existed anyway.
+_ENTERED_AT = "COALESCE(NULLIF(created_at, ''), timestamp)"
+
+
+def _entry_age_seconds(row: dict[str, Any]) -> float:
+    """Seconds since the row was *keyed in* (not the date it was recorded for)."""
+    raw = str(row.get("created_at") or "").strip() or str(row.get("timestamp") or "")
+    try:
+        entered = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return float("inf")
+    return (clock.now() - entered).total_seconds()
+
+
 def get_last_staff_entry(username: str, window_minutes: int = 2) -> dict[str, Any] | None:
     """
     Return the most recent sale or room entry recorded by `username`
     within the last `window_minutes` minutes, or None if outside the window.
-    """
-    cutoff = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    Recency is judged on when the row was *entered*, not the date it was entered
+    for: ordering a backdated sale by `timestamp` would hide it behind today's
+    rows and then reject it as days old.
+    """
     sale = _row(
-        "SELECT *, 'sale' AS entry_type FROM sales "
-        "WHERE recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)"
-        " ORDER BY timestamp DESC LIMIT 1",
+        f"SELECT *, 'sale' AS entry_type FROM sales "
+        f"WHERE recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)"
+        f" ORDER BY {_ENTERED_AT} DESC, id DESC LIMIT 1",
         {"u": username},
     )
     room = _row(
-        "SELECT *, 'room' AS entry_type FROM rooms "
-        "WHERE recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)"
-        " ORDER BY timestamp DESC LIMIT 1",
+        f"SELECT *, 'room' AS entry_type FROM rooms "
+        f"WHERE recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)"
+        f" ORDER BY {_ENTERED_AT} DESC, id DESC LIMIT 1",
         {"u": username},
     )
 
     candidates = [c for c in (sale, room) if c is not None]
-
     if not candidates:
         return None
 
-    # Pick the most recent
-    def _ts(r: dict) -> datetime:
-        try:
-            return datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
-        except (ValueError, KeyError):
-            return datetime.min
-
-    best = max(candidates, key=_ts)
-    age_seconds = (datetime.now() - _ts(best)).total_seconds()
-    if age_seconds > window_minutes * 60:
+    best = min(candidates, key=_entry_age_seconds)
+    if _entry_age_seconds(best) > window_minutes * 60:
         return None
     return best
+
+
+def get_undoable_entry(entry_type: str, entry_id: int, username: str,
+                       window_minutes: int = 2) -> dict[str, Any] | None:
+    """Return one specific sale/room row if `username` may still undo it.
+
+    The inline undo button carries the id of the entry it was attached to, so
+    the reversal lands on that exact row — not on whatever happens to be the
+    person's newest entry by the time they tap.
+
+    None means: unknown id, already voided, entered by someone else, or the
+    window has closed.
+    """
+    table = {"sale": "sales", "room": "rooms"}.get(entry_type)
+    if table is None or entry_id <= 0:
+        return None
+    row = _row(
+        f"SELECT *, '{entry_type}' AS entry_type FROM {table} "
+        f"WHERE id = :id AND recorded_by = :u AND (deleted_at = '' OR deleted_at IS NULL)",
+        {"id": entry_id, "u": username},
+    )
+    if row is None or _entry_age_seconds(row) > window_minutes * 60:
+        return None
+    return row
 
 
 # ── Stocktakes ────────────────────────────────────────────────────────
@@ -1299,7 +1412,7 @@ def record_inventory_snapshot(snapshot_date: str | None = None) -> int:
     Idempotent per day — re-running overwrites that day's rows rather than
     duplicating them, so a restart or a manual run is always safe.
     """
-    day = snapshot_date or datetime.now().strftime("%Y-%m-%d")
+    day = snapshot_date or clock.today().strftime("%Y-%m-%d")
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(text("""

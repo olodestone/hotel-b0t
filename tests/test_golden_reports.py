@@ -92,15 +92,13 @@ def test_cashcycle_break_even_falls_back_to_the_last_trading_month(monkeypatch):
     nothing has happened, so both blocks fall back to the last month that traded.
     """
     from datetime import datetime
-    import metrics as _metrics
+    import clock
 
-    class _JulyFirst(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 7, 1, 9, 0, 0)
-
-    monkeypatch.setattr(reports, "datetime", _JulyFirst)
-    monkeypatch.setattr(_metrics, "datetime", _JulyFirst)
+    july_first = datetime(2026, 7, 1, 9, 0, 0)
+    # clock is the single wall clock now — patching reports.datetime would leave
+    # the report reading the real one.
+    monkeypatch.setattr(clock, "now", lambda: july_first)
+    monkeypatch.setattr(clock, "today", lambda: july_first.date())
     out = reports.generate_cashcycle_report()
 
     assert "no July entries yet" in out          # fallback is labelled, not silent
