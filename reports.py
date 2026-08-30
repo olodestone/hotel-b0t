@@ -2110,8 +2110,10 @@ def generate_dow_split_report(
         _SEP,
     ]
 
-    if not split.overall.nights_sold:
-        lines.append("No room-nights fall in this period.")
+    # sold_units, not nights_sold: a hotel that only sells by the hour has no
+    # room-nights at all, and was being told it had no bookings.
+    if not split.overall.sold_units:
+        lines.append("No room bookings fall in this period.")
         return "\n".join(lines)
 
     # The answer first — this report exists to settle one question. When the
@@ -2184,6 +2186,7 @@ def generate_dow_split_report(
             f" and is priced {_signed_pct(split.adr_gap_pct)}._"
         )
 
+    lines += _daypart_block(room_rows + lookback, start, end)
     lines += _turnaway_block(ta, split)
 
     lines += [
@@ -2202,6 +2205,40 @@ def _signed_pct(pct: float) -> str:
     if pct < -metrics.TREND_BAND:
         return f"{abs(pct):,.0f}% lower"
     return "about the same"
+
+
+def _daypart_block(room_rows: list[dict], start: date, end: date) -> list[str]:
+    """Where an hourly trade actually sits in the day.
+
+    A short let is not a night. Splitting it by weekday answers half the
+    question; the half that sets the price is *when in the day*, because a room
+    turned away at 8pm and idle at 10am has two problems and only one is a rate.
+    """
+    split = metrics.daypart_split(room_rows, start, end, _room_type_hours())
+    if not split.total_lets:
+        return []
+
+    out = [_SEP, "*BY TIME OF DAY* _(hourly lets only)_"]
+    width = max(len(b.label) for b in split.bands)
+    table = f"{'WHEN':<{width}}  {'LETS':>5}  {'PER LET':>9}  {'HOURS':>6}\n"
+    for b in split.bands:
+        if not b.lets:
+            continue
+        table += (f"{b.label:<{width}}  {b.lets:>5}  {b.arl:>9,.0f}  {b.hours:>6,.0f}\n")
+    out.append("```\n" + table + "```")
+    out.append(f"  _{split.lets_per_day} lets a day across {_plural(split.days, 'day')}_")
+
+    if split.untimed_lets:
+        out.append(
+            f"  _{_plural(split.untimed_lets, 'let')} carry no time of day — "
+            "backdated entries are stamped midnight, so they cannot be placed._")
+
+    verdict, detail = metrics.daypart_verdict(split)
+    if verdict:
+        out += ["", f"  🕐 *{_esc(verdict)}*", f"  _{_esc(detail)}_"]
+    elif not split.readable:
+        out.append("  _Too few timed lets yet to read the shape of the day._")
+    return out
 
 
 def _turnaway_block(ta, split) -> list[str]:

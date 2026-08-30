@@ -2147,6 +2147,165 @@ def _short_stay_shape(weekday, weekend, lets_gap, arl_gap):
             "rooms need a split.")
 
 
+# ── Time of day: where an hourly trade actually lives ─────────────────
+#
+# A short let is not a night. It runs for an hour or three and it happens at a
+# time — mid-morning, after work, late. Splitting it by weekday answers half
+# the question; the half that sets the price is *when in the day*, because a
+# room that is turned away at 8pm and idle at 10am has two different problems
+# and only one of them is a rate.
+#
+# The hour comes from the booking's own timestamp, which is the moment it was
+# keyed in — at a front desk that is the check-in, close enough to place it in
+# a band. A backdated entry is stamped midnight and carries no real hour, so it
+# is reported as untimed rather than silently filed under Night, which would
+# invent an evening trade out of paperwork done the next morning.
+
+DAYPARTS = (
+    ("Morning",   6, 12),
+    ("Afternoon", 12, 18),
+    ("Evening",   18, 23),
+    ("Night",     23, 6),      # wraps midnight
+)
+
+
+def daypart_of(dt):
+    """Which band an hour falls in, or None when the row carries no real time."""
+    if dt is None:
+        return None
+    # Exactly midnight is what _ts() writes for a backdated entry. A genuine
+    # 00:00 let is indistinguishable from it, so both are treated as untimed —
+    # better to under-claim than to manufacture a night trade.
+    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        return None
+    for name, start, end in DAYPARTS:
+        if start < end:
+            if start <= dt.hour < end:
+                return name
+        elif dt.hour >= start or dt.hour < end:
+            return name
+    return None
+
+
+@dataclass(frozen=True)
+class DaypartBand:
+    label: str
+    lets: int
+    revenue: float
+    hours: float
+
+    @property
+    def arl(self):
+        return round(self.revenue / self.lets, 2) if self.lets else 0.0
+
+
+@dataclass(frozen=True)
+class DaypartSplit:
+    bands: tuple
+    untimed_lets: int
+    total_lets: int
+    days: int
+
+    @property
+    def timed_lets(self):
+        return sum(b.lets for b in self.bands)
+
+    @property
+    def busiest(self):
+        live = [b for b in self.bands if b.lets]
+        return max(live, key=lambda b: b.lets).label if live else ""
+
+    @property
+    def quietest(self):
+        live = [b for b in self.bands if b.lets]
+        return min(live, key=lambda b: b.lets).label if live else ""
+
+    @property
+    def readable(self):
+        """Enough timed lets to say anything. Untimed rows carry no hour."""
+        return self.timed_lets >= 5
+
+    @property
+    def lets_per_day(self):
+        return round(self.total_lets / self.days, 2) if self.days else 0.0
+
+
+def daypart_split(room_rows, start, end, hours_map=None):
+    """Hourly lets grouped by time of day, for the window [start, end]."""
+    buckets = {name: {"lets": 0, "revenue": 0.0, "hours": 0.0}
+               for name, _s, _e in DAYPARTS}
+    untimed = total = 0
+
+    for r in room_rows:
+        dt = parse_ts(r.get("timestamp"))
+        if not dt or not (start <= dt.date() <= end):
+            continue
+        if not is_short_stay(r, hours_map):
+            continue
+        try:
+            units = int(r["quantity"]) * int(r["nights"])
+            revenue = float(r["total_revenue"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if units <= 0:
+            continue
+        total += units
+        band = daypart_of(dt)
+        if band is None:
+            untimed += units
+            continue
+        b = buckets[band]
+        b["lets"] += units
+        b["revenue"] += revenue
+        b["hours"] += units * stay_hours(r, hours_map)
+
+    return DaypartSplit(
+        bands=tuple(DaypartBand(label=name, lets=buckets[name]["lets"],
+                                revenue=round(buckets[name]["revenue"], 2),
+                                hours=round(buckets[name]["hours"], 2))
+                    for name, _s, _e in DAYPARTS),
+        untimed_lets=untimed, total_lets=total,
+        days=max((end - start).days + 1, 0),
+    )
+
+
+def daypart_verdict(split):
+    """What the day's shape says about the let price.
+
+    Volume is the signal here, not occupancy: an hourly room's ceiling is how
+    many times it turns over, and a band nobody books is a band priced for
+    demand that is not there at that hour.
+    """
+    if not split.readable:
+        return ("", "")
+    live = [b for b in split.bands if b.lets]
+    if len(live) == 1:
+        return (f"The hourly trade is a {live[0].label.lower()} business.",
+                f"Every timed let this period fell in the {live[0].label.lower()}. "
+                "Price that band on its own — the rest of the day is a different "
+                "product, or not a product at all.")
+
+    busiest = max(live, key=lambda b: b.lets)
+    quietest = min(live, key=lambda b: b.lets)
+    spread = pct_of(busiest.lets - quietest.lets, busiest.lets)
+    rate_gap = _rel_change(busiest.arl, quietest.arl)
+
+    if spread < 25:
+        return ("Demand is even across the day.",
+                "No band stands out, so a single let price is the right shape.")
+    if rate_gap > TREND_BAND:
+        return (f"{busiest.label} is busiest and already priced higher.",
+                f"{busiest.label} runs {busiest.lets} lets against "
+                f"{quietest.lets} in the {quietest.label.lower()}, and already "
+                f"earns {rate_gap:,.0f}% more per let. It is holding — the quiet "
+                "band is where the empty hours are.")
+    return (f"Charge more in the {busiest.label.lower()}.",
+            f"{busiest.label} takes {busiest.lets} lets against "
+            f"{quietest.lets} in the {quietest.label.lower()}, at about the same "
+            "price. That is the clearest rate rise on this screen, and it leaves "
+            "your overnight rooms alone.")
+
+
 @dataclass(frozen=True)
 class TurnawaySummary:
     total: int              # guests/rooms refused

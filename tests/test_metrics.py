@@ -1648,3 +1648,89 @@ def test_a_room_debt_is_checked_against_room_revenue_not_bar():
     rooms = [{"timestamp": "2026-06-10 15:00:00", "room_type": "std",
               "quantity": 1, "nights": 1, "total_revenue": 30_000}]
     assert metrics.unmatched_debts(room_debt, [], rooms).any is False
+
+
+# ── Time of day: an hourly let is not a night ─────────────────────────
+
+def _let_at(day, hour, units=1, revenue=3_000):
+    return {"timestamp": f"2026-06-{day:02d} {hour:02d}:30:00",
+            "room_type": "short time", "quantity": 1, "nights": units,
+            "total_revenue": units * revenue}
+
+
+def test_the_day_splits_at_the_hours_the_trade_actually_shifts():
+    from datetime import datetime as _dt
+    bands = {h: metrics.daypart_of(_dt(2026, 6, 1, h, 30))
+             for h in (5, 6, 11, 12, 17, 18, 22, 23)}
+    assert bands == {5: "Night", 6: "Morning", 11: "Morning", 12: "Afternoon",
+                     17: "Afternoon", 18: "Evening", 22: "Evening", 23: "Night"}
+
+
+def test_a_backdated_entry_is_untimed_not_filed_under_night():
+    """_ts() stamps midnight, which is paperwork, not an evening trade."""
+    from datetime import datetime as _dt
+    assert metrics.daypart_of(_dt(2026, 6, 1, 0, 0, 0)) is None
+    assert metrics.daypart_of(None) is None
+
+    rows = [{"timestamp": "2026-06-15 00:00:00", "room_type": "short time",
+             "quantity": 1, "nights": 2, "total_revenue": 6_000}]
+    s = metrics.daypart_split(rows, *_JUNE, hours_map=_HOURLY)
+    assert s.untimed_lets == 2
+    assert s.timed_lets == 0
+    assert all(b.lets == 0 for b in s.bands)
+
+
+def test_lets_are_grouped_by_when_in_the_day_they_happened():
+    rows = [_let_at(d, h, n) for d in range(1, 29)
+            for h, n in ((10, 1), (14, 2), (19, 4))]
+    s = metrics.daypart_split(rows, *_JUNE, hours_map=_HOURLY)
+    by = {b.label: b.lets for b in s.bands}
+    assert by == {"Morning": 28, "Afternoon": 56, "Evening": 112, "Night": 0}
+    assert s.busiest == "Evening" and s.quietest == "Morning"
+
+
+def test_overnight_stays_are_left_out_of_the_daypart_split():
+    """It reports the hourly trade; a night has no time of day."""
+    rows = [_let_at(1, 19), {"timestamp": "2026-06-01 20:00:00",
+                             "room_type": "standard", "quantity": 3, "nights": 1,
+                             "total_revenue": 45_000}]
+    s = metrics.daypart_split(rows, *_JUNE, hours_map=_HOURLY)
+    assert s.total_lets == 1
+
+
+def test_a_lopsided_day_says_which_band_to_reprice():
+    rows = ([_let_at(d, 19, 4) for d in range(1, 29)]
+            + [_let_at(d, 10, 1) for d in range(1, 29)])
+    verdict, detail = metrics.daypart_verdict(
+        metrics.daypart_split(rows, *_JUNE, hours_map=_HOURLY))
+    assert "evening" in verdict.lower()
+    assert "overnight rooms alone" in detail
+
+
+def test_an_even_day_says_one_price_is_the_right_shape():
+    rows = [_let_at(d, h, 2) for d in range(1, 29) for h in (10, 14, 19)]
+    verdict, _ = metrics.daypart_verdict(
+        metrics.daypart_split(rows, *_JUNE, hours_map=_HOURLY))
+    assert "even across the day" in verdict
+
+
+def test_a_band_already_priced_higher_is_told_it_is_holding():
+    rows = ([_let_at(d, 19, 4, revenue=5_000) for d in range(1, 29)]
+            + [_let_at(d, 10, 1, revenue=3_000) for d in range(1, 29)])
+    verdict, _ = metrics.daypart_verdict(
+        metrics.daypart_split(rows, *_JUNE, hours_map=_HOURLY))
+    assert "already priced higher" in verdict
+
+
+def test_too_few_timed_lets_says_nothing_at_all():
+    s = metrics.daypart_split([_let_at(1, 19)], *_JUNE, hours_map=_HOURLY)
+    assert s.readable is False
+    assert metrics.daypart_verdict(s) == ("", "")
+
+
+def test_an_hourly_only_hotel_has_bookings_even_with_no_nights():
+    """It sells nothing overnight; nights_sold is zero and that is not empty."""
+    rows = [_let_at(5, 19, 3)]
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=2, hours_map=_HOURLY)
+    assert split.overall.nights_sold == 0
+    assert split.overall.sold_units == 3

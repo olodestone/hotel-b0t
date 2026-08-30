@@ -303,6 +303,22 @@ Moves inside `metrics.TREND_BAND` (5%) read as flat — without a dead band a ho
 
 `rate_note` is the separate pass-through check: **did a rate change reach RevPAR?** ADR up + RevPAR up = sticking; ADR up + RevPAR flat = lost bookings are cancelling it out; ADR up + RevPAR down = it backfired. All six ADR×RevPAR combinations are spelled out, because "not up" covers held-flat and fell — two very different outcomes, and collapsing them once produced a "RevPAR followed it down" note beside a flat verdict.
 
+**A short let is not a night, and it happens at a time.** Splitting the hourly
+trade by weekday answers half the question; the half that sets the price is
+*when in the day*, because a room turned away at 8pm and idle at 10am has two
+problems and only one of them is a rate. `metrics.daypart_split()` groups hourly
+lets into Morning (06–12), Afternoon (12–18), Evening (18–23) and Night (23–06),
+and `/roomstats dow` prints it under **BY TIME OF DAY** with its own verdict —
+kept beside its own data rather than stacked on the top-level verdicts.
+
+The hour comes from the booking's own timestamp, which is the moment it was
+keyed in; at a front desk that is the check-in, close enough to place in a band.
+**A backdated entry is stamped `00:00:00` by `_ts()` and is reported as untimed**,
+never filed under Night — that would invent an evening trade out of paperwork
+done the next morning. A genuine midnight let is indistinguishable from one, so
+both are excluded: better to under-claim than to manufacture a pattern. The
+block needs five timed lets before it will read the shape of the day at all.
+
 **RevPAR by room type** needs a per-type denominator, stored as `roomtype_rooms:<type>` in `settings` (`db.get_all_room_type_counts()`), set with `/setrooms <type> <n>` or from **⚙️ Manage → ⚙️ Settings → 🏨 Room Counts** (the `src` ConversationHandler). That screen lists the hotel total and every type the hotel has priced, counted or actually booked (`_known_room_types()` unions the three sources), shows which are still unset, and warns when the per-type counts don't sum to the total. Types are picked **by index** — they are free text and can contain spaces (`short time`), so they can't ride in `callback_data`. Because this is a setting you enter three or four times in a row, the confirmation carries a *Set another* button straight back into the flow. Its neighbour `sset:roomtype` sets room **prices**, and is labelled "🛏 Room Prices" so the two aren't confused. Each type divides by *its own* room count — borrowing `total_rooms` would credit every room in the building to one category — so a type with no count recorded shows `RevPAR n/a` and a prompt, never a wrong number. By-type ADR needs no denominator and is always populated. If `total_rooms` is unset but per-type counts exist, their sum becomes the hotel-wide denominator; if both are set and disagree, `/setrooms` warns (legitimate when rooms are out of service).
 
 **GOPPAR — the bottom-line twin.** RevPAR is a revenue metric: it cannot see fuel, wages, restocking or maintenance, so a hotel can post a rising RevPAR straight through a month it lost money on. `metrics.compute_goppar()` divides *profit* by the same denominator and prints directly beneath it, so the gap between the two lines **is** the cost base.

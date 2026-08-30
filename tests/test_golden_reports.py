@@ -628,3 +628,28 @@ def test_position_is_quiet_when_debts_are_paired():
     """The fixture has debtors and matching sales — nothing to warn about."""
     out = reports.generate_position_report()
     assert "has no sale behind it" not in out
+
+
+def test_dow_report_splits_the_hourly_trade_by_time_of_day(monkeypatch):
+    rooms = []
+    for d in range(1, 29):
+        for h, n in ((10, 1), (19, 4)):
+            rooms.append({"id": len(rooms) + 1,
+                          "timestamp": f"2026-06-{d:02d} {h:02d}:30:00",
+                          "room_type": "short time", "quantity": 1, "nights": n,
+                          "price_per_night": 3000, "total_revenue": n * 3000,
+                          "deleted_at": None})
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [dict(r) for r in rooms] if t == "rooms" else [])
+    monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {"short time": 2})
+    monkeypatch.setattr(reports.db, "get_all_room_type_counts", lambda: {"short time": 2})
+    out = reports.generate_dow_split_report(for_month=(2026, 6))
+    assert "*BY TIME OF DAY* _(hourly lets only)_" in out
+    assert "Evening" in out and "Morning" in out
+    assert "Charge more in the evening" in out
+    assert "lets a day across" in out
+
+
+def test_a_nightly_only_hotel_gets_no_time_of_day_block():
+    out = reports.generate_dow_split_report(for_month=(2026, 6))
+    assert "BY TIME OF DAY" not in out
