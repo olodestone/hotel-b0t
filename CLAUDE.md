@@ -311,13 +311,24 @@ lets into Morning (06–12), Afternoon (12–18), Evening (18–23) and Night (2
 and `/roomstats dow` prints it under **BY TIME OF DAY** with its own verdict —
 kept beside its own data rather than stacked on the top-level verdicts.
 
-The hour comes from the booking's own timestamp, which is the moment it was
-keyed in; at a front desk that is the check-in, close enough to place in a band.
-**A backdated entry is stamped `00:00:00` by `_ts()` and is reported as untimed**,
-never filed under Night — that would invent an evening trade out of paperwork
-done the next morning. A genuine midnight let is indistinguishable from one, so
-both are excluded: better to under-claim than to manufacture a pattern. The
-block needs five timed lets before it will read the shape of the day at all.
+**The band is asked for and stored, never inferred from the timestamp.** Hotel
+85 records bookings in a paper book and keys them in the following morning, so
+a row's timestamp is when the *typing* happened. Deriving the hour from it
+looked reasonable and was flatly wrong — 81 evening lets keyed at 08:30 came
+back as `{'Morning': 81}` with the verdict *"the hourly trade is a morning
+business"*: a finding about the owner's admin routine, not about the hotel.
+
+Only the book knows when the let was, so the booking flow asks. `rooms.daypart`
+stores it, `metrics.daypart_of()` reads that field **and nothing else**, and a
+booking with no band recorded is reported untimed rather than guessed at. The
+question is asked only for hourly room types (`_is_hourly_type()`), so an
+overnight booking costs no extra tap, and **🤷 Not noted** is always offered —
+a forced guess is worse than an honest gap. The block needs five timed lets
+before it reads the shape of the day at all.
+
+This is the same failure as a pre-filled count sheet: a figure the system can
+produce on its own is not an observation, and dressing one up as the other is
+how a control quietly becomes decoration.
 
 **RevPAR by room type** needs a per-type denominator, stored as `roomtype_rooms:<type>` in `settings` (`db.get_all_room_type_counts()`), set with `/setrooms <type> <n>` or from **⚙️ Manage → ⚙️ Settings → 🏨 Room Counts** (the `src` ConversationHandler). That screen lists the hotel total and every type the hotel has priced, counted or actually booked (`_known_room_types()` unions the three sources), shows which are still unset, and warns when the per-type counts don't sum to the total. Types are picked **by index** — they are free text and can contain spaces (`short time`), so they can't ride in `callback_data`. Because this is a setting you enter three or four times in a row, the confirmation carries a *Set another* button straight back into the flow. Its neighbour `sset:roomtype` sets room **prices**, and is labelled "🛏 Room Prices" so the two aren't confused. Each type divides by *its own* room count — borrowing `total_rooms` would credit every room in the building to one category — so a type with no count recorded shows `RevPAR n/a` and a prompt, never a wrong number. By-type ADR needs no denominator and is always populated. If `total_rooms` is unset but per-type counts exist, their sum becomes the hotel-wide denominator; if both are set and disagree, `/setrooms` warns (legitimate when rooms are out of service).
 
@@ -973,7 +984,7 @@ survives, and drink sales restore bar stock on the way out.
 | Table | Key columns |
 |---|---|
 | `sales` | `id`, `timestamp`, `created_at`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at`, `cost_price` — the cost carried at the moment of sale, so a closed month cannot be restated by a later restock |
-| `rooms` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at`, `duration_hours` — `nights` is really *stay units* (nights, or lets for an hourly type); `duration_hours` of 0 defers to the room type |
+| `rooms` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at`, `duration_hours`, `daypart` (asked at entry for hourly lets, never derived from the timestamp) — `nights` is really *stay units* (nights, or lets for an hourly type); `duration_hours` of 0 defers to the room type |
 | `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description`, `expense_class`, `needs_review`, `obligation_id` — `account` is now `bar`/`rooms`/**`overhead`**; `expense_class` is the second axis and decides whether the row reaches the P&L at all |
 | `owner_draws` | `id`, `timestamp`, `amount`, `account`, `description`, `recorded_by`, `deleted_by`, `deleted_at` — owner equity withdrawals, deliberately separate from `expenses` |
 | `debtors` | `id`, `timestamp`, `account`, `name`, `amount`, `amount_paid`, `description`, `status`, `paid_at` |

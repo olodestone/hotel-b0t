@@ -633,12 +633,13 @@ def test_position_is_quiet_when_debts_are_paired():
 def test_dow_report_splits_the_hourly_trade_by_time_of_day(monkeypatch):
     rooms = []
     for d in range(1, 29):
-        for h, n in ((10, 1), (19, 4)):
+        # All keyed in the morning after; the band comes from the book.
+        for band, n in (("Morning", 1), ("Evening", 4)):
             rooms.append({"id": len(rooms) + 1,
-                          "timestamp": f"2026-06-{d:02d} {h:02d}:30:00",
+                          "timestamp": f"2026-06-{d:02d} 08:30:00",
                           "room_type": "short time", "quantity": 1, "nights": n,
                           "price_per_night": 3000, "total_revenue": n * 3000,
-                          "deleted_at": None})
+                          "daypart": band, "deleted_at": None})
     monkeypatch.setattr(reports.db, "read_all",
                         lambda t: [dict(r) for r in rooms] if t == "rooms" else [])
     monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {"short time": 2})

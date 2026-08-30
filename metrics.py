@@ -2155,11 +2155,13 @@ def _short_stay_shape(weekday, weekend, lets_gap, arl_gap):
 # room that is turned away at 8pm and idle at 10am has two different problems
 # and only one of them is a rate.
 #
-# The hour comes from the booking's own timestamp, which is the moment it was
-# keyed in — at a front desk that is the check-in, close enough to place it in
-# a band. A backdated entry is stamped midnight and carries no real hour, so it
-# is reported as untimed rather than silently filed under Night, which would
-# invent an evening trade out of paperwork done the next morning.
+# The band is asked for and stored, never inferred from the timestamp. This
+# hotel records bookings in a paper book and keys them in the next morning, so
+# a row's timestamp is when the *typing* happened. Reading the hour from it
+# reported "the hourly trade is a morning business" — a finding about the
+# owner's admin routine, not about the hotel. Only the book knows when the let
+# actually was, so the booking flow asks, and a booking that was never asked is
+# reported untimed rather than guessed at.
 
 DAYPARTS = (
     ("Morning",   6, 12),
@@ -2169,22 +2171,18 @@ DAYPARTS = (
 )
 
 
-def daypart_of(dt):
-    """Which band an hour falls in, or None when the row carries no real time."""
-    if dt is None:
-        return None
-    # Exactly midnight is what _ts() writes for a backdated entry. A genuine
-    # 00:00 let is indistinguishable from it, so both are treated as untimed —
-    # better to under-claim than to manufacture a night trade.
-    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
-        return None
-    for name, start, end in DAYPARTS:
-        if start < end:
-            if start <= dt.hour < end:
-                return name
-        elif dt.hour >= start or dt.hour < end:
-            return name
-    return None
+DAYPART_NAMES = tuple(name for name, _s, _e in DAYPARTS)
+
+
+def daypart_of(row):
+    """The band recorded on the booking, or None if none was.
+
+    Deliberately reads the stored field and nothing else. Deriving it from the
+    timestamp looked reasonable and was wrong: entries keyed the morning after
+    all landed in Morning, which then read as a genuine trading pattern.
+    """
+    val = str(row.get("daypart") or "").strip().title()
+    return val if val in DAYPART_NAMES else None
 
 
 @dataclass(frozen=True)
@@ -2242,6 +2240,7 @@ def daypart_split(room_rows, start, end, hours_map=None):
             continue
         if not is_short_stay(r, hours_map):
             continue
+        band = daypart_of(r)
         try:
             units = int(r["quantity"]) * int(r["nights"])
             revenue = float(r["total_revenue"])
@@ -2250,7 +2249,6 @@ def daypart_split(room_rows, start, end, hours_map=None):
         if units <= 0:
             continue
         total += units
-        band = daypart_of(dt)
         if band is None:
             untimed += units
             continue
@@ -2280,8 +2278,10 @@ def daypart_verdict(split):
         return ("", "")
     live = [b for b in split.bands if b.lets]
     if len(live) == 1:
-        return (f"The hourly trade is a {live[0].label.lower()} business.",
-                f"Every timed let this period fell in the {live[0].label.lower()}. "
+        band = live[0].label.lower()
+        article = "an" if band[0] in "aeiou" else "a"
+        return (f"The hourly trade is {article} {band} business.",
+                f"Every timed let this period fell in the {band}. "
                 "Price that band on its own — the rest of the day is a different "
                 "product, or not a product at all.")
 

@@ -60,7 +60,8 @@ def process_set_price(drink: str, price: float) -> tuple[bool, str]:
 # ── Room sale ─────────────────────────────────────────────────────────
 
 def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None,
-                      recorded_by: str = "", duration_hours: float | None = None) -> tuple[bool, str, int]:
+                      recorded_by: str = "", duration_hours: float | None = None,
+                      daypart: str = "") -> tuple[bool, str, int]:
     """Returns (ok, message, room_id) — room_id is 0 when nothing was written.
 
     ``nights`` counts *stay units*: nights for a nightly room type, lets for an
@@ -77,7 +78,8 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
         return False, "❌ Stay length must be between 0 and 24 hours.", 0
 
     room_id = db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp,
-                             recorded_by=recorded_by, duration_hours=duration_hours or 0)
+                             recorded_by=recorded_by, duration_hours=duration_hours or 0,
+                             daypart=daypart)
     total = qty * price * nights
 
     # Name the unit the booking was actually sold in: calling a 3-hour let
@@ -89,9 +91,10 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
         unit = f"₦{price:,.2f}/night × {nights} night(s)"
 
     date_note = f" _(recorded for {timestamp})_" if timestamp else ""
+    when = f" · {daypart.title()}" if daypart.strip() else ""
     return True, (
         f"✅ Room booking recorded.{date_note}\n"
-        f"Type: *{room_type.title()}* | Qty: {qty} | {unit}\n"
+        f"Type: *{room_type.title()}* | Qty: {qty} | {unit}{when}\n"
         f"Total Revenue: *₦{total:,.2f}*"
     ), room_id
 

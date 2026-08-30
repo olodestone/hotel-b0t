@@ -261,6 +261,11 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         # type", so every historical row is reinterpreted correctly the moment
         # a short-stay type is configured — nothing needs backfilling.
         conn.execute(text("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS duration_hours FLOAT DEFAULT 0"))
+        # Which part of the day an hourly let actually happened in. Asked at
+        # entry, never derived from the timestamp: bookings are written in a
+        # paper book and keyed in the next morning, so the timestamp is when
+        # the typing happened, not when the room was used.
+        conn.execute(text("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS daypart TEXT DEFAULT ''"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id          SERIAL PRIMARY KEY,
@@ -672,7 +677,7 @@ def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None
 # ── Room-booking record ───────────────────────────────────────────────
 
 def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None,
-                recorded_by: str = "", duration_hours: float = 0) -> int:
+                recorded_by: str = "", duration_hours: float = 0, daypart: str = "") -> int:
     """Insert one booking. Returns the new row id so callers can offer a targeted undo.
 
     ``nights`` is really *stay units*: nights for a nightly room type, lets for
@@ -683,14 +688,15 @@ def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: 
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(text("""
-            INSERT INTO rooms (timestamp, created_at, room_type, quantity, price_per_night, nights, total_revenue, recorded_by, duration_hours)
-            VALUES (:ts, :created, :rtype, :qty, :price, :nights, :total, :recorded_by, :hours)
+            INSERT INTO rooms (timestamp, created_at, room_type, quantity, price_per_night, nights, total_revenue, recorded_by, duration_hours, daypart)
+            VALUES (:ts, :created, :rtype, :qty, :price, :nights, :total, :recorded_by, :hours, :daypart)
             RETURNING id
         """), {
             "ts": _ts(timestamp), "created": now_str(), "rtype": room_type.lower(),
             "qty": qty, "price": price, "nights": nights,
             "total": round(qty * price * nights, 2),
             "recorded_by": recorded_by, "hours": max(float(duration_hours or 0), 0),
+            "daypart": str(daypart or "").strip().title(),
         })
         new_id = int(result.scalar_one())
         conn.commit()

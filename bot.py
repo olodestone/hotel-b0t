@@ -2505,6 +2505,7 @@ _EXP_CLASS = 92                     # expense axis 2: operating/periodic/capital
 _RCL_PICK, _RCL_FIELD, _RCL_VALUE = range(93, 96)  # reclassify flow
 _POB_NAME, _POB_AMT, _POB_MONTHS, _POB_ACCT = range(96, 100)   # register a periodic bill
 _STK_ITEM, _STK_BAR, _STK_STORE = range(102, 105)              # month-end stocktake
+_BOOK_DAYPART = 109                    # when in the day an hourly let happened
 _RAU_ACTUAL, _RAU_ACTUAL_TEXT, _RAU_RATE, _RAU_RATE_TEXT = range(105, 109)  # room audit
 _PPY_PICK, _PPY_AMT = range(100, 102)                          # pay one from the reserve
 
@@ -2851,6 +2852,51 @@ async def _book_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return _BOOK_NIGHTS
 
 
+def _is_hourly_type(room_type: str) -> bool:
+    hours = db.get_all_room_type_hours().get(str(room_type).strip().lower())
+    return bool(hours) and hours < metrics.NIGHT_HOURS
+
+
+def _daypart_keyboard() -> InlineKeyboardMarkup:
+    """Asked, never inferred — the timestamp is when the book was typed up."""
+    rows = [[InlineKeyboardButton(f"{icon} {name}", callback_data=f"bdp:{name}")]
+            for name, icon in (("Morning", "🌅"), ("Afternoon", "☀️"),
+                               ("Evening", "🌆"), ("Night", "🌙"))]
+    rows.append([InlineKeyboardButton("🤷 Not noted", callback_data="bdp:__skip__")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _book_after_nights(send, ctx, uid: int) -> int:
+    """Hourly lets are asked what part of the day. Nightly stays skip it —
+    an overnight booking has no time of day worth recording."""
+    rtype = ctx.user_data.get("book_type", "")
+    units = ctx.user_data.get("book_nights", 1)
+    if _is_hourly_type(rtype):
+        await send(
+            f"🕐 *{reports._esc(rtype.title())} — what part of the day?*\n"
+            "_From the book, not from now — you are keying this in later._",
+            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_daypart_keyboard())
+        return _BOOK_DAYPART
+    await send(
+        f"🛏 {ctx.user_data.get('book_qty', 1)}× {rtype.title()}, {units} nights — when?",
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard_for("bdd", uid))
+    return _BOOK_DATE
+
+
+async def _book_pick_daypart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]
+    ctx.user_data["book_daypart"] = "" if val == "__skip__" else val
+    await q.edit_message_text(
+        f"🛏 {ctx.user_data.get('book_qty', 1)}× "
+        f"{ctx.user_data.get('book_type', '').title()} — which day?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_date_keyboard_for("bdd", update.effective_user.id),
+    )
+    return _BOOK_DATE
+
+
 async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
@@ -2859,13 +2905,7 @@ async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         await q.edit_message_text("How many nights? (type a number)")
         return _BOOK_NIGHTS_TEXT
     ctx.user_data["book_nights"] = int(val)
-    uid = update.effective_user.id
-    await q.edit_message_text(
-        f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {val} nights — when?",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_date_keyboard_for("bdd", uid),
-    )
-    return _BOOK_DATE
+    return await _book_after_nights(q.edit_message_text, ctx, update.effective_user.id)
 
 
 async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2875,13 +2915,8 @@ async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Enter a whole number:")
         return _BOOK_NIGHTS_TEXT
     ctx.user_data["book_nights"] = nights
-    uid = update.effective_user.id
-    await update.message.reply_text(
-        f"🛏 {ctx.user_data.get('book_qty', 1)}× {ctx.user_data.get('book_type', '').title()}, {nights} nights — when?",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_date_keyboard_for("bdd", uid),
-    )
-    return _BOOK_DATE
+    return await _book_after_nights(update.message.reply_text, ctx,
+                                    update.effective_user.id)
 
 
 async def _book_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2930,7 +2965,9 @@ async def _do_book(update: Update, ctx: ContextTypes.DEFAULT_TYPE, timestamp: st
             reply_markup=_get_keyboard(user.id),
         )
         return ConversationHandler.END
-    ok, msg, room_id = logic.process_room_sale(rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
+    ok, msg, room_id = logic.process_room_sale(
+        rtype, qty, price, nights, timestamp=timestamp, recorded_by=recorded_by,
+        daypart=ctx.user_data.pop("book_daypart", ""))
     if ok:
         undo_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
             "↩️ Undo — tap to cancel this booking", callback_data=f"undo:room:{room_id}")]])
@@ -6639,6 +6676,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _BOOK_QTY_TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_qty_text)],
             _BOOK_NIGHTS:      [CallbackQueryHandler(_book_pick_nights, pattern="^bn:")],
             _BOOK_NIGHTS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _book_nights_text)],
+            _BOOK_DAYPART:     [CallbackQueryHandler(_book_pick_daypart, pattern="^bdp:")],
             _BOOK_DATE:        [CallbackQueryHandler(_book_pick_date, pattern="^bdd:")],
         },
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
