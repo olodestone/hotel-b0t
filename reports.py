@@ -1272,6 +1272,7 @@ def generate_position_report() -> str:
         "💳 *OWED TO US* _(receivables)_",
         f"  Outstanding debtors: {_fmt(pos.receivables)}  ({pos.outstanding_count} owing)",
     ]
+    lines += _unmatched_debt_block(pos)
 
     # Supplier credit is a claim on cash you already have — show it so the
     # headline balance is never mistaken for money that's free to spend.
@@ -1494,6 +1495,36 @@ def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
 
 
 # ── Stocktake variance (shrinkage) ────────────────────────────────────
+
+def _unmatched_debt_block(pos) -> list[str]:
+    """Debts with no sale behind them — the one thing that breaks the cash sum.
+
+    A debt is meant to be recorded *alongside* the sale, not instead of it: the
+    cash estimate treats revenue as collected unless a debt says otherwise. A
+    debt on its own subtracts money that was never added, so the shortfall is
+    reported here rather than quietly absorbed.
+    """
+    if not pos.unmatched_receivables:
+        return []
+    um = metrics.unmatched_debts(
+        [r for r in db.read_all("debtors") if r.get("status") == "outstanding"],
+        _active(db.read_all("sales")), _active(db.read_all("rooms")))
+    out = [
+        "",
+        f"  ⚠️ *{_fmt(pos.unmatched_receivables)} of debt has no sale behind it.*",
+        "  _A debt records who owes you. The sale records what they took._",
+        "  _Both are needed, or the money never entered the books at all._",
+    ]
+    for r in um.rows[:5]:
+        who = _esc(str(r.get("name", "")).title())
+        out.append(f"    `[{r['id']}]` {str(r.get('timestamp',''))[:10]}  "
+                   f"{_fmt(float(r['amount']))} — {who} "
+                   f"({str(r.get('account','')).title()})")
+    if len(um.rows) > 5:
+        out.append(f"    _…and {len(um.rows) - 5} more._")
+    out.append("  _Fix: record the missing sale for that day, then this clears._")
+    return out
+
 
 def _verification_note(for_date, for_month, all_time) -> list[str]:
     """A month with no stocktake is UNVERIFIED, and every report must say so.

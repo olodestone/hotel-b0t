@@ -51,7 +51,12 @@ def sell_drink(drink: str, qty: int, timestamp: str | None = None, recorded_by: 
         )
 
     updated = db.upsert_drink(drink, qty_sold=qty)
-    sale_id = db.record_sale(drink, qty, price, timestamp=timestamp, recorded_by=recorded_by)
+    # Stamp the cost this drink carried at the moment of sale. Read here, where
+    # the row is already in hand, so a restock landing mid-sale cannot change
+    # what this sale is recorded as having cost.
+    sale_id = db.record_sale(drink, qty, price, timestamp=timestamp,
+                             recorded_by=recorded_by,
+                             cost_price=float(existing.get("cost_price") or 0))
 
     new_stock = int(updated["current_stock"])
     threshold = int(updated["low_stock_threshold"])

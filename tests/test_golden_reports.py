@@ -607,3 +607,24 @@ def test_audit_sheet_prints_the_vacant_rooms(monkeypatch):
     out = reports.audit_sheet([_d(2026, 6, 5)], 2026, 6)
     assert "VACANT (per system)" in out
     assert "shown vacant" in out
+
+
+# ── Audit fixes ───────────────────────────────────────────────────────
+
+def test_position_names_debts_with_no_sale_behind_them(monkeypatch):
+    debts = [{"id": 9, "timestamp": "2026-06-10 20:00:00", "account": "bar",
+              "name": "john", "amount": 10000, "amount_paid": 0,
+              "status": "outstanding", "description": "tab"}]
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [dict(r) for r in debts] if t == "debtors" else [])
+    monkeypatch.setattr(reports.db, "get_outstanding_payables", lambda: [])
+    out = reports.generate_position_report()
+    assert "has no sale behind it" in out
+    assert "`[9]` 2026-06-10  ₦10,000 — John (Bar)" in out
+    assert "-₦" not in out.split("CASH AT HAND")[1].split("STOCK VALUE")[0]
+
+
+def test_position_is_quiet_when_debts_are_paired():
+    """The fixture has debtors and matching sales — nothing to warn about."""
+    out = reports.generate_position_report()
+    assert "has no sale behind it" not in out

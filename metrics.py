@@ -242,16 +242,27 @@ def restock_spend(rows):
 
 
 def cost_of_drinks_sold(sales_rows, cost_map):
-    """COGS at *current* cost price.
+    """COGS at the cost each sale actually carried.
 
-    ``cost_map`` maps a lower-cased drink name → its current cost price. Sales of
-    a drink not present in the map count as zero cost (mirrors legacy behaviour).
+    A sale stamps the drink's cost onto its own row, so what a month cost is
+    settled once the month is over. Reading today's price instead restated
+    every closed month: the same May sales reported ₦60,000 profit in May and
+    ₦30,000 in July, without a single May row changing.
+
+    ``cost_map`` (lower-cased drink name → current cost) is the fallback for
+    rows written before the stamp existed, and for a drink with no cost
+    recorded. That is the old behaviour, kept only where nothing better can be
+    reconstructed.
     """
     total = 0.0
     for row in sales_rows:
-        name = row["drink_name"].lower()
         qty = int(row["quantity"])
-        total += qty * cost_map.get(name, 0.0)
+        try:
+            stamped = float(row.get("cost_price") or 0)
+        except (TypeError, ValueError):
+            stamped = 0.0
+        unit = stamped if stamped > 0 else cost_map.get(row["drink_name"].lower(), 0.0)
+        total += qty * unit
     return round(total, 2)
 
 
@@ -628,6 +639,65 @@ def compute_reserve(obligations, expense_rows, today):
     )
 
 
+# ── Unmatched credit sales ────────────────────────────────────────────
+#
+# A debt is recorded on its own table and creates no sale. The intended
+# sequence is both: record the sale, then record the debt for the part not
+# paid. The cash estimate is built on that — it treats revenue as collected
+# unless a debt says otherwise.
+#
+# When only the debt is entered, the arithmetic goes somewhere impossible: it
+# subtracts a receivable from revenue that never included it, and reports cash
+# falling because a guest drank on credit. Nothing linked the two records, so
+# nothing could notice.
+#
+# Detection is deliberately conservative. A debt raised on a day when that
+# account recorded no revenue at all cannot have a matching sale behind it —
+# there is nothing for it to be part of. Anything looser would flag honest
+# entries, and a control that cries wolf gets ignored.
+
+
+@dataclass(frozen=True)
+class UnmatchedDebts:
+    rows: tuple
+    total: float
+
+    @property
+    def any(self):
+        return bool(self.rows)
+
+
+def unmatched_debts(debtor_rows, sales_rows, room_rows):
+    """Debts raised on a day their account took no money at all.
+
+    Returns the rows so they can be named and corrected, not just counted: the
+    fix is to add the missing sale, and that needs the date and the amount.
+    """
+    bar_days, room_days = set(), set()
+    for r in sales_rows:
+        dt = parse_ts(r.get("timestamp"))
+        if dt:
+            bar_days.add(dt.date())
+    for r in room_rows:
+        dt = parse_ts(r.get("timestamp"))
+        if dt:
+            room_days.add(dt.date())
+
+    found = []
+    for d in debtor_rows:
+        dt = parse_ts(d.get("timestamp"))
+        if not dt:
+            continue
+        account = str(d.get("account") or "").lower()
+        days = room_days if account == "rooms" else bar_days
+        if dt.date() not in days:
+            found.append(d)
+    return UnmatchedDebts(
+        rows=tuple(found),
+        total=round(sum(float(r["amount"]) for r in found), 2),
+    )
+
+
 # ── Contingency: sizing the buffer from history, not a forecast ───────
 #
 # The register accrues bills you can name. Nobody can name the compressor that
@@ -792,6 +862,7 @@ class CashPosition:
     profit_all: float
     capital_cash: float = 0.0    # asset purchases: out of the P&L, out of the bank
     periodic_cash: float = 0.0   # periodic bills paid: drawn from the reserve
+    unmatched_receivables: float = 0.0   # debts exceeding the revenue they came from
 
 
 def compute_cash_position(sales_all, rooms_all, expense_all, draws_all, debtor_rows,
@@ -829,7 +900,12 @@ def compute_cash_position(sales_all, rooms_all, expense_all, draws_all, debtor_r
     recv_cash = round(sum(
         float(r["amount"]) - float(r.get("amount_paid") or 0)
         for r in _since(outstanding)), 2)
-    collected = round(rev_cash - recv_cash, 2)      # assume cash unless an outstanding debtor exists
+    # Assume cash unless an outstanding debtor says otherwise. Clamped at zero:
+    # you cannot collect a negative amount, and an unmatched debt used to drive
+    # this below it — reporting cash falling because a guest drank on credit.
+    # `unmatched_debts` is what explains the shortfall rather than hiding it.
+    collected = round(max(rev_cash - recv_cash, 0.0), 2)
+    uncollectable = round(max(recv_cash - rev_cash, 0.0), 2)
     cash = round(opening + collected - opex_cash - restock_cash
                  - capital_cash - periodic_cash - draws_cash, 2)
 
@@ -853,6 +929,7 @@ def compute_cash_position(sales_all, rooms_all, expense_all, draws_all, debtor_r
         opening=opening, anchor_dt=anchor_dt, collected=collected,
         opex_cash=opex_cash, restock_cash=restock_cash, draws_cash=draws_cash, cash=cash,
         capital_cash=capital_cash, periodic_cash=periodic_cash,
+        unmatched_receivables=uncollectable,
         stock_value=stock_value, receivables=receivables, outstanding_count=len(outstanding),
         month_profit=month_profit, profit_all=profit_all,
     )

@@ -338,6 +338,12 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         # Migrations: soft-delete support (void instead of hard delete)
         conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
+        # The cost this drink actually carried when it was sold. Without it,
+        # COGS is computed at *today's* cost price, so restocking dearer
+        # silently rewrites the profit of every month already closed. 0 means
+        # a row written before this existed — those still fall back to the
+        # current price, which is the best that can be reconstructed.
+        conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS cost_price FLOAT DEFAULT 0"))
         conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS deleted_at TEXT DEFAULT ''"))
         conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS deleted_by TEXT DEFAULT ''"))
@@ -633,19 +639,30 @@ def read_all(table: str) -> list[dict[str, Any]]:
 
 # ── Drink-sale record ─────────────────────────────────────────────────
 
-def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None, recorded_by: str = "") -> int:
-    """Insert one sale. Returns the new row id so callers can offer a targeted undo."""
+def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None,
+                recorded_by: str = "", cost_price: float | None = None) -> int:
+    """Insert one sale. Returns the new row id so callers can offer a targeted undo.
+
+    The drink's cost at this moment is stamped onto the row. Reading it from
+    inventory at report time instead meant a later restock at a higher price
+    restated the profit of months that were already closed and acted on.
+    """
+    name = drink.lower()
+    if cost_price is None:
+        row = get_drink(name)
+        cost_price = float(row.get("cost_price") or 0) if row else 0.0
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(text("""
-            INSERT INTO sales (timestamp, created_at, drink_name, quantity, selling_price, total_revenue, recorded_by)
-            VALUES (:ts, :created, :drink, :qty, :price, :total, :recorded_by)
+            INSERT INTO sales (timestamp, created_at, drink_name, quantity, selling_price, total_revenue, recorded_by, cost_price)
+            VALUES (:ts, :created, :drink, :qty, :price, :total, :recorded_by, :cost)
             RETURNING id
         """), {
-            "ts": _ts(timestamp), "created": now_str(), "drink": drink.lower(),
+            "ts": _ts(timestamp), "created": now_str(), "drink": name,
             "qty": qty, "price": price,
             "total": round(qty * price, 2),
             "recorded_by": recorded_by,
+            "cost": round(float(cost_price or 0), 2),
         })
         new_id = int(result.scalar_one())
         conn.commit()

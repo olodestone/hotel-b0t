@@ -47,7 +47,7 @@ dashboard/ (separate FastAPI web service, read-only) → metrics.py + database.p
 
 **`database.py`** — PostgreSQL persistence via SQLAlchemy + pandas. All queries use parameterised statements. `read_all(table)` returns `list[dict]` using `pd.read_sql`. The `upsert_drink()` function does an atomic `INSERT ... ON CONFLICT DO UPDATE`. `get_setting()`/`set_setting()` manage the `settings` table for configurable percentages.
 
-**`reports.py`** — Telegram formatting: reads data from `database.py`/`inventory.py`, runs the numbers through `metrics.py`, builds Telegram MarkdownV2 strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses *current* cost price (not historical per-sale cost). Salary expenses are always split out separately from other expenses. Profit calcs exclude `restock` (inventory purchase) and owner draws — see "Profit vs Cash vs Stock" below.
+**`reports.py`** — Telegram formatting: reads data from `database.py`/`inventory.py`, runs the numbers through `metrics.py`, builds Telegram MarkdownV2 strings. Reports separate Bar and Rooms P&L. Cost-of-drinks-sold uses the cost **stamped on each sale** (see "COGS is settled at the time of sale"). Salary expenses are always split out separately from other expenses. Profit calcs exclude `restock` (inventory purchase) and owner draws — see "Profit vs Cash vs Stock" below.
 
 **`metrics.py`** — Pure financial calc core (no DB, no formatting). Functions take already-fetched rows + a cost-price map and return dataclasses (`compute_pnl` → `PnL`/`AccountPnL`, `summarize_outstanding`, plus shared row helpers `apply_filter`/`active`/`operating_expenses`/`cost_of_drinks_sold`/…). This is the **single source of truth** for the math, shared by `reports.py` (Telegram) and `dashboard/` (web) so the two can never disagree. The full report, position, allocation, and staff reports consume it (`compute_pnl`, `compute_cash_position`, `compute_allocation`, `staff_breakdown`), as do the performance reports (`compute_working_capital`, `compute_break_even`, `compute_room_metrics`, `menu_engineering`, `summarize_variance`). Golden-master tests in `tests/` assert the Telegram output is byte-for-byte unchanged.
 
@@ -221,6 +221,60 @@ Three figures are tracked separately and must never be conflated:
 3. **Stock value on hand (asset)** — `Σ (store + bar units) × cost_price`. Shown as `TOTAL VALUE` in `/stock` and line ③ of `/position`.
 
 `/position` shows all three side by side plus outstanding receivables and (when any exist) unpaid supplier invoices. Owner draws live in the dedicated `owner_draws` table, never in `expenses`, so they can never touch profit.
+
+### COGS is settled at the time of sale
+
+`sales.cost_price` stamps what a drink cost **at the moment it was sold**.
+Before this, `cost_of_drinks_sold()` read the *current* price from inventory,
+so restocking dearer silently rewrote every month already closed:
+
+| May's report, run in | COGS | Profit | Gross margin |
+|---|---|---|---|
+| May (cost ₦400) | ₦40,000 | ₦60,000 | 60.0% |
+| June (cost ₦550) | ₦55,000 | ₦45,000 | 45.0% |
+| July (cost ₦700) | ₦70,000 | ₦30,000 | 30.0% |
+
+Not one May row changed. In a high-inflation currency that is not an edge case,
+and it undermined everything read across periods — the `/roomstats` verdicts,
+the GOPPAR trend, shrinkage as a share of COGS, and any decision recorded
+against a figure that later moved.
+
+The cost is read in `inventory.record_sale()`, where the drink row is already
+in hand, so a restock landing mid-sale cannot change what the sale is recorded
+as having cost. Rows written before the column existed, and drinks with no cost
+recorded, still fall back to `cost_map` — that is the old behaviour, kept only
+where nothing better can be reconstructed. A stamp of 0 counts as missing, not
+as free stock.
+
+### A debt is not a sale
+
+`/add_debtor` writes only to `debtors`. It creates no sale, deliberately — a
+₦10,000 bar tab does not say which drinks were taken, so there is nothing to
+compute COGS from. The intended sequence is **both**: record the sale, then
+record the debt for the part not paid. `compute_cash_position` is built on that,
+treating revenue as collected unless a debt says otherwise.
+
+Entering only the debt sent the arithmetic somewhere impossible — it subtracted
+a receivable from revenue that never included it:
+
+| how the same ₦10,000 tab was keyed | revenue | profit | cash |
+|---|---|---|---|
+| sale + debtor (intended) | 10,000 | 5,000 | 0 |
+| **debtor only** | 0 | 0 | **−10,000** |
+| sale only (tab forgotten) | 10,000 | 5,000 | 10,000 |
+
+Cash fell because a guest drank on credit. Two changes close it:
+
+- `collected` is clamped at zero — you cannot collect a negative amount — and
+  the shortfall is reported as `unmatched_receivables` rather than absorbed.
+- `metrics.unmatched_debts()` finds the rows and `/position` names them, so the
+  fix (record the missing sale) is actionable rather than just flagged.
+
+Detection is **conservative on purpose**: it flags only a debt raised on a day
+when that account took no money at all, since there is then nothing for it to be
+part of. A room debt is checked against room revenue, a bar debt against bar
+sales. Anything looser would flag honest entries, and a control that cries wolf
+gets ignored.
 
 ### Margins
 
@@ -902,7 +956,7 @@ survives, and drink sales restore bar stock on the way out.
 
 | Table | Key columns |
 |---|---|
-| `sales` | `id`, `timestamp`, `created_at`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at` |
+| `sales` | `id`, `timestamp`, `created_at`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at`, `cost_price` — the cost carried at the moment of sale, so a closed month cannot be restated by a later restock |
 | `rooms` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at`, `duration_hours` — `nights` is really *stay units* (nights, or lets for an hourly type); `duration_hours` of 0 defers to the room type |
 | `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description`, `expense_class`, `needs_review`, `obligation_id` — `account` is now `bar`/`rooms`/**`overhead`**; `expense_class` is the second axis and decides whether the row reaches the P&L at all |
 | `owner_draws` | `id`, `timestamp`, `amount`, `account`, `description`, `recorded_by`, `deleted_by`, `deleted_at` — owner equity withdrawals, deliberately separate from `expenses` |

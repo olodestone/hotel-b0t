@@ -1569,3 +1569,82 @@ def test_a_flat_rate_over_a_handful_of_nights_is_not_yet_a_finding():
     few = [{"room_type": "suite", "quantity": 1, "nights": 1, "total_revenue": 25_000,
             "timestamp": f"2026-06-{d:02d} 15:00:00"} for d in range(1, 5)]
     assert metrics.rate_spread(few)[0].suspicious is False
+
+
+# ── COGS is settled at the time of sale ───────────────────────────────
+
+def test_a_closed_month_does_not_move_when_cost_prices_rise():
+    """The same May sales reported ₦60,000 profit in May and ₦30,000 in July."""
+    may = [{"timestamp": "2026-05-10 20:00:00", "drink_name": "beer",
+            "quantity": 100, "total_revenue": 100_000, "cost_price": 400}]
+    figures = {metrics.compute_pnl(may, [], [], {"beer": c}).net_profit
+               for c in (400, 550, 700)}
+    assert figures == {60_000}          # one answer, whenever it is run
+
+
+def test_rows_written_before_the_stamp_fall_back_to_current_cost():
+    legacy = [{"timestamp": "2026-05-10 20:00:00", "drink_name": "beer",
+               "quantity": 100, "total_revenue": 100_000}]
+    assert metrics.cost_of_drinks_sold(legacy, {"beer": 550}) == 55_000
+
+
+def test_a_zero_stamp_is_treated_as_missing_not_as_free_stock():
+    row = [{"drink_name": "beer", "quantity": 10, "cost_price": 0}]
+    assert metrics.cost_of_drinks_sold(row, {"beer": 500}) == 5_000
+
+
+def test_the_stamp_wins_over_the_current_price():
+    row = [{"drink_name": "beer", "quantity": 10, "cost_price": 300}]
+    assert metrics.cost_of_drinks_sold(row, {"beer": 900}) == 3_000
+
+
+# ── Credit sales with no sale behind them ─────────────────────────────
+
+_TAB = [{"id": 9, "timestamp": "2026-06-10 20:00:00", "account": "bar",
+         "name": "john", "amount": 10_000, "amount_paid": 0,
+         "status": "outstanding"}]
+_SALE = [{"timestamp": "2026-06-10 20:00:00", "drink_name": "beer",
+          "quantity": 10, "total_revenue": 10_000, "cost_price": 500}]
+
+
+def _pos(sales, debtors):
+    from datetime import datetime as _dt
+    return metrics.compute_cash_position(
+        sales, [], [], [], debtors, stock_value=0, opening=0, anchor_dt=None,
+        cost_map={"beer": 500}, now=_dt(2026, 6, 30, 12, 0))
+
+
+def test_cash_can_never_go_negative_because_someone_drank_on_credit():
+    """A debt with no sale used to subtract revenue that was never added."""
+    assert _pos([], _TAB).cash == 0.0
+    assert _pos([], _TAB).unmatched_receivables == 10_000
+
+
+def test_the_intended_pairing_reports_nothing_amiss():
+    pos = _pos(_SALE, _TAB)
+    assert pos.cash == 0.0                  # sold on credit: nothing collected
+    assert pos.unmatched_receivables == 0.0
+    assert metrics.unmatched_debts(_TAB, _SALE, []).any is False
+
+
+def test_an_unmatched_debt_is_named_so_it_can_be_fixed():
+    um = metrics.unmatched_debts(_TAB, [], [])
+    assert um.any is True and um.total == 10_000
+    assert um.rows[0]["id"] == 9            # the row itself, not just a count
+
+
+def test_detection_does_not_fire_on_a_day_that_took_money():
+    """Conservative on purpose — a control that cries wolf gets ignored."""
+    partial = [{"timestamp": "2026-06-10 20:00:00", "drink_name": "beer",
+                "quantity": 2, "total_revenue": 2_000, "cost_price": 500}]
+    assert metrics.unmatched_debts(_TAB, partial, []).any is False
+
+
+def test_a_room_debt_is_checked_against_room_revenue_not_bar():
+    room_debt = [{"id": 1, "timestamp": "2026-06-10 15:00:00", "account": "rooms",
+                  "name": "acme", "amount": 30_000, "amount_paid": 0,
+                  "status": "outstanding"}]
+    assert metrics.unmatched_debts(room_debt, _SALE, []).any is True   # bar sales don't count
+    rooms = [{"timestamp": "2026-06-10 15:00:00", "room_type": "std",
+              "quantity": 1, "nights": 1, "total_revenue": 30_000}]
+    assert metrics.unmatched_debts(room_debt, [], rooms).any is False
