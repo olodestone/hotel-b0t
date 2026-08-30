@@ -1631,7 +1631,7 @@ def generate_count_sheet() -> str:
         "_look identical in one total._",
         "_Never estimate. Never count from memory. Same day each month._",
         "",
-        "When the sheet is filled, enter it with ⚙️ Manage → 📦 Stocktake.",
+        "When the sheet is filled: ⚙️ Manage → 🧾 Month-End Verification → 📦 Enter stocktake.",
     ])
 
 

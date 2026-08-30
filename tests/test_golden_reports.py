@@ -704,3 +704,10 @@ def test_report_shows_the_denominator_it_used(monkeypatch):
     _mixed_hotel(monkeypatch)
     out = reports.generate_full_report(for_month=(2026, 6))
     assert "room-nights._" in out
+
+
+def test_count_sheet_names_a_button_path_that_exists():
+    """The sheet is carried and read off paper; a wrong path there is dead-ended."""
+    out = reports.generate_count_sheet()
+    assert "Month-End Verification" in out
+    assert "📦 Stocktake." not in out       # no such button
