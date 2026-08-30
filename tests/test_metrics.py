@@ -843,3 +843,729 @@ def test_conversion_can_exceed_100_percent_when_the_bar_carries_the_rooms():
     gp = metrics.compute_goppar(pnl, available_room_nights=240)
     assert gp.conversion_pct > 100          # whole-hotel profit exceeds room revenue
     assert gp.rooms_conversion_pct == 60.0  # rooms alone stay under it
+
+
+# ── Day-of-week split: flat rise vs weekday/weekend pricing ───────────
+
+from datetime import date  # noqa: E402
+
+# June 2026 starts on a Monday and 2026-06-28 is a Sunday — exactly four of
+# every weekday, so occupancy denominators are equal across the seven and any
+# difference the tests find is real rather than a calendar artefact.
+_JUNE = (date(2026, 6, 1), date(2026, 6, 28))
+
+
+def _night(day: int, qty: int, nights: int, revenue: float, rtype: str = "standard"):
+    return {"timestamp": f"2026-06-{day:02d} 12:00:00", "room_type": rtype,
+            "quantity": qty, "nights": nights, "total_revenue": revenue}
+
+
+def test_a_stay_is_credited_to_every_night_it_occupies():
+    """A Friday check-in for 3 nights is not three Fridays."""
+    rows = [_night(5, 2, 3, 2 * 3 * 20_000)]          # Fri 5 Jun → Fri/Sat/Sun
+    nights = list(metrics.expand_room_nights(rows))
+    assert [n[0].strftime("%a") for n in nights] == ["Fri", "Sat", "Sun"]
+    assert all(n[2] == 2 for n in nights)             # 2 rooms on each night
+
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=10)
+    sold = [b.nights_sold for b in split.by_dow]
+    assert sold == [0, 0, 0, 0, 2, 2, 2]              # Mon..Sun
+
+
+def test_adr_is_per_room_night_not_per_booking():
+    """The revenue apportioned to a night covers every room in that booking.
+
+    Multiplying it by the room count again squares the rooms and reports an ADR
+    several times the rate actually charged.
+    """
+    rows = [_night(1, 4, 1, 4 * 15_000)]              # 4 rooms, one night
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=10)
+    assert split.by_dow[0].adr == 15_000.0
+    assert split.by_dow[0].nights_sold == 4
+    assert split.overall.revenue == 60_000.0
+
+
+def test_each_weekday_divides_by_its_own_available_nights():
+    rows = [_night(5, 8, 1, 8 * 15_000)]              # one Friday only
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=10)
+    friday = split.by_dow[4]
+    assert friday.days == 4                           # four Fridays in the window
+    assert friday.available == 40                     # not 10 × 28
+    assert friday.occupancy_pct == 20.0               # 8 of 40, not 8 of 10
+
+
+def test_nights_outside_the_window_are_clipped():
+    """A stay that began before the window contributes only the nights inside it."""
+    rows = [{"timestamp": "2026-05-30 12:00:00", "room_type": "standard",
+             "quantity": 1, "nights": 4, "total_revenue": 4 * 10_000}]
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=10)
+    assert split.overall.nights_sold == 2             # 1 & 2 June; 30 & 31 May drop
+    assert split.overall.revenue == 20_000.0
+
+
+def _weekly(weekend_qty: int, weekday_qty: int, rate: float = 15_000,
+            weekend_rate: float | None = None):
+    """One booking per night for the whole of June 2026."""
+    rows = []
+    for d in range(1, 29):
+        wknd = date(2026, 6, d).weekday() in metrics.WEEKEND_NIGHTS
+        qty = weekend_qty if wknd else weekday_qty
+        r = (weekend_rate or rate) if wknd else rate
+        if qty:
+            rows.append(_night(d, qty, 1, qty * r))
+    return rows
+
+
+def test_busy_weekend_at_the_same_rate_says_split_the_rate():
+    split = metrics.compute_dow_split(_weekly(8, 2), *_JUNE, total_rooms=10)
+    assert split.occupancy_gap_pt == 60.0
+    assert split.adr_gap_pct == 0.0
+    assert "Split the rate" in split.verdict
+
+
+def test_busy_weekend_already_at_a_premium_points_at_the_weekday_nights():
+    split = metrics.compute_dow_split(
+        _weekly(8, 2, weekend_rate=25_000), *_JUNE, total_rooms=10)
+    assert split.adr_gap_pct > metrics.TREND_BAND
+    assert "weekday nights are the problem" in split.verdict
+
+
+def test_level_demand_says_a_flat_rise_is_the_right_shape():
+    split = metrics.compute_dow_split(_weekly(5, 5), *_JUNE, total_rooms=10)
+    assert split.occupancy_gap_pt == 0.0
+    assert "Flat rise" in split.verdict
+
+
+def test_an_emptier_weekend_rules_out_a_weekend_premium():
+    split = metrics.compute_dow_split(_weekly(1, 8), *_JUNE, total_rooms=10)
+    assert split.occupancy_gap_pt < 0
+    assert "not justified" in split.verdict
+
+
+def test_without_a_room_count_the_split_says_so_but_still_gives_adr():
+    split = metrics.compute_dow_split(_weekly(8, 2), *_JUNE, total_rooms=0)
+    assert split.has_rooms is False
+    assert split.by_dow[4].adr == 15_000.0            # ADR needs no denominator
+    assert split.by_dow[4].occupancy_pct == 0.0
+    assert "room count" in split.verdict
+
+
+def test_tied_nights_are_named_together_never_picked_between():
+    """Three nights at identical occupancy have no single 'busiest'."""
+    split = metrics.compute_dow_split(_weekly(5, 5), *_JUNE, total_rooms=10)
+    assert split.busiest == ""                        # all seven tie → no peak
+    rows = _weekly(0, 0) + [_night(5, 4, 1, 60_000), _night(6, 4, 1, 60_000)]
+    two = metrics.compute_dow_split(rows, *_JUNE, total_rooms=10)
+    assert two.busiest == "Friday & Saturday"
+
+
+def test_an_empty_window_invents_no_peak():
+    split = metrics.compute_dow_split([], *_JUNE, total_rooms=10)
+    assert (split.busiest, split.quietest) == ("", "")
+    assert split.overall.nights_sold == 0
+
+
+# ── Turnaways: the demand a full night hides ──────────────────────────
+
+def _turn(day: int, qty: int, rtype: str = "standard", reason: str = "fully booked"):
+    return {"timestamp": f"2026-06-{day:02d} 20:00:00", "room_type": rtype,
+            "quantity": qty, "reason": reason}
+
+
+def test_turnaways_land_on_the_night_they_happened():
+    rows = [_turn(5, 3), _turn(6, 4), _turn(1, 1)]    # Fri, Sat, Mon
+    split = metrics.compute_dow_split(_weekly(8, 2), *_JUNE, total_rooms=10,
+                                      turnaway_rows=rows)
+    assert split.by_dow[4].turnaways == 3
+    assert split.by_dow[5].turnaways == 4
+    assert split.weekend.turnaways == 7
+    assert split.weekday.turnaways == 1
+    assert split.turnaways_tracked is True
+
+
+def test_no_turnaways_recorded_is_not_the_same_as_none_happening():
+    split = metrics.compute_dow_split(_weekly(8, 2), *_JUNE, total_rooms=10)
+    assert split.turnaways_tracked is False
+    summary = metrics.summarize_turnaways([], *_JUNE)
+    assert summary.tracked is False and summary.total == 0
+
+
+def test_turnaway_summary_groups_and_prices_at_achieved_adr():
+    rows = [_turn(5, 3), _turn(6, 2, "deluxe"), _turn(12, 1, "", "")]
+    s = metrics.summarize_turnaways(rows, *_JUNE, adr=15_000)
+    assert s.total == 6
+    assert s.days_with_data == 3
+    assert s.by_type == {"Standard": 3, "Deluxe": 2, "Unspecified": 1}
+    assert s.by_reason["fully booked"] == 5
+    assert s.by_reason["not given"] == 1
+    assert s.lost_revenue == 90_000.0                 # 6 × the rate actually achieved
+
+
+def test_turnaways_outside_the_window_are_ignored():
+    s = metrics.summarize_turnaways([_turn(5, 3), {"timestamp": "2026-05-05 20:00:00",
+                                                   "quantity": 9}], *_JUNE)
+    assert s.total == 3
+
+
+def test_a_window_too_short_to_compare_refuses_to_issue_a_verdict():
+    """A single Friday has no working-week nights to be busier than."""
+    friday = date(2026, 6, 5)
+    split = metrics.compute_dow_split(
+        [_night(5, 8, 1, 8 * 15_000)], friday, friday, total_rooms=10)
+    assert "Too short a window" in split.verdict
+    assert "Split the rate" not in split.verdict
+    assert split.by_dow[4].occupancy_pct == 80.0     # the night itself still reports
+
+
+def test_a_full_week_is_long_enough_to_compare():
+    split = metrics.compute_dow_split(
+        _weekly(8, 2), date(2026, 6, 1), date(2026, 6, 7), total_rooms=10)
+    assert "Split the rate" in split.verdict
+
+
+# ── Hourly lets: not every stay is a night ────────────────────────────
+
+def _let(day, qty, units, revenue, rtype="short time", hours=0):
+    return {"timestamp": f"2026-06-{day:02d} 14:00:00", "room_type": rtype,
+            "quantity": qty, "nights": units, "total_revenue": revenue,
+            "duration_hours": hours}
+
+
+_HOURLY = {"short time": 2}
+
+
+def test_lets_are_not_counted_as_room_nights():
+    """One room let three times in a day used to report 300% occupancy."""
+    rows = [_let(5, 1, 3, 9_000)]
+    rm = metrics.compute_room_metrics(rows, total_rooms=1, days=1,
+                                      hours_by_type=_HOURLY)
+    assert rm.room_nights_sold == 0        # no night was sold
+    assert rm.short_lets == 3
+    assert rm.occupancy_pct == 0.0         # overnight occupancy, honestly zero
+    assert rm.utilization_pct == 25.0      # 6 of 24 room-hours
+
+
+def test_a_lets_rate_never_enters_adr():
+    """A ₦3,000 two-hour let averaged with a ₦15,000 night is a rate nobody charged."""
+    rows = [_let(5, 1, 3, 9_000), _room_night(5, 3, 1, 45_000)]
+    rm = metrics.compute_room_metrics(rows, total_rooms=4, days=1,
+                                      hours_by_type=_HOURLY)
+    assert rm.adr == 15_000.0              # overnight rate, not the ₦9,000 blend
+    assert rm.arl == 3_000.0               # lets get their own average
+    assert rm.occupancy_pct == 75.0        # 3 nights of 4 room-days
+
+
+def _room_night(day, qty, nights, revenue, rtype="standard"):
+    return {"timestamp": f"2026-06-{day:02d} 20:00:00", "room_type": rtype,
+            "quantity": qty, "nights": nights, "total_revenue": revenue,
+            "duration_hours": 0}
+
+
+def test_revpar_is_unaffected_by_stay_length():
+    """The invariant that makes RevPAR the cross-trade comparator.
+
+    Its denominator is room-*days*, so revenue per available room-day is a fair
+    question whether the room earned it from one guest or six.
+    """
+    rows = [_let(5, 1, 3, 9_000), _room_night(5, 3, 1, 45_000)]
+    blind = metrics.compute_room_metrics(rows, 4, 1)
+    aware = metrics.compute_room_metrics(rows, 4, 1, hours_by_type=_HOURLY)
+    assert blind.revpar == aware.revpar == 13_500.0
+    assert blind.revenue == aware.revenue
+    assert blind.occupancy_pct == 150.0 and aware.occupancy_pct == 75.0  # only this moved
+
+
+def test_configuring_nothing_leaves_every_figure_where_it_was():
+    """A hotel that only sells nights must be untouched by any of this."""
+    rows = [_room_night(5, 2, 3, 90_000)]
+    before = metrics.compute_room_metrics(rows, 8, 29)
+    after = metrics.compute_room_metrics(rows, 8, 29, hours_by_type={})
+    assert before == after
+    assert after.short_lets == 0 and after.has_short_stay is False
+
+
+def test_a_negotiated_duration_on_the_row_beats_the_type():
+    """Reconfiguring a type later must not rewrite what a past booking was."""
+    rows = [_let(5, 1, 1, 5_000, rtype="standard", hours=3)]
+    rm = metrics.compute_room_metrics(rows, 1, 1)      # 'standard' is nightly
+    assert rm.short_lets == 1                          # the row says otherwise
+    assert rm.room_nights_sold == 0
+    assert rm.room_hours_sold == 3.0
+
+
+def test_lets_never_spread_across_calendar_days():
+    """Three lets are three lets on one day, not one a day for three days."""
+    rows = [_let(5, 1, 3, 9_000)]                      # Friday 5 June
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=1,
+                                      hours_map=_HOURLY)
+    assert [b.lets for b in split.by_dow] == [0, 0, 0, 0, 3, 0, 0]
+    assert sum(b.nights_sold for b in split.by_dow) == 0
+
+
+def test_nights_still_spread_when_the_hotel_also_sells_hours():
+    rows = [_room_night(5, 1, 3, 60_000), _let(5, 1, 2, 6_000)]
+    split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=4,
+                                      hours_map=_HOURLY)
+    assert [b.nights_sold for b in split.by_dow] == [0, 0, 0, 0, 1, 1, 1]
+    assert [b.lets for b in split.by_dow] == [0, 0, 0, 0, 2, 0, 0]
+
+
+def _mixed(weekend_lets, weekday_lets, weekend_nights, weekday_nights,
+           let_rate=3_000, weekend_let_rate=None):
+    rows = []
+    for d in range(1, 29):
+        wknd = date(2026, 6, d).weekday() in metrics.WEEKEND_NIGHTS
+        lets = weekend_lets if wknd else weekday_lets
+        rate = (weekend_let_rate or let_rate) if wknd else let_rate
+        nights = weekend_nights if wknd else weekday_nights
+        if lets:
+            rows.append(_let(d, 1, lets, lets * rate))
+        if nights:
+            rows.append(_room_night(d, nights, 1, nights * 15_000))
+    return rows
+
+
+def test_each_trade_gets_its_own_verdict():
+    """Overnight can peak at the weekend while the hourly trade peaks midweek."""
+    split = metrics.compute_dow_split(
+        _mixed(weekend_lets=2, weekday_lets=6, weekend_nights=5, weekday_nights=2),
+        *_JUNE, total_rooms=8, hours_map=_HOURLY)
+    assert "Split the rate" in split.verdict            # overnight: raise weekend
+    assert "working-week business" in split.short_verdict  # hourly: do not
+    assert split.lets_gap_pct < 0
+
+
+def test_a_busy_weekend_at_a_flat_let_price_says_raise_the_let_price():
+    split = metrics.compute_dow_split(
+        _mixed(weekend_lets=8, weekday_lets=2, weekend_nights=0, weekday_nights=0),
+        *_JUNE, total_rooms=8, hours_map=_HOURLY)
+    assert "Raise the weekend let price" in split.short_verdict
+    assert split.verdict == ""              # no overnight trade to speak for
+
+
+def test_a_nightly_only_hotel_gets_no_hourly_verdict():
+    split = metrics.compute_dow_split(_weekly(8, 2), *_JUNE, total_rooms=10)
+    assert split.short_verdict == ""
+    assert "Split the rate" in split.verdict
+
+
+# ── Expense classification: two axes ──────────────────────────────────
+
+def _exp(account, category, amount, cls=None, review=False):
+    row = {"account": account, "category": category, "amount": amount}
+    if cls:
+        row["expense_class"] = cls
+    if review:
+        row["needs_review"] = True
+    return row
+
+
+def test_overhead_reaches_the_pnl_instead_of_vanishing():
+    """`== "bar"` and `== "rooms"` matched neither, so overhead left the P&L."""
+    pnl = metrics.compute_pnl(
+        [], [{"room_type": "std", "quantity": 1, "nights": 1, "total_revenue": 100_000}],
+        [_exp("overhead", "levies", 30_000)], {})
+    assert pnl.overhead_total == 30_000
+    assert pnl.total_outgoings == 30_000
+    assert pnl.net_profit == 70_000          # not 100_000
+    assert pnl.overhead.profit == -30_000    # it earns nothing
+
+
+def test_overhead_keeps_the_rooms_target_invariants():
+    """surplus == net_profit and bar_contribution == bar.profit, documented and pinned."""
+    sales = [{"drink_name": "coke", "quantity": 10, "total_revenue": 20_000}]
+    rooms = [{"room_type": "std", "quantity": 1, "nights": 1, "total_revenue": 100_000}]
+    exp = [_exp("bar", "salary", 10_000), _exp("rooms", "fuel", 20_000),
+           _exp("overhead", "levies", 30_000)]
+    cost = {"coke": 500}
+    pnl = metrics.compute_pnl(sales, rooms, exp, cost)
+    tgt = metrics.compute_rooms_target(sales, rooms, exp, cost)
+    assert tgt.surplus == pnl.net_profit
+    assert tgt.bar_contribution == pnl.bar.profit
+
+
+def test_capital_is_out_of_the_pnl_but_not_out_of_the_bank():
+    exp = [_exp("rooms", "maintenance", 20_000),
+           _exp("rooms", "maintenance", 115_000, cls="capital")]
+    pnl = metrics.compute_pnl(
+        [], [{"room_type": "std", "quantity": 1, "nights": 1, "total_revenue": 200_000}],
+        exp, {})
+    assert pnl.rooms.expense_total == 20_000     # the cable run is not a room cost
+    assert pnl.net_profit == 180_000
+    assert pnl.capital_spend == 115_000
+    assert metrics.capital_spend(exp) == 115_000
+
+
+def test_capital_reduces_the_cash_estimate():
+    """Excluding it from profit must not exclude it from the bank."""
+    exp = [_exp("rooms", "maintenance", 115_000, cls="capital")]
+    pos = metrics.compute_cash_position(
+        [], [], exp, [], [], stock_value=0, opening=500_000, anchor_dt=None,
+        cost_map={}, now=clock_now())
+    assert pos.capital_cash == 115_000
+    assert pos.cash == 385_000                  # 500,000 − 115,000
+
+
+def clock_now():
+    from datetime import datetime
+    return datetime(2026, 6, 29, 14, 30)
+
+
+def test_a_periodic_payment_is_a_reserve_draw_not_a_cost():
+    """The accrual carried the cost; charging the invoice too would double it."""
+    exp = [_exp("rooms", "maintenance", 90_000, cls="periodic")]
+    assert metrics.operating_expenses(exp) == []      # out of the P&L
+    assert metrics.periodic_spend(exp) == 90_000      # still out of the bank
+
+
+def test_legacy_rows_keep_their_old_behaviour():
+    """Restock/supplier were excluded by category before the class axis existed."""
+    assert metrics.expense_class({"category": "restock"}) == "inventory"
+    assert metrics.expense_class({"category": "supplier"}) == "inventory"
+    assert metrics.expense_class({"category": "fuel"}) == "operating"
+    assert metrics.operating_expenses([_exp("bar", "restock", 30_000)]) == []
+
+
+def test_an_unknown_class_falls_back_to_operating():
+    """Over-expensing understates profit — the safe way to be wrong."""
+    assert metrics.expense_class({"category": "fuel", "expense_class": "nonsense"}) == "operating"
+
+
+def test_an_unknown_account_falls_back_to_bar_as_the_schema_always_did():
+    assert metrics.expense_account({"account": "sideways"}) == "bar"
+    assert metrics.expense_account({}) == "bar"
+    assert metrics.expense_account({"account": "OVERHEAD"}) == "overhead"
+
+
+def test_review_rows_catch_unsure_and_misc():
+    rows = [_exp("rooms", "fuel", 1000), _exp("rooms", "misc", 4000),
+            _exp("bar", "consumables", 500, review=True)]
+    flagged = metrics.review_rows(rows)
+    assert len(flagged) == 2
+    assert all(r["category"] in ("misc", "consumables") for r in flagged)
+
+
+def test_overhead_salary_is_split_out_like_the_others():
+    """split_salary matches the exact string 'salary' — 'salaries' would not."""
+    pnl = metrics.compute_pnl([], [], [_exp("overhead", "salary", 25_000)], {})
+    assert pnl.overhead.salary == 25_000
+    assert pnl.overhead.other_expense == 0
+
+
+# ── Periodic accrual and the reserve ──────────────────────────────────
+
+def _ob(months=6, amount=90_000, start=date(2026, 1, 1), active=True, retired=None, oid=1):
+    return metrics.Obligation(oid, "Soakaway", "rooms", "maintenance",
+                              amount, months, start, active, retired)
+
+
+def test_a_bill_accrues_its_share_and_no_more():
+    ob = _ob()
+    assert ob.monthly_share == 15_000
+    assert metrics.accrued_for(ob, date(2026, 6, 1), date(2026, 6, 30)) == 15_000
+    # six months of accrual is exactly the bill — never more, never less
+    assert metrics.accrued_for(ob, date(2026, 1, 1), date(2026, 6, 30)) == 90_000
+
+
+def test_part_months_accrue_in_proportion():
+    ob = _ob()
+    assert metrics.accrued_for(ob, date(2026, 6, 1), date(2026, 6, 15)) == 7_500
+    assert metrics.accrued_for(ob, date(2026, 6, 5), date(2026, 6, 5)) == 500
+
+
+def test_nothing_accrues_before_the_bill_was_registered():
+    """Adding an obligation today must not rewrite last year's profit."""
+    ob = _ob(start=date(2026, 6, 1))
+    assert metrics.accrued_for(ob, date(2025, 1, 1), date(2025, 12, 31)) == 0.0
+    assert metrics.accrued_for(ob, date(2026, 5, 1), date(2026, 6, 30)) == 15_000
+
+
+def test_retiring_a_bill_stops_it_accruing_without_erasing_its_history():
+    """Reading the active flag alone wiped every accrual it had ever made."""
+    retired = _ob(active=False, retired=date(2026, 6, 30))
+    assert metrics.accrued_for(retired, date(2026, 1, 1), date(2026, 6, 30)) == 90_000
+    # and it stops there — the rest of the year adds nothing
+    assert metrics.accrued_for(retired, date(2026, 1, 1), date(2026, 12, 31)) == 90_000
+
+
+def test_a_retired_bill_no_longer_appears_in_new_accruals():
+    live = metrics.accrual_rows([_ob()], date(2026, 7, 1), date(2026, 7, 31))
+    dead = metrics.accrual_rows([_ob(active=False, retired=date(2026, 6, 30))],
+                                date(2026, 7, 1), date(2026, 7, 31))
+    assert len(live) == 1 and dead == []
+
+
+def test_accrual_rows_carry_a_real_account_so_they_flow_through_the_split():
+    rows = metrics.accrual_rows([_ob()], date(2026, 6, 1), date(2026, 6, 30))
+    pnl = metrics.compute_pnl([], [], rows, {})
+    assert pnl.rooms.expense_total == 15_000     # lands on rooms, not nowhere
+    assert pnl.net_profit == -15_000
+    assert rows[0]["id"] is None and rows[0]["accrual"] is True
+
+
+def test_paying_the_bill_empties_exactly_that_reserve():
+    ob = _ob()
+    paid = [{"account": "rooms", "category": "maintenance", "amount": 90_000,
+             "expense_class": "periodic", "obligation_id": 1,
+             "timestamp": "2026-06-30 00:00:00"}]
+    res = metrics.compute_reserve([ob], paid, date(2026, 6, 30))
+    assert res.accrued_total == 90_000
+    assert res.paid_total == 90_000
+    assert res.balance == 0.0
+    assert res.underfunded == ()
+
+
+def test_paying_early_reports_a_material_shortfall():
+    ob = _ob()
+    paid = [{"account": "rooms", "category": "maintenance", "amount": 90_000,
+             "expense_class": "periodic", "obligation_id": 1,
+             "timestamp": "2026-03-31 00:00:00"}]
+    res = metrics.compute_reserve([ob], paid, date(2026, 3, 31))
+    assert res.balance == -45_000                # three months short
+    assert [l.obligation.name for l in res.underfunded] == ["Soakaway"]
+
+
+def test_a_part_month_gap_is_timing_not_a_funding_problem():
+    """₦500 short on a ₦90,000 bill is the 29th of a 30-day month, not a warning."""
+    ob = _ob()
+    paid = [{"account": "rooms", "category": "maintenance", "amount": 90_000,
+             "expense_class": "periodic", "obligation_id": 1,
+             "timestamp": "2026-06-29 00:00:00"}]
+    res = metrics.compute_reserve([ob], paid, date(2026, 6, 29))
+    assert res.balance == -500
+    assert res.lines[0].funded is False          # it is short
+    assert res.lines[0].materially_short is False  # but not by enough to say so
+    assert res.underfunded == ()
+
+
+def test_an_unattributed_payment_still_drains_the_reserve():
+    """It is real money out; it just cannot be charged to a particular bill."""
+    paid = [{"account": "rooms", "category": "maintenance", "amount": 20_000,
+             "expense_class": "periodic", "timestamp": "2026-06-30 00:00:00"}]
+    res = metrics.compute_reserve([_ob()], paid, date(2026, 6, 30))
+    assert res.unlinked_paid == 20_000
+    assert res.paid_total == 20_000
+    assert res.balance == 70_000                 # 90,000 accrued − 20,000 drawn
+
+
+def test_the_cash_position_accrues_the_same_way_the_pnl_does():
+    """The same month read -4,500 on /report and +10,000 on /position."""
+    from datetime import datetime as _dt
+    rooms = [{"timestamp": "2026-06-05 15:00:00", "room_type": "std", "quantity": 2,
+              "nights": 3, "total_revenue": 90_000}]
+    exp = [{"timestamp": "2026-06-07 12:00:00", "account": "rooms",
+            "category": "fuel", "amount": 80_000}]
+    ob = _ob()
+    pos = metrics.compute_cash_position(
+        [], rooms, exp, [], [], stock_value=0, opening=0, anchor_dt=None,
+        cost_map={}, now=_dt(2026, 6, 30, 12, 0), obligations=[ob])
+    pnl = metrics.compute_pnl(
+        [], rooms, exp + metrics.accrual_rows([ob], date(2026, 6, 1), date(2026, 6, 30)), {})
+    assert pos.month_profit == pnl.net_profit == -5_000
+
+
+def test_a_hotel_with_no_register_accrues_nothing():
+    assert metrics.accrual_rows([], date(2026, 6, 1), date(2026, 6, 30)) == []
+    res = metrics.compute_reserve([], [], date(2026, 6, 30))
+    assert res.balance == 0.0 and res.monthly_total == 0.0
+
+
+# ── Irregular (one-off) costs and the contingency check ───────────────
+
+def test_a_one_off_stays_a_real_cost():
+    """Unlike capital, a dead compressor buys nothing — excluding it would lie."""
+    exp = [_exp("bar", "maintenance", 420_000, cls="irregular")]
+    assert len(metrics.operating_expenses(exp)) == 1
+    pnl = metrics.compute_pnl(
+        [], [{"room_type": "std", "quantity": 1, "nights": 1, "total_revenue": 1_000_000}],
+        exp, {})
+    assert pnl.net_profit == 580_000          # the money really was spent
+    assert pnl.irregular_spend == 420_000
+
+
+def test_underlying_profit_reads_the_month_without_the_breakdown():
+    exp = [_exp("rooms", "fuel", 300_000),
+           _exp("bar", "maintenance", 420_000, cls="irregular")]
+    pnl = metrics.compute_pnl(
+        [], [{"room_type": "std", "quantity": 1, "nights": 1, "total_revenue": 1_260_000}],
+        exp, {})
+    assert pnl.net_profit == 540_000          # what it actually made
+    assert pnl.underlying_profit == 960_000   # what it would have, if nothing broke
+    assert pnl.has_one_offs is True
+
+
+def test_a_month_with_no_one_offs_has_nothing_to_strip():
+    pnl = metrics.compute_pnl([], [], [_exp("rooms", "fuel", 300_000)], {})
+    assert pnl.has_one_offs is False
+    assert pnl.underlying_profit == pnl.net_profit
+
+
+def _months(n, events, revenue=1_260_000):
+    exp = [{"timestamp": f"2026-{mo:02d}-10 12:00:00", "account": "bar",
+            "category": "maintenance", "amount": amt, "expense_class": "irregular"}
+           for mo, amt in events]
+    rooms = [{"timestamp": f"2026-{mo:02d}-05 12:00:00", "total_revenue": revenue}
+             for mo in range(1, n + 1)]
+    from datetime import datetime as _dt
+    return metrics.compute_contingency(exp, [], rooms, 10, _dt(2026, n, 29))
+
+
+def test_contingency_sizes_the_buffer_from_what_actually_went_wrong():
+    c = _months(8, [(2, 420_000), (5, 90_000), (6, 150_000)])
+    assert c.months_observed == 8
+    assert c.total_irregular == 660_000
+    assert c.monthly_average == 82_500        # 660,000 / 8, no forecast anywhere
+    assert c.reliable is True
+
+
+def test_one_breakdown_in_one_month_is_not_a_monthly_rate():
+    """n=1 would recommend tripling the buffer off a single accident."""
+    c = _months(1, [(1, 420_000)])
+    assert c.months_observed == 1
+    assert c.reliable is False
+
+
+def test_contingency_compares_against_what_the_buffer_sets_aside():
+    c = _months(8, [(2, 420_000), (5, 90_000), (6, 150_000)])
+    assert c.buffer_monthly == 126_000        # 10% of 1,260,000
+    assert c.gap == 82_500 - 126_000
+    assert c.covered is True                  # comfortably
+
+    lean = _months(8, [(m, 200_000) for m in range(1, 8)])
+    assert lean.covered is False
+    assert lean.suggested_pct > lean.buffer_pct
+
+
+def test_contingency_never_averages_over_months_that_have_no_history():
+    """Three months of data averaged over twelve reports a quarter of the rate."""
+    c = _months(3, [(1, 300_000)])
+    assert c.months_observed == 3             # not 12
+    assert c.monthly_average == 100_000
+
+
+def test_contingency_with_nothing_tagged_says_so():
+    c = _months(8, [])
+    assert c.has_history is False
+    assert c.monthly_average == 0.0
+
+
+# ── Month-end verification: stocktake ─────────────────────────────────
+
+def _count(drink, expected, counted, cost=300, ts="2026-06-28 08:00:00", loc="bar"):
+    return {"drink_name": drink, "expected": expected, "counted": counted,
+            "variance": counted - expected, "cost_price": cost,
+            "timestamp": ts, "location": loc}
+
+
+def test_status_bands_read_the_ratio_not_the_units():
+    """3 short of 12 is a different event from 3 short of 600."""
+    assert metrics.variance_status(-0.5)[0] == "🟢"
+    assert metrics.variance_status(-2.0)[0] == "🟡"
+    assert metrics.variance_status(-5.0)[0] == "🔴"
+
+
+def test_a_surplus_is_flagged_never_treated_as_a_clean_count():
+    """More bottles than expected is the same leak seen from the other side."""
+    mark, note = metrics.variance_status(+10.0)
+    assert mark == "🔴"
+    assert "unrecorded" in note
+
+    vs = metrics.summarize_variance([_count("coke", 30, 33, 120)], {"coke": 120})
+    assert vs.surplus_units == 3
+    assert vs.clean is False                  # a surplus is not a clean count
+    assert vs.flagged and vs.flagged[0]["drink"] == "Coke"
+
+
+def test_shrinkage_is_reported_against_the_stock_that_went_out():
+    """₦2,000 short means nothing until you know what was sold."""
+    vs = metrics.summarize_variance(
+        [_count("heineken", 40, 34)], {"heineken": 300}, cogs=60_000)
+    assert vs.shrink_value == -1_800
+    assert vs.shrink_pct_of_cogs == 3.0
+
+
+def test_items_are_ordered_by_naira_lost_not_by_units():
+    """200 units of the cheapest drink can matter less than 4 of the best."""
+    vs = metrics.summarize_variance(
+        [_count("cheap", 500, 300, 10), _count("premium", 20, 16, 2_000)],
+        {"cheap": 10, "premium": 2_000})
+    assert vs.by_drink[0]["drink"] == "Premium"     # -8,000 beats -2,000
+    assert vs.by_drink[0]["units"] == -4
+
+
+def test_bar_and_store_are_measured_against_their_own_expectation():
+    rows = [_count("heineken", 12, 10, loc="bar"),
+            _count("heineken", 24, 24, loc="store")]
+    vs = metrics.summarize_variance(rows, {"heineken": 300})
+    assert vs.by_drink[0]["expected"] == 36         # both locations
+    assert vs.by_drink[0]["units"] == -2            # only the bar was short
+
+
+def test_a_month_with_no_count_reads_as_a_gap_not_as_zero_loss():
+    from datetime import datetime as _dt
+    rows = [_count("heineken", 40, 34, ts="2026-06-28 08:00:00")]
+    trend = metrics.variance_trend(rows, {"heineken": 300},
+                                   {(2026, 6): 60_000}, _dt(2026, 6, 29))
+    labels = [t[0] for t in trend]
+    assert labels == ["Apr", "May", "Jun"]
+    assert trend[0][1] is None and trend[1][1] is None   # skipped, not clean
+    assert trend[2][1] == 3.0
+
+
+# ── Month-end verification: room audit ────────────────────────────────
+
+def test_vacant_rooms_are_the_point_of_the_exercise():
+    rows = [{"timestamp": "2026-06-05 15:00:00", "room_type": "standard",
+             "quantity": 3, "nights": 1, "total_revenue": 45_000}]
+    d = metrics.build_audit_day(rows, date(2026, 6, 5), rooms_total=8)
+    assert d.nights_logged == 3
+    assert d.vacant == 5
+
+
+def test_capture_rate_below_the_floor_blocks_pricing_decisions():
+    r = metrics.compute_room_audit(3, 18, 21, 0, 0, adr=15_000, days_in_month=30)
+    assert r.capture_pct == 85.7
+    assert r.trustworthy is False
+    assert r.missing == 3
+    assert r.monthly_leak == 450_000        # 3/3 × 30 × 15,000
+
+
+def test_full_capture_is_trustworthy():
+    r = metrics.compute_room_audit(3, 21, 21, 0, 0, adr=15_000, days_in_month=30)
+    assert r.capture_pct == 100.0 and r.trustworthy is True
+    assert r.monthly_leak == 0.0
+
+
+def test_audit_days_are_drawn_from_the_whole_month_not_only_booked_days():
+    """A day with no entries is exactly the day worth auditing."""
+    import random
+    days = metrics.audit_days([], 2026, 4, 3, random.Random(1))
+    assert len(days) == 3
+    assert all(d.month == 4 for d in days)
+    assert len(set(days)) == 3              # no repeats
+
+
+def test_one_flat_rate_across_a_month_is_flagged():
+    """Real trade produces walk-ins, regulars and the odd favour."""
+    flat = [{"room_type": "standard", "quantity": 2, "nights": 1,
+             "total_revenue": 30_000, "timestamp": f"2026-06-{d:02d} 15:00:00"}
+            for d in range(1, 29)]
+    s = metrics.rate_spread(flat)[0]
+    assert s.distinct == 1 and s.nights >= 30
+    assert s.suspicious is True
+
+
+def test_a_normal_spread_of_rates_is_not_flagged():
+    mixed = [{"room_type": "standard", "quantity": 1, "nights": 1,
+              "total_revenue": r, "timestamp": f"2026-06-{d:02d} 15:00:00"}
+             for d, r in enumerate((15000, 12000, 15000, 14000, 15000), start=1)]
+    s = metrics.rate_spread(mixed)[0]
+    assert s.distinct == 3
+    assert s.mode_rate == 15_000
+    assert s.suspicious is False
+
+
+def test_a_flat_rate_over_a_handful_of_nights_is_not_yet_a_finding():
+    few = [{"room_type": "suite", "quantity": 1, "nights": 1, "total_revenue": 25_000,
+            "timestamp": f"2026-06-{d:02d} 15:00:00"} for d in range(1, 5)]
+    assert metrics.rate_spread(few)[0].suspicious is False

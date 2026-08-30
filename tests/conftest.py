@@ -90,6 +90,15 @@ def _dataset() -> dict:
         "transfers": [
             {"id": 1, "timestamp": "2026-06-06 08:00:00", "drink_name": "heineken", "quantity": 12, "recorded_by": "john"},
         ],
+        # Refused bookings. Weighted onto the Fri/Sat nights the fixture's only
+        # multi-night stay also occupies, so the weekend-demand branch of the
+        # pricing verdict is exercised; one row carries no type and no reason,
+        # which is what a rushed front-desk entry actually looks like.
+        "turnaways": [
+            {"id": 1, "timestamp": "2026-06-05 20:00:00", "created_at": "2026-06-05 20:00:00", "room_type": "standard", "quantity": 2, "reason": "fully booked", "recorded_by": "mary"},
+            {"id": 2, "timestamp": "2026-06-06 21:00:00", "created_at": "2026-06-06 21:00:00", "room_type": "deluxe",   "quantity": 1, "reason": "fully booked", "recorded_by": "mary"},
+            {"id": 3, "timestamp": "2026-06-23 19:00:00", "created_at": "2026-06-23 19:00:00", "room_type": "",         "quantity": 1, "reason": "",             "recorded_by": "john"},
+        ],
         # One shortage and one exact match, so the variance report exercises both branches.
         "stock_counts": [
             {"id": 1, "timestamp": "2026-06-21 08:00:00", "drink_name": "heineken", "expected": 14, "counted": 12, "variance": -2, "cost_price": 300, "note": "weekly count", "recorded_by": "john"},
@@ -122,6 +131,16 @@ _SETTINGS: dict = {"total_rooms": "8"}
 # the golden report exercises the happy path; the mismatch warning has its own test.
 _ROOM_TYPE_COUNTS: dict = {"standard": 6, "deluxe": 2}
 
+# Stay length per room type. Empty by default: the fixture hotel sells nights
+# only, which is what keeps every golden snapshot byte-identical. Tests that
+# need an hourly type patch this getter directly.
+_ROOM_TYPE_HOURS: dict = {}
+
+# The periodic-accrual register. Empty by default so the golden snapshots stay
+# byte-identical: a hotel that has registered no recurring bills accrues
+# nothing, and every existing figure is what it always was.
+_OBLIGATIONS: list = []
+
 
 @pytest.fixture(autouse=True)
 def patch_db_and_time(monkeypatch):
@@ -149,6 +168,11 @@ def patch_db_and_time(monkeypatch):
     monkeypatch.setattr(database, "get_outstanding_payables", fake_outstanding_payables)
     monkeypatch.setattr(database, "get_inventory_snapshots", fake_inventory_snapshots)
     monkeypatch.setattr(database, "get_all_room_type_counts", lambda: dict(_ROOM_TYPE_COUNTS))
+    monkeypatch.setattr(database, "get_all_room_type_hours", lambda: dict(_ROOM_TYPE_HOURS))
+    # Reads via targeted SQL, so it needs its own stub or it reaches for a live
+    # engine the moment any report computes profit.
+    monkeypatch.setattr(database, "get_obligations",
+                        lambda include_inactive=False: [dict(o) for o in _OBLIGATIONS])
     monkeypatch.setattr(reports, "datetime", _FrozenDateTime)
     monkeypatch.setattr(metrics, "datetime", _FrozenDateTime)
     monkeypatch.setattr(dashboard_data, "datetime", _FrozenDateTime)

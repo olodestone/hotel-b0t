@@ -327,3 +327,283 @@ def test_roomstats_flags_a_negative_goppar_with_no_baseline(monkeypatch):
     out = reports.generate_room_stats_report()
     assert "GOPPAR: ₦-603" in out
     assert "spent more than it earned" in out
+
+
+# ── Night-by-night split ──────────────────────────────────────────────
+
+def test_dow_split_report_current_month(snapshot):
+    snapshot("dow_split_month", reports.generate_dow_split_report())
+
+
+def test_dow_split_credits_a_stay_to_every_night_it_covers():
+    """The fixture's only multi-night stay checks in on a Friday for 3 nights."""
+    out = reports.generate_dow_split_report()
+    # Fri, Sat and Sun each carry it — a Friday check-in is not three Fridays.
+    for night in ("Fri", "Sat", "Sun"):
+        assert f"\n{night:<6} " in out
+    assert "Busiest: *Friday & Saturday & Sunday*" in out
+
+
+def test_dow_split_says_when_no_turnaways_were_ever_recorded(monkeypatch):
+    """A zero and an unmeasured zero are opposite findings, not the same one."""
+    real = reports.db.read_all
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [] if t == "turnaways" else real(t))
+    out = reports.generate_dow_split_report()
+    assert "Nothing recorded for this period" in out
+    assert "/turnaway" in out
+    assert "turned away*" not in out          # never prints a count it does not have
+
+
+def test_dow_split_flags_weekend_refusals_on_nights_already_full(monkeypatch):
+    """Refusals on sold-out weekend nights are the case for a weekend premium."""
+    rooms = [{"id": 1, "timestamp": f"2026-06-{d:02d} 15:00:00", "room_type": "standard",
+              "quantity": 8, "nights": 1, "price_per_night": 15000,
+              "total_revenue": 120000, "deleted_at": None}
+             for d in (5, 6, 12, 13, 19, 20, 26, 27)]        # every Fri & Sat
+    turnaways = [{"id": 1, "timestamp": "2026-06-05 20:00:00", "room_type": "standard",
+                  "quantity": 6, "reason": "fully booked"},
+                 {"id": 2, "timestamp": "2026-06-06 20:00:00", "room_type": "standard",
+                  "quantity": 5, "reason": "fully booked"}]
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: {"rooms": rooms, "turnaways": turnaways}.get(t, []))
+    out = reports.generate_dow_split_report()
+    assert "Split the rate" in out
+    assert "11 guests turned away" in out
+    assert "unmet demand at the weekend" in out
+
+
+# ── Hotels that also sell rooms by the hour ───────────────────────────
+
+def _hourly_hotel(monkeypatch, weekend_lets=5, weekday_lets=3):
+    """June 2026: a 2-room hourly trade alongside 6 overnight rooms."""
+    rooms = []
+    for d in range(1, 29):
+        wknd = date(2026, 6, d).weekday() in (4, 5)
+        lets = weekend_lets if wknd else weekday_lets
+        rooms.append({"id": 100 + d, "timestamp": f"2026-06-{d:02d} 14:00:00",
+                      "room_type": "short time", "quantity": 1, "nights": lets,
+                      "price_per_night": 3000, "total_revenue": lets * 3000,
+                      "deleted_at": None, "duration_hours": 0})
+        n = 5 if wknd else 3
+        rooms.append({"id": 200 + d, "timestamp": f"2026-06-{d:02d} 20:00:00",
+                      "room_type": "standard", "quantity": n, "nights": 1,
+                      "price_per_night": 15000, "total_revenue": n * 15000,
+                      "deleted_at": None, "duration_hours": 0})
+    monkeypatch.setattr(reports.db, "read_all", lambda t: {"rooms": rooms}.get(t, []))
+    monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {"short time": 2})
+    monkeypatch.setattr(reports.db, "get_all_room_type_counts",
+                        lambda: {"short time": 2, "standard": 6})
+
+
+def test_roomstats_reports_the_two_trades_apart(monkeypatch):
+    _hourly_hotel(monkeypatch)
+    out = reports.generate_room_stats_report()
+    assert "📈 *ADR:  ₦15,000*" in out              # the overnight rate, unblended
+    assert "avg ₦3,000 per let" in out
+    assert "Occupancy: 43.1%" in out                # never above 100% again
+    assert "Room-time used: 46.7%" in out
+    assert "• *Short Time* — per let ₦3,000" in out
+    assert "of its hours" in out                    # not "% full" for an hourly type
+
+
+def test_dow_split_gives_each_trade_its_own_verdict(monkeypatch):
+    """The two can disagree, and a single blended verdict would hide it."""
+    _hourly_hotel(monkeypatch, weekend_lets=2, weekday_lets=6)
+    out = reports.generate_dow_split_report()
+    assert "🛏 *Overnight:* Split the rate" in out
+    assert "🕐 *Hourly:* The hourly trade is a working-week business." in out
+    assert "Night  Use    Nights Lets" in out       # lets get their own column
+
+
+def test_dow_split_keeps_the_plain_table_for_a_nightly_only_hotel(monkeypatch):
+    _hourly_hotel(monkeypatch)
+    monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {})
+    out = reports.generate_dow_split_report()
+    assert "Night  Occ    ADR      RevPAR   Away" in out
+    assert "Lets" not in out
+    assert "Hourly:" not in out
+
+
+# ── Expense classification: the three report sections ─────────────────
+
+def _classified(monkeypatch):
+    rows = [
+        {"id": 1, "timestamp": "2026-06-03 09:00:00", "account": "bar", "category": "salary",
+         "amount": 50000, "description": "bar wages", "deleted_at": None},
+        {"id": 3, "timestamp": "2026-06-07 12:00:00", "account": "rooms", "category": "fuel",
+         "amount": 80000, "description": "diesel", "deleted_at": None},
+        {"id": 5, "timestamp": "2026-06-09 12:00:00", "account": "overhead", "category": "levies",
+         "amount": 15000, "description": "area levy", "deleted_at": None},
+        {"id": 7, "timestamp": "2026-06-11 12:00:00", "account": "rooms", "category": "maintenance",
+         "amount": 115000, "description": "new cable run", "expense_class": "capital",
+         "deleted_at": None},
+        {"id": 8, "timestamp": "2026-06-12 12:00:00", "account": "rooms", "category": "maintenance",
+         "amount": 90000, "description": "soakaway", "expense_class": "periodic",
+         "deleted_at": None},
+        {"id": 10, "timestamp": "2026-06-14 12:00:00", "account": "rooms", "category": "misc",
+         "amount": 4000, "description": "unlabelled", "deleted_at": None},
+    ]
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [dict(r) for r in rows] if t == "expenses" else [])
+    return rows
+
+
+def test_expense_report_splits_operating_capital_and_periodic(monkeypatch):
+    _classified(monkeypatch)
+    out = reports.generate_expense_report(for_month=(2026, 6))
+    assert "*① OPERATING — in the P&L*" in out
+    assert "*② CAPITAL SPEND — cash out, not a cost*" in out
+    assert "*③ RESERVE — periodic bills*" in out
+    assert "🏢 *OVERHEAD*" in out
+    # 50,000 bar + (80,000 fuel + 4,000 misc) + 15,000 overhead.
+    # Neither the 115,000 cable (capital) nor the 90,000 soakaway (periodic,
+    # a reserve draw) belongs in an operating total.
+    assert "*Operating total: ₦149,000*" in out
+    assert "*Capital total: ₦115,000*" in out
+    assert "1 entry flagged for review" in out
+
+
+def test_capital_is_named_in_full_not_lumped(monkeypatch):
+    """The repair-vs-replace question is per item; it cannot be asked of a total."""
+    _classified(monkeypatch)
+    out = reports.generate_expense_report(for_month=(2026, 6))
+    assert "`[7]` 2026-06-11  ₦115,000 — Rooms/Maintenance _new cable run_" in out
+
+
+def test_review_report_lists_large_entries_and_flagged_ones(monkeypatch):
+    _classified(monkeypatch)
+    monkeypatch.setattr(reports.db, "get_setting", lambda k, d="": d)
+    out = reports.generate_review_report(for_month=(2026, 6))
+    assert "do you now own something you did not own before" in out.lower()
+    assert "`[3]`" in out                         # diesel, at or above ₦50,000
+    assert "`[10]`" in out                        # Misc, flagged
+    assert "`[7]`" not in out                     # capital: already out of the P&L
+    assert "`[8]`" not in out                     # periodic: a reserve draw, not a cost
+    assert "`[1]`" in out                         # bar salary is 50,000 exactly
+    assert "entrys" not in out                    # the plural rule
+
+
+def test_review_report_says_so_when_there_is_nothing_to_check(monkeypatch):
+    monkeypatch.setattr(reports.db, "read_all", lambda t: [])
+    monkeypatch.setattr(reports.db, "get_setting", lambda k, d="": d)
+    out = reports.generate_review_report(for_month=(2026, 6))
+    assert "Nothing to review" in out
+
+
+def test_position_shows_capital_leaving_the_bank(monkeypatch):
+    real = reports.db.read_all
+    monkeypatch.setattr(reports.db, "read_all", lambda t: (
+        [{"id": 7, "timestamp": "2026-06-11 12:00:00", "account": "rooms",
+          "category": "maintenance", "amount": 115000, "description": "cable",
+          "expense_class": "capital", "deleted_at": None}]
+        if t == "expenses" else real(t)))
+    out = reports.generate_position_report()
+    assert "− Asset purchases:" in out
+    assert "₦115,000" in out
+
+
+# ── One-off costs ─────────────────────────────────────────────────────
+
+def test_report_shows_actual_and_underlying_when_something_broke(monkeypatch):
+    rooms = [{"id": i, "timestamp": f"2026-06-{d:02d} 15:00:00", "room_type": "standard",
+              "quantity": 3, "price_per_night": 15000, "nights": 1,
+              "total_revenue": 45000, "deleted_at": None}
+             for i, d in enumerate(range(1, 29))]
+    exp = [{"id": 2, "timestamp": "2026-06-07 12:00:00", "account": "rooms",
+            "category": "fuel", "amount": 300000, "description": "diesel", "deleted_at": None},
+           {"id": 3, "timestamp": "2026-06-14 12:00:00", "account": "bar",
+            "category": "maintenance", "amount": 420000, "description": "compressor",
+            "expense_class": "irregular", "deleted_at": None}]
+    monkeypatch.setattr(reports.db, "read_all", lambda t: {
+        "expenses": [dict(r) for r in exp], "rooms": [dict(r) for r in rooms]}.get(t, []))
+    out = reports.generate_full_report(for_month=(2026, 6))
+    assert "🌩 One-off costs:  ₦420,000" in out
+    assert "*Underlying:      ₦960,000*" in out
+    assert "*Net Profit:    ₦540,000*" in out      # actual is still the headline
+
+
+_ALLOC_ROOMS = [{"id": 1, "timestamp": "2026-06-05 15:00:00", "room_type": "standard",
+                 "quantity": 3, "price_per_night": 15000, "nights": 1,
+                 "total_revenue": 450000, "deleted_at": None}]
+
+
+def test_allocation_will_not_size_a_buffer_off_one_accident(monkeypatch):
+    exp = [{"id": 3, "timestamp": "2026-06-14 12:00:00", "account": "bar",
+            "category": "maintenance", "amount": 420000, "description": "compressor",
+            "expense_class": "irregular", "deleted_at": None}]
+    monkeypatch.setattr(reports.db, "read_all", lambda t: {
+        "expenses": [dict(r) for r in exp],
+        "rooms": [dict(r) for r in _ALLOC_ROOMS]}.get(t, []))
+    out = reports.generate_allocation_report(for_month=(2026, 6))
+    assert "Too little history to size a buffer from" in out
+    assert "setallocation buffer" not in out       # no advice off n=1
+
+
+def test_allocation_says_when_nothing_has_been_tagged(monkeypatch):
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [dict(r) for r in _ALLOC_ROOMS] if t == "rooms" else [])
+    out = reports.generate_allocation_report(for_month=(2026, 6))
+    assert "No one-off costs tagged yet" in out
+
+
+# ── Month-end verification ────────────────────────────────────────────
+
+def test_count_sheet_leaves_the_blanks_blank(monkeypatch):
+    """A sheet pre-filled with the expected figure is not a count."""
+    out = reports.generate_count_sheet()
+    assert "BAR   STORE  TOTAL" in out
+    grid = out.split("```")[1]
+    # The unit cost belongs on the sheet; the counts must not. Every item row
+    # ends in three empty blanks — nothing pre-filled to read off and tick.
+    item_rows = [l for l in grid.splitlines() if "____" in l]
+    assert item_rows
+    for row in item_rows:
+        assert row.count("____") == 3
+
+
+def test_variance_report_flags_a_surplus_rather_than_congratulating(monkeypatch):
+    counts = [{"id": 1, "timestamp": "2026-06-28 08:00:00", "drink_name": "coke",
+               "expected": 30, "counted": 33, "variance": 3, "cost_price": 120,
+               "location": "bar"}]
+    real = reports.db.read_all
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: counts if t == "stock_counts" else real(t))
+    out = reports.generate_variance_report(for_month=(2026, 6))
+    assert "🔺 *Surplus:" in out
+    assert "Not good news" in out
+    assert "No shortages recorded" not in out   # the old clean bill of health
+
+
+def test_a_month_with_no_stocktake_is_marked_unverified(monkeypatch):
+    real = reports.db.read_all
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [] if t == "stock_counts" else real(t))
+    for out in (reports.generate_full_report(for_month=(2026, 6)),
+                reports.generate_sales_report(for_month=(2026, 6))):
+        assert "UNVERIFIED" in out
+    variance = reports.generate_variance_report(for_month=(2026, 6))
+    assert "UNVERIFIED" in variance
+
+
+def test_a_counted_month_carries_no_warning():
+    out = reports.generate_full_report(for_month=(2026, 6))
+    assert "UNVERIFIED" not in out             # the fixture has June counts
+
+
+def test_variance_report_never_names_a_person(monkeypatch):
+    counts = [{"id": 1, "timestamp": "2026-06-28 08:00:00", "drink_name": "heineken",
+               "expected": 40, "counted": 34, "variance": -6, "cost_price": 300,
+               "location": "bar", "recorded_by": "zenobia"}]
+    real = reports.db.read_all
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: counts if t == "stock_counts" else real(t))
+    out = reports.generate_variance_report(for_month=(2026, 6))
+    assert "zenobia" not in out.lower()        # variance only, never who held the sheet
+
+
+def test_audit_sheet_prints_the_vacant_rooms(monkeypatch):
+    from datetime import date as _d
+    out = reports.audit_sheet([_d(2026, 6, 5)], 2026, 6)
+    assert "VACANT (per system)" in out
+    assert "shown vacant" in out

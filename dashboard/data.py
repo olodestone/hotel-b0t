@@ -21,9 +21,20 @@ from reports import (  # presentation label + setting keys + pct getters, shared
     _get_alloc_pcts,
     _get_profit_dist_pcts,
     _total_rooms,
+    _obligations,
+    _window_bounds,
     CASH_OPENING_KEY,
     CASH_OPENING_DATE_KEY,
 )
+
+
+def _period_accrual(for_date, for_month, all_time, rows_for_span=()):
+    """This period's periodic accrual, resolved exactly as the bot resolves it."""
+    obligations = _obligations()
+    if not obligations:
+        return []
+    start, end = _window_bounds(for_date, for_month, all_time, rows_for_span)
+    return metrics.accrual_rows(obligations, start, end)
 
 # Trailing window for the cash-cycle panel — matches reports._CCC_WINDOW_DAYS.
 CCC_WINDOW_DAYS = 30
@@ -124,6 +135,7 @@ def cash_position() -> metrics.CashPosition:
         sales_all, rooms_all, expense_all, draws_all, debtor_rows,
         stock_value=stock_value, opening=opening, anchor_dt=anchor_dt,
         cost_map=_cost_price_map(), now=clock.now(),
+        obligations=_obligations(),
     )
 
 
@@ -234,6 +246,10 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         }
     debtors = db.read_all("debtors")
 
+    # The dashboard reads the same numbers as the bot, so it accrues the same
+    # way — a web page disagreeing with Telegram is the failure metrics.py
+    # exists to prevent.
+    expenses = expenses + _period_accrual(for_date, for_month, all_time, rooms)
     pnl = metrics.compute_pnl(sales, rooms, expenses, cost_map)
     owed = metrics.summarize_outstanding(debtors)
 
@@ -299,7 +315,10 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         "trend_granularity": trend_granularity,
         "position": cash_position(),  # 'as of now', not period-filtered
         # Performance for the selected period …
-        "rooms_metrics": metrics.compute_room_metrics(rooms, _total_rooms(), period_days),
+        "rooms_metrics": metrics.compute_room_metrics(
+            rooms, _total_rooms(), period_days,
+            hours_by_type=db.get_all_room_type_hours()),
+        # `expenses` already carries this period's accrual (see above).
         "break_even": metrics.compute_break_even(sales, expenses, cost_map),
         "rooms_target": metrics.compute_rooms_target(sales, rooms, expenses, cost_map),
         "menu": metrics.menu_engineering(sales, stock, window_days=max(period_days, 1)),

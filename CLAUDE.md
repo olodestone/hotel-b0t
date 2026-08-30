@@ -83,6 +83,12 @@ across several hotels.
   jobs were built at startup on the old clock and would otherwise keep firing on
   it until a restart.
 
+The ⚙️ Manage → 📈 Insights callbacks (`_cb_insights_menu`,
+`_period_kwargs_for`) were reading `datetime.now()` — the server clock — so on
+Railway a period button tapped late at night in Lagos resolved "this month" and
+"this week" against UTC. Both now use `clock.now()` / `clock.today()`, and the
+two room views share `_period_kwargs_for()` so they cannot drift apart again.
+
 **Never call `datetime.now()` or `date.today()` in application code.** They read
 the server clock. The only survivors are `scripts/` (manual CLI tools, where
 server time is the right answer for a filename).
@@ -104,6 +110,7 @@ Two roles: `admin` and `staff`. Role lookup hits the `users` table on every requ
 **Staff can:**
 - `/sell_drink` — record drink sales (tracked with `recorded_by`)
 - `/room` — record room bookings
+- `/turnaway` — record guests turned away (no money moves; feeds `/roomstats dow`). Reached by tapping **🛏 Book Room → 🚪 No room free**, which costs no slot on the six-button staff keyboard
 - `/report`, `/stock`, `/summary`, `/history`, `/debtors` — view only
 
 **Admin only:**
@@ -114,7 +121,7 @@ Two roles: `admin` and `staff`. Role lookup hits the `users` table on every requ
 - `/count`, `/variance` — stocktakes and shrinkage
 - `/restock_credit`, `/payables`, `/pay_supplier` — supplier credit
 
-The five analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable); 🛏 Room Stats there opens a period picker (this week / last week / this month / all time) rather than jumping straight to the month. Supplier credit has its own **⚙️ Manage → 🧾 Suppliers** submenu — see below.
+The analysis reports are also reachable from **⚙️ Manage → 📈 Insights** (a submenu, so the Manage keyboard stays readable); 🛏 Room Stats there opens a period picker (this week / last week / this month / all time) rather than jumping straight to the month. Supplier credit has its own **⚙️ Manage → 🧾 Suppliers** submenu — see below.
 
 Staff cannot delete anything — audit trail is preserved. Mistakes are corrected by admin via `/delete` then re-entry.
 
@@ -124,8 +131,9 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | Command | Description |
 |---|---|
 | `/sell_drink <drink> <qty> <price> [YYYY-MM-DD]` | Record drink sale |
-| `/room <type> <qty> <price> <nights> [YYYY-MM-DD]` | Record room booking |
+| `/room <type> <qty> <price> <nights> [YYYY-MM-DD]` | Record room booking. Add `<n>h` (e.g. `3h`) for a one-off short let on an otherwise nightly room |
 | `/undo` | Reverse your own most recent sale or booking, within 2 minutes |
+| `/turnaway <how many> [type] [reason] [YYYY-MM-DD]` | Log guests you had no room for — demand that never became a booking |
 | `/report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Full financial report |
 | `/summary [YYYY-MM-DD]` | Daily overview with set-aside nudge |
 | `/stock` | Inventory table (store + bar columns) |
@@ -137,7 +145,7 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 |---|---|
 | `/sales_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Drink-level sales breakdown with cost & profit |
 | `/expense_report [today\|YYYY-MM-DD\|YYYY-MM\|all]` | Expense breakdown by category |
-| `/expense <room\|bar> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages. Draw-like categories (`drawings`, `owner`, `withdrawal`, …) are rejected and routed to `/draw` |
+| `/expense <rooms\|bar\|overhead> <category> <amount> [note] [YYYY-MM-DD]` | Record expense. Use `salary` as category for staff wages. Draw-like categories (`drawings`, `owner`, `withdrawal`, …) are rejected and routed to `/draw` |
 | `/draw <amount> [note] [YYYY-MM-DD]` | Record an owner withdrawal (equity draw). **Not** an expense — reduces cash, never profit |
 | `/draws [today\|YYYY-MM-DD\|YYYY-MM\|all]` | List owner draws for a period (newest first, with IDs) and the total drawn |
 | `/add_debtor <room\|bar> <name> <amount> [note] [YYYY-MM-DD]` | Log debtor |
@@ -153,7 +161,13 @@ Staff cannot delete anything — audit trail is preserved. Mistakes are correcte
 | `/roomstats [week\|lastweek\|period]` | Occupancy, ADR, RevPAR **and GOPPAR** read against the previous like-for-like period, with a raise/hold verdict, plus RevPAR split by room type |
 | `/setrooms <n>` | Record the lettable room count — the denominator for occupancy and RevPAR |
 | `/setrooms <type> <n>` | Rooms of one type — the denominator for **RevPAR per room type** |
+| `/setduration <type> <hours>` | Declare a room type **sold by the hour** — its units become lets, not nights. `24` puts it back to nightly. Applies retroactively |
+| `/review [period]` | Month-end check — entries at or above the capital threshold, plus anything flagged unsure. Also **⚙️ Manage → 🔎 Review** |
+| `/reclassify <id> <account\|class> <value>` | Correct one expense's classification in place. Amount, date and author untouched |
+| `/roomstats dow [period]` | Night-by-night split (occupancy/ADR/RevPAR per weekday) + turnaways, with a flat-rise vs weekend-premium verdict |
 | `/count <drink> <units> [note] [YYYY-MM-DD]` | Physical stocktake: logs the variance vs what the books expected, then corrects bar stock to the counted figure |
+| `/stocktake` | Month-end count sheet, then bar and store counts per item. Also **⚙️ Manage → 🧾 Month-End Verification** |
+| `/roomaudit` | Were all room-nights logged, at the rate charged? The bot draws the days |
 | `/variance [period]` | Shrinkage report built from stocktakes |
 | `/restock_credit <drink> <qty> <cost> <supplier> [YYYY-MM-DD]` | Receive stock on supplier credit. Stock in now, **no cash out** — trailing date is the due date |
 | `/payables` | Outstanding supplier invoices, soonest due first |
@@ -191,6 +205,10 @@ All date-filtered reports accept the same arguments:
 | `generate_cashcycle_report()` | `/cashcycle` |
 | `generate_menu_report()` | `/menu` |
 | `generate_room_stats_report()` | `/roomstats` |
+| `generate_dow_split_report()` | `/roomstats dow` |
+| `generate_review_report()` | `/review` |
+| `generate_count_sheet()` | `/stocktake` (step 1) |
+| `generate_room_audit_report()` | `/roomaudit` |
 | `generate_variance_report()` | `/variance` |
 | `generate_payables_report()` | `/payables` |
 
@@ -247,6 +265,142 @@ Caveat worth keeping in mind: Hotel 85's expense categories don't separate fixed
 
 `reports._yield_gap_note()` flags the trap the split exists for: the type charging the **most** per night being out-earned per room owned by a **cheaper** one. A cheap type yielding least is not the trap — that is just a cheap room — so the note fires only when the winner's ADR is lower and the gap clears `TREND_BAND`.
 
+### Night-by-night split (⚙️ Manage → 📈 Insights → 🗓 Night by Night, or `/roomstats dow`)
+
+A period's RevPAR is one number, and a hotel that is full every Friday and half
+empty every Tuesday reports a middling occupancy that describes neither night.
+**⚙️ Manage → 📈 Insights → 🗓 Night by Night** (period picker, same four
+choices as 🛏 Room Stats) splits the same window across the seven weekdays so a
+rate decision can be made on the shape of demand rather than its average. The
+report carries a **🚪 Log a turnaway** button at its foot, so the screen that
+says "nothing recorded" is one tap from fixing that.
+
+Two corrections make the split honest, and both are load-bearing:
+
+1. **A booking is not one night.** A `rooms` row carries a start `timestamp`, a
+   `nights` count and a `quantity`; crediting the whole stay to the weekday it
+   *began* on would put a Friday check-in's Sunday night on Friday.
+   `metrics.expand_room_nights()` explodes every row onto the calendar nights it
+   actually occupies. The report widens its row scan back `_MAX_STAY_LOOKBACK`
+   days so a stay that began before the window still counts for the nights
+   inside it, and `compute_dow_split` clips to `[start, end]` afterwards.
+2. **Each weekday divides by its own denominator.** A window rarely holds equal
+   numbers of each weekday, so a Friday's occupancy is `nights sold / (rooms ×
+   number of Fridays)` — never an even share of the period.
+
+The revenue apportioned to a night spans **all** rooms in its booking, not one:
+multiplying it by `quantity` again squares the room count and reports an ADR
+several times the rate actually charged. There is a regression test pinning it.
+
+**The verdict** (`metrics._pricing_shape()`) reads the occupancy gap in
+percentage *points* against whether the weekend already carries a rate premium:
+
+| | weekend priced the same | weekend already at a premium |
+|---|---|---|
+| **weekend ≥10pt fuller** | split the rate — raise the weekend, hold the weekday | premium is working; the weekday nights are the problem, and need volume not price |
+| **occupancy level** | flat rise is the right shape | flat rise; no demand gap left for a wider split |
+| **weekend ≥10pt emptier** | a weekend premium is not justified — this is a business/stopover trade, price the weekday as the peak | — |
+
+Nights tied on occupancy are named together (`Friday & Saturday`) and suppressed
+past three: picking between identical nights states a difference the numbers do
+not contain.
+
+Both bands need at least `metrics.MIN_BAND_NIGHTS` (2) nights before any verdict
+is issued. `/roomstats dow today` on a Friday has *no* working-week nights to be
+busier than, and without the guard returned "raise your weekend rates" off a
+single booking; it now says the window is too short and names what it holds.
+
+**Turnaways — the half occupancy cannot see.** A night at 100% looks identical
+whether one guest was refused or twenty, and only the second says the rate is
+too low. Nothing in the books can infer this, so it is recorded directly. Two tap paths reach the
+same `ta_conv` flow — how many → what type → why, all buttons:
+
+| Who | Path | Why there |
+|---|---|---|
+| Staff | **🛏 Book Room → 🚪 No room free — log a turnaway** | the exact moment a turnaway is discovered — you go to book someone in and there is nothing free. Costs no slot on the staff keyboard, which is full at six by design |
+| Admin | **⚙️ Manage → 🚪 Turnaway** | admins have no 🛏 Book Room button, and at this hotel the front desk is often an admin account |
+
+Both buttons carry the same `ta:start` callback straight into the conversation's
+entry point, so there is one flow rather than two that can drift.
+
+Its entry button deliberately carries a **`ta:start`** callback rather than a
+`bt:` one. The booking conversation's room-type state only claims `^bt:`, so the
+tap falls straight through to `ta_conv`'s entry point instead of needing a
+second tap to escape the booking flow.
+
+`/turnaway <how many> [type] [reason] [YYYY-MM-DD]` still types it in one line,
+and a bare `/turnaway` offers the button. The `turnaways` table touches no
+money: no revenue, no expense, no stock movement, and it is outside every P&L
+path by construction.
+
+The report prices refusals at the ADR **actually achieved**, which is the honest
+floor — pricing them at a raised rate would assume the very rise the screen
+exists to test. When nothing has ever been recorded it says so rather than
+printing a zero: no turnaways and no turnaway *tracking* are opposite findings.
+Refusals concentrated on nights already ≥70% full are flagged as the clearest
+case for a weekend premium; refusals on quiet nights point at the wrong room
+*type* rather than the price.
+
+Backdating works as everywhere else, so a tally kept on paper can be entered
+after the fact.
+
+### Not every let is a night (hourly rooms)
+
+Hotel 85 also sells rooms by the hour — a guest takes a room for one, two or
+three hours rather than overnight. These are recorded against the **same**
+`rooms` table with `nights=1`, so before this was modelled the `nights` column
+was silently carrying two different units. Read as nights, hourly lets wreck two
+figures and **only** two:
+
+- **Occupancy** — a room let three times in a day reported *300% of itself*;
+  hotel-wide occupancy went over 100%.
+- **ADR** — a ₦3,000 two-hour let averaged with a ₦15,000 overnight stay to
+  produce ₦9,000, a rate the hotel never charged for anything.
+
+**RevPAR and GOPPAR were never wrong.** Their denominator is room-*days*, and
+revenue per available room-day is a fair question whether the room earned it
+from one guest or six. That is exactly why they remain the cross-trade
+comparator: it is the one line the two trades can be added up on.
+
+**The model.** Every room type has a stay length in hours
+(`settings.roomtype_hours:<type>`), set from **⚙️ Manage → ⚙️ Settings → 🕐 Stay
+Length** (the `ssl_conv` flow: pick the type, then 1h/2h/3h/6h/🌙 full night, or
+type your own) or with `/setduration <type> <hours>`. Types are picked **by
+index** for the same reason as room counts — "short time" has a space in it and
+cannot ride in `callback_data`. The booking keyboard labels an hourly type
+`₦3,000/2h let` rather than `/night`, so the front desk sees which trade it is
+booking into. Anything below
+`metrics.NIGHT_HOURS` (24) is an *hourly* type:
+
+| | nightly type | hourly type |
+|---|---|---|
+| `rooms.nights` means | nights | **lets** |
+| counted in | `room_nights_sold` | `short_lets` |
+| its rate | `adr` (per night) | `arl` (per let) |
+| its fill | `occupancy_pct` (nights / room-days) | `utilization_pct` (hours / room-hours) |
+| spreads across days? | yes — a 3-night stay covers 3 days | **no** — 3 lets are 3 lets on one day |
+
+`metrics.stay_hours(row, hours_map)` resolves it: a duration stored on the row
+wins, otherwise the type's setting, otherwise 24. That ordering is what makes
+the fix **retroactive** — declaring "short time is 2 hours" once reinterprets
+every historical booking correctly, so nothing needs backfilling. `rooms.duration_hours`
+exists for the negotiated one-off (`/room standard 1 5000 1 3h`) and is stored
+so reconfiguring a type later can never rewrite what a past booking actually was.
+
+**A hotel that configures nothing is untouched.** With an empty hours map every
+type is nightly and every figure is what it always was — pinned by
+`test_configuring_nothing_leaves_every_figure_where_it_was` and by the
+golden-master snapshots, which did not move when this landed.
+
+**Two trades, two verdicts.** `/roomstats dow` computes the rate verdict
+separately for each and prints both, because they routinely disagree: overnight
+demand peaks at the weekend far more reliably than hourly demand does, and a
+single blended verdict would hide it. The hourly trade's volume is measured in
+**lets per day** (normalised for the differing band lengths), not occupancy — an
+hourly room's ceiling is how many times it can be turned over, not whether it is
+full at midnight. Each verdict is suppressed when its trade has no activity, so
+a nightly-only hotel sees exactly one.
+
 ### Cash conversion cycle (`/cashcycle`)
 
 `CCC = DIO + DSO − DPO`, in days: how long cash is trapped between paying for stock and banking the proceeds. This is what explains a profitable month with an empty account. All of it lives in `metrics.compute_working_capital()`, which takes **all-time** rows and applies the trailing window internally so the three legs can never be windowed inconsistently.
@@ -287,6 +441,362 @@ Record with category `salary`:
 /expense rooms salary 45000 rooms staff wages march
 ```
 All reports pull salary out into its own line separate from other expenses. The allocation report warns if the salary bill exceeds the safe-to-use profit.
+
+## Expense classification — two axes
+
+Every expense is classified on **two independent axes** before it saves. They
+answer different questions and neither substitutes for the other.
+
+**AXIS 1 — `account`: whose cost is it?**
+
+| | |
+|---|---|
+| `rooms` | disappears if rooms stopped being let |
+| `bar` | disappears if the bar closed |
+| `overhead` | serves the whole business, or neither department |
+
+Overhead is **not** a bucket for anything shared-ish. Two deliberate exceptions,
+both decided by the owner and both load-bearing:
+
+- **Salaries stay on the department that causes them.** The barman is a bar
+  cost. `compute_rooms_target` is built on the bar carrying its own staff and
+  `compute_break_even` is bar-only on every side; moving wages to overhead
+  inflates bar contribution, makes break-even look far easier than it is, and
+  drops the room target. Overhead/Salary is for genuinely shared staff — the
+  night watchman, not the barman. The category string is `salary` on **all
+  three** accounts, because `split_salary()` matches that exact word; "salaries"
+  would silently stop being a salary.
+- **Diesel stays on rooms.** The generator does serve the bar, so by the strict
+  Axis-1 test it is overhead — but `compute_rooms_target` names diesel
+  explicitly as a shared cost that room revenue carries, and moving it would
+  make rooms GOPPAR jump and break comparability with every prior month.
+
+**AXIS 2 — `expense_class`: what kind of spend is it?**
+
+| class | meaning | reaches the P&L? |
+|---|---|---|
+| `operating` | bought again next month, consumed in the month | yes |
+| `irregular` | a one-off nobody could have forecast | yes — **tagged** (see below) |
+| `periodic` | recurs every 3–12 months | as an accrual, not as the row |
+| `capital` | creates or replaces an asset lasting 12+ months | **no** — cash only |
+| `inventory` | stock for resale | **no** — cash only |
+
+This is a separate column, **not a category value**. A category holds one
+string, so "Maintenance that happens to be capital" could only be recorded by
+giving up the category. `metrics.operating_expenses()` is the single gate: one
+filter, so no report can drift out of agreement with another.
+
+`metrics.expense_class()` tolerates rows written before the axis existed. Rather
+than running the old category-based exclusion alongside the new one, the legacy
+rule is expressed *as* a class — `restock`/`supplier` rows resolve to
+`inventory`, everything else to `operating`. An unknown class also falls back to
+`operating`: over-expensing understates profit, which is the safe way to be wrong.
+
+### The overhead account was silently deleting money
+
+`compute_pnl` filtered `account == "bar"` and `account == "rooms"`. An overhead
+row matched **neither**, so it left the P&L entirely and profit was overstated
+by its full amount — worse than landing in Misc, because nothing showed. Worse
+still, `compute_rooms_target` filters `!= "bar"`, so it *did* count it, breaking
+the documented `surplus == net_profit` invariant by exactly the overhead. `PnL`
+now carries a third `overhead: AccountPnL` (revenue 0, profit = −cost) and both
+invariants are pinned by tests.
+
+### Capital: out of the P&L, not out of the bank
+
+Capital is excluded from profit, every margin and GOPPAR — but the money left
+the account, so `compute_cash_position` subtracts `capital_cash` alongside stock
+purchases and draws. Excluding it from both would report money already spent.
+
+**The capital test is enforced, not trusted.** An item is capital only if it
+still exists in 12 months **and** costs at least the threshold
+(`settings.capital_threshold`, default ₦50,000 — Naira and policy, so it is a
+setting). Below the threshold the Capital button is simply **not rendered**, and
+`process_expense` rejects it server-side, so no classification can quietly pull
+a small purchase out of the P&L.
+
+**Known limitation:** capital never enters the P&L at all, so there is no
+depreciation. A ₦115,000 cable run lasting five years really costs ~₦23k/year,
+and without depreciation GOPPAR flatters permanently. This is a deliberate
+simplification at this size — read GOPPAR as *before capital consumption*.
+
+### Costs nobody can predict
+
+The accrual register handles bills you can name. Nobody can name the compressor
+that fails next March — there is no expected amount to divide and no interval to
+divide it over. Left as `operating` such a cost lands on one month in full:
+
+```
+normal month     Net Profit: ₦760,000
+compressor dies  Net Profit: ₦340,000
+```
+
+Identical trading, a 55% collapse. So `irregular` exists, and it is handled
+without forecasting anything.
+
+**It stays in the P&L.** A dead compressor buys nothing, so unlike capital it is
+a genuine cost of the business and excluding it would overstate profit. It is
+*tagged*, not removed, which lets `/report` show the month two ways:
+
+```
+📈 *Net Profit:    ₦340,000*
+  Net Margin:      27.0%
+  🌩 One-off costs:  ₦420,000
+  *Underlying:      ₦760,000*  (60.3%)  — if nothing had broken
+```
+
+`PnL.underlying_profit` is `net_profit + irregular_spend`. It is printed
+**beneath** the actual figure and never instead of it — the money really was
+spent; this answers the different question of whether the month traded badly or
+something simply broke.
+
+**Deliberately not accrued.** Accruing a guess while the real cost also lands in
+the P&L would charge it twice — the trap `periodic` avoids by leaving the P&L
+entirely. There is nothing honest to divide, so nothing is divided.
+
+**The buffer is sized from history instead** (`metrics.compute_contingency`,
+shown in `/allocation`). What the unforeseeable has *actually* cost per month
+over a trailing window is compared with what the existing `buffer` allocation
+sets aside. Self-calibrating, no prediction, and it plugs into the allocation
+system that already exists rather than building a second reserve:
+
+```
+🌩 Contingency check (last 8 months)
+    One-offs have cost ₦82,500/month on average
+    Your 10% buffer sets aside ₦126,000/month
+    ✅ Covered, with ₦43,500/month to spare.
+```
+
+Three things keep it honest:
+
+- **`months_observed` counts real history, not the window.** Averaging three
+  months over twelve reports a quarter of the true rate and tells the owner they
+  are comfortably covered.
+- **Below `MIN_CONTINGENCY_MONTHS` (6) it refuses to advise.** One breakdown in
+  one month averages to that breakdown every month forever; recommending a
+  tripled buffer off n=1 is worse than saying "not enough history yet".
+- **It is advisory.** It reports the gap and names the percentage that would
+  close it (`/setallocation buffer 12`), but never changes the allocation
+  itself. Silently re-sizing something the owner set deliberately is how a tool
+  stops being trusted.
+
+Tagging happens at entry (**🌩 One-off — couldn't have seen it coming**) or
+afterwards from **⚙️ Manage → 🔎 Review**, which now asks two questions of every
+large entry: do you own something new (capital?), and could you have forecast it
+(one-off?).
+
+### Periodic accrual and the reserve
+
+A bill landing every six months is a cost of **all six**. Charging it to the
+month it happens to fall in makes that month look like a disaster and the other
+five look better than they were — the distortion that makes an owner mistrust
+their own P&L. So the cost and the payment are separated:
+
+| | |
+|---|---|
+| **accrual** | `expected_amount ÷ months`, charged to the P&L every month |
+| **reserve** | what those accruals have built up, minus what has been drawn |
+| **payment** | the real invoice: cash out, a draw against the reserve, **not a cost** |
+
+`periodic` is therefore **not** in `PNL_CLASSES`. A periodic expense row leaves
+the P&L entirely; the accrual carries the cost instead. Counting both would
+charge the bill twice.
+
+**The accrual is computed, never stored.** `metrics.accrual_rows()` derives it
+from the register on every read. Storing monthly accrual rows would need a
+scheduler and would double-count on any re-run; computing it means any window,
+including a historical one, gives the same answer every time. The rows are
+synthesised with a real account and category, so they flow through the
+Bar/Rooms/Overhead split, the salary split and the category breakdown untouched
+— GOPPAR, margins and the allocation all see the cost without any of them
+knowing accrual exists. They carry `id: None` and `accrual: True`, so the
+expense report renders them as `🔁 accrual` rather than a tappable entry.
+
+Accrual is **pro-rated by days within each month**: a full month charges exactly
+the monthly share, half a month half of it, an all-time window one share per
+month since the bill started. That is what lets `/summary` (one day) and
+`/report` (one month) agree instead of one of them having to skip it.
+
+**Two boundaries, both dates rather than flags:**
+
+- Nothing accrues before `start_date` — registering a bill today must not
+  retroactively rewrite months already reported.
+- Nothing accrues after `retired_on` — but **everything before it still does**.
+  Reading the `active` flag inside `accrued_for` was a bug: retiring a bill
+  erased every accrual it had ever made, flipping the reserve to −₦90,000 and
+  silently changing past months' profit. `set_obligation_active` stamps the
+  date; retirement is never a delete.
+
+**The reserve is a running balance**, so `compute_reserve()` reads *all-time*
+rows — windowing it would report the month's movement as the whole pot. A
+payment with no `obligation_id` still drains it (real money left) but is
+reported as `unlinked_paid` rather than charged to whichever bill sorted first.
+
+`ReserveLine.materially_short` is what the ⚠️ warning fires on, not `funded`: on
+the 29th of a 30-day month the reserve is one day light by construction, and
+warning about ₦500 on a ₦90,000 bill trains the owner to ignore the warning. A
+gap has to exceed one monthly share to count.
+
+**Every surface that computes profit must accrue**, or two screens disagree.
+`reports._with_accrual()` and `_period_accrual()` (dashboard) are the shared
+entry points; `compute_cash_position` takes `obligations` and accrues its two
+windows internally (all-time and this month). This was got wrong once: the
+accrual reached `/report` but not `/position`, and the same month read **−₦4,500
+on one screen and +₦10,000 on the other**. There is a regression test pinning
+`pos.month_profit == pnl.net_profit`.
+
+**Tap path: ⚙️ Manage → 🔁 Periodic.**
+
+| Button | Flow | What it does |
+|---|---|---|
+| ➕ Register a bill | `pob_conv` — name → cost → frequency → account | starts it accruing from this month |
+| 💸 Pay one | `ppy_conv` — pick bill → amount | writes a `periodic` expense linked to that obligation |
+| 📋 Reserve detail | `_cb_reserve_detail` | section ③ of the expense report — no second view of the same numbers |
+
+The frequency buttons show the monthly share live (`Every 6 months — ₦15,000/mo`),
+so the consequence of the choice is visible before it is made. A bill recurring
+monthly or more often is refused: that is just an operating expense.
+
+### Report sections (`/expense_report`)
+
+1. **① OPERATING** — operating rows + the periodic **accrual**, split Bar / Rooms / Overhead
+2. **② CAPITAL SPEND** — listed per item, never lumped: the repair-vs-replace
+   question is per item and cannot be asked of a total
+3. **③ RESERVE** — per bill: set aside, paid, balance; plus what was drawn this period
+
+GOPPAR and net margin come from section ① only.
+
+### Month-end check (⚙️ Manage → 🔎 Review, or `/review`)
+
+Two lists, because they are two different mistakes. **Large entries** (≥ the
+capital threshold, still in the P&L) get the repair-vs-replace question asked of
+them once — the same tradesman produces a repair and an asset and the invoice
+looks identical, so the question is never *who was paid* but *do I now own
+something I did not own before*. **Flagged entries** are ones the person
+recording them already said they were unsure about (the "🔎 Not sure" button
+records `operating` + `needs_review`; Misc is treated as flagged too).
+
+Reclassification is **in place** — `db.reclassify_expense()` changes account,
+category or class and never touches the amount, date or author. Without it the
+month-end check would be advice with no button behind it, since the only other
+option is delete-and-rekey, which loses the original timestamp.
+⚙️ Manage → 🔎 Review → ✏️ Reclassify, or `/reclassify <id> <account|class> <value>`.
+
+### Entry flow (⚙️ Manage → 💸 Expense)
+
+account → **category (per account)** → amount → **class** → note → date.
+
+The class step comes *after* the amount because the capital test needs it. At or
+above the threshold the prompt puts the repair-vs-replace question directly. The
+category keyboard is account-aware and carries the full map — Pest Control and
+Linen included — because a category that needs typing gets a near-miss picked
+instead, which is the same failure as a fixed enum by another route.
+
+### Migration
+
+Existing rows default to `operating` on their current account, which is correct
+by the "safe way to be wrong" rule. But **past capital purchases remain inside
+historical P&L**, so months before the cut-over are not comparable with months
+after it. Run `/review all` once to find and reclassify them.
+
+## Month-end verification (`/stocktake`, `/roomaudit`)
+
+Every other number in this system is the books confirming their own arithmetic.
+These two commands are the only independent observations the business has, and
+both are run on the last day of the month, before any report.
+
+**⚙️ Manage → 🧾 Month-End Verification** shows whether each has been done and
+opens all four steps.
+
+### `/stocktake`
+
+**The count sheet leaves the blanks blank.** `generate_count_sheet()` prints
+item, unit cost and the date of the last count, then three empty columns. A
+sheet pre-filled with what the books expect is not a count — whoever carries it
+reads the expected figure and ticks it, and the one independent observation is
+gone. Pinned by a test asserting every item row ends in three blanks.
+
+**Bar and store are counted separately.** `stock_counts.location` splits them
+into two rows, each measured against its own expectation, and
+`record_stock_count()` trues up `current_stock` or `store_stock` accordingly —
+writing a store count into `current_stock` would move phantom units onto the bar
+shelf. A single combined total cannot tell a transfer from a loss.
+
+**Status is read as a ratio, never in units** — 3 short of 12 is a different
+event from 3 short of 600:
+
+| band | status |
+|---|---|
+| 0 to −1% | 🟢 normal handling |
+| −1 to −3% | 🟡 watch |
+| worse than −3% | 🔴 flag |
+| **any surplus** | 🔴 **flag** |
+
+**A surplus is never good news.** More units than the books expect means sales
+went unrecorded or a purchase was logged twice — the same leak seen from the
+other side. The old report said *"✅ No shortages recorded — every count matched
+or ran over"*, which read an overage as a clean bill of health; it now flags it
+and says to investigate it like a shortage. `VarianceSummary.clean` requires
+both `shrink_units` and `surplus_units` to be zero.
+
+**Shrinkage is reported against the stock that went out** (`shrink_pct_of_cogs`)
+— ₦2,000 short means nothing until you know whether ₦40,000 or ₦4m was sold.
+Items are ordered by **naira lost, not units**: 200 of the cheapest drink can
+matter less than 4 of the best. `variance_trend()` puts the last three months
+side by side, and a month with **no count shows as a dash, not as zero loss**.
+
+**A month with no stocktake is UNVERIFIED**, and `_verification_note()` stamps
+that on `/report` and `/sales_report` as well as the variance report itself.
+(The spec also says not to *generate* the bar report at all until the count is
+done. I mark rather than block: a running business that cannot see its numbers
+is worse off than one told the numbers are unverified, and the spec's own
+fallback is the marking. Change it if you disagree.)
+
+**Variance is reported, never attribution.** No count is tied to a person in any
+output — the figure is about the process, and naming whoever held the sheet
+turns a control into an accusation. `recorded_by` is stored but never rendered;
+there is a test for it.
+
+### `/roomaudit`
+
+Confirms every room-night was logged, at the rate charged.
+
+**The bot draws the days** — `metrics.audit_days()` with `random.SystemRandom`,
+never seeded from anything the operator supplies. Days a person picks are days
+they remember clearly, and those are the days most likely to be correct: the
+sample would be biased toward a clean result. Days are drawn from the whole
+month, **not only from days that already carry bookings** — a day with no
+entries at all is precisely the day worth auditing.
+
+**The vacant lines are the exercise.** `audit_sheet()` prints every room on each
+sampled date, occupied and vacant, because an occupied room that was logged
+proves nothing. A room the system swears was empty is where an unlogged night
+hides.
+
+**The corrections are asked as a delta, not an absolute.** "How many nights
+were actually occupied" forces mental arithmetic against a figure the bot
+already knows; "how many did it miss" is nearly always a small number, so it is
+a tap (`✅ None — all logged` / `+1` / `+2` / `+3` / … / `✏️ Other`). Rate
+variance is the same shape — `✅ Every rate matched` covers the usual case.
+
+**Stock counts are deliberately typed.** There is no "✓ matches the books"
+button, and there must not be: it is the pre-filled-sheet problem in another
+form, inviting the expected figure to be entered without anything being
+counted. Typing the number is the one place friction is protective.
+
+**Capture rate gates pricing.** Below `metrics.CAPTURE_FLOOR` (95%) the report
+refuses to let a pricing decision proceed: a rate rise on nights you are not
+collecting widens the gap rather than closing it. `monthly_leak` scales the gap
+to a month at the **ADR actually achieved** — deliberately not at a raised rate,
+which would assume the very increase the audit exists to make safe. Audits are
+stored in `room_audits` and reported as a trend.
+
+**The rate-spread check runs on the full month, always, and needs no audit
+input at all.** Per room type it reports min, max, mode and the count of
+distinct rates. `distinct == 1` across 30+ room-nights is 🔴: real trade
+produces walk-ins, regulars, negotiated stays and the odd favour, so a perfectly
+flat rate means discounts are going off-book or rates are not captured as
+charged.
 
 ## Allocation System
 
@@ -393,17 +903,20 @@ survives, and drink sales restore bar stock on the way out.
 | Table | Key columns |
 |---|---|
 | `sales` | `id`, `timestamp`, `created_at`, `drink_name`, `quantity`, `selling_price`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at` |
-| `rooms` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at` |
-| `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description` |
+| `rooms` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `price_per_night`, `nights`, `total_revenue`, `recorded_by`, `deleted_by`, `deleted_at`, `duration_hours` — `nights` is really *stay units* (nights, or lets for an hourly type); `duration_hours` of 0 defers to the room type |
+| `expenses` | `id`, `timestamp`, `account`, `category`, `amount`, `description`, `expense_class`, `needs_review`, `obligation_id` — `account` is now `bar`/`rooms`/**`overhead`**; `expense_class` is the second axis and decides whether the row reaches the P&L at all |
 | `owner_draws` | `id`, `timestamp`, `amount`, `account`, `description`, `recorded_by`, `deleted_by`, `deleted_at` — owner equity withdrawals, deliberately separate from `expenses` |
 | `debtors` | `id`, `timestamp`, `account`, `name`, `amount`, `amount_paid`, `description`, `status`, `paid_at` |
 | `debtor_payments` | `id`, `debtor_id`, `timestamp`, `amount`, `recorded_by` — one row per payment event |
 | `inventory` | `drink_name`, `current_stock`, `store_stock`, `total_purchased`, `total_sold`, `cost_price`, `low_stock_threshold` |
 | `users` | `user_id`, `username`, `role`, `added_at` |
-| `stock_counts` | `id`, `timestamp`, `drink_name`, `expected`, `counted`, `variance`, `cost_price`, `note`, `recorded_by` — one physical stocktake; the only independent check on the books |
+| `stock_counts` | `id`, `timestamp`, `drink_name`, `expected`, `counted`, `variance`, `cost_price`, `note`, `recorded_by`, `location` (bar/store — counted separately), `period` — one physical stocktake; the only independent check on the books |
+| `room_audits` | `id`, `timestamp`, `audit_date`, `period`, `rooms_total`, `nights_logged`, `nights_actual`, `rate_variance`, `variance_count`, `note`, `recorded_by` — capture rate as a trend, not a one-off |
+| `turnaways` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `reason`, `recorded_by` — guests refused for want of a room. Touches no money; the only record of demand that never became a transaction |
 | `payables` | `id`, `timestamp`, `supplier`, `drink_name`, `quantity`, `amount`, `amount_paid`, `due_date`, `status`, `paid_at`, `recorded_by` — supplier credit; makes DPO computable |
 | `inventory_snapshots` | `snapshot_date`, `drink_name`, `bar_stock`, `store_stock`, `cost_price`, `stock_value` — PK `(snapshot_date, drink_name)`; nightly stock history for true DIO |
-| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it), `total_rooms` (occupancy/RevPAR denominator) and `roomtype_rooms:<type>` (per-type RevPAR denominator) |
+| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it), `total_rooms` (occupancy/RevPAR denominator), `roomtype_rooms:<type>` (per-type RevPAR denominator), `roomtype_hours:<type>` (hours per stay-unit — marks a type as hourly) and `capital_threshold` (minimum spend that can be capital) |
+| `periodic_obligations` | `id`, `name`, `account`, `category`, `expected_amount`, `months`, `start_date`, `active`, `retired_on`, `created_at`, `recorded_by` — the accrual register. Without it there is nothing to accrue *against* |
 
 All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases upgrade safely on next startup.
 

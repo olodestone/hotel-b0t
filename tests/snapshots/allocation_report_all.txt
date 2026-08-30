@@ -16,6 +16,9 @@
   _How to split it:_
   From Bar Account:   ₦800
   From Rooms Account: ₦15,500
+
+  🌩 _No one-off costs tagged yet, so there is nothing to size the_
+  _buffer against. Tag them as they happen — ⚙️ Manage → 🔎 Review._
 ──────────────────────────────
 💸 *COSTS* _(what reduces profit)_
   🍺 Cost of stock sold: ₦4,800

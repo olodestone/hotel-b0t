@@ -1,5 +1,6 @@
 💸 *Expense Report — ALL-TIME*
 ──────────────────────────────
+*① OPERATING — in the P&L*
 🍺 *BAR EXPENSES*
   👤 *Salary* — ₦50,000
     `[1]` 2026-06-03  ₦50,000 _bar wages_
@@ -16,6 +17,7 @@
     `[4]` 2026-06-09  ₦6,000 _linens_
   *Subtotal: ₦51,000*
 ──────────────────────────────
-*Grand Total: ₦120,999*
-📦 Stock purchased: ₦30,000 _(inventory buy — not an operating expense)_
+*Operating total: ₦120,999*
+──────────────────────────────
+📦 Stock purchased: ₦30,000 _(inventory buy — cash to stock, not a cost)_
 _Generated 29 Jun 2026 14:30_

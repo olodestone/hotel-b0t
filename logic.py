@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 import database as db
+import metrics
 import inventory as inv
 import reports
 from inventory import StockResult
@@ -58,29 +59,88 @@ def process_set_price(drink: str, price: float) -> tuple[bool, str]:
 
 # ── Room sale ─────────────────────────────────────────────────────────
 
-def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str, int]:
-    """Returns (ok, message, room_id) — room_id is 0 when nothing was written."""
+def process_room_sale(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None,
+                      recorded_by: str = "", duration_hours: float | None = None) -> tuple[bool, str, int]:
+    """Returns (ok, message, room_id) — room_id is 0 when nothing was written.
+
+    ``nights`` counts *stay units*: nights for a nightly room type, lets for an
+    hourly one. ``duration_hours`` overrides the type's configured length for
+    this booking alone — a one-off short let on an otherwise nightly room.
+    """
     if qty <= 0:
         return False, "❌ Quantity must be a positive integer.", 0
     if price <= 0:
         return False, "❌ Price must be a positive number.", 0
     if nights <= 0:
         return False, "❌ Number of nights must be a positive integer.", 0
+    if duration_hours is not None and not (0 < duration_hours <= 24):
+        return False, "❌ Stay length must be between 0 and 24 hours.", 0
 
-    room_id = db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp, recorded_by=recorded_by)
+    room_id = db.record_room(room_type.strip(), qty, price, nights, timestamp=timestamp,
+                             recorded_by=recorded_by, duration_hours=duration_hours or 0)
     total = qty * price * nights
+
+    # Name the unit the booking was actually sold in: calling a 3-hour let
+    # "1 night at ₦5,000/night" is how the two trades got confused to begin with.
+    hours = duration_hours if duration_hours is not None else db.get_room_type_hours(room_type)
+    if hours is not None and hours < 24:
+        unit = f"₦{price:,.2f} × {nights} let(s) of {hours:g}h"
+    else:
+        unit = f"₦{price:,.2f}/night × {nights} night(s)"
+
     date_note = f" _(recorded for {timestamp})_" if timestamp else ""
     return True, (
         f"✅ Room booking recorded.{date_note}\n"
-        f"Type: *{room_type.title()}* | Qty: {qty} | "
-        f"₦{price:,.2f}/night × {nights} night(s)\n"
+        f"Type: *{room_type.title()}* | Qty: {qty} | {unit}\n"
         f"Total Revenue: *₦{total:,.2f}*"
     ), room_id
+
+
+# ── Room stay length (hourly vs nightly types) ────────────────────────
+
+def process_set_room_duration(room_type: str, hours: float) -> tuple[bool, str]:
+    """Declare how long one let of a room type holds the room.
+
+    This is what tells occupancy and ADR apart for a hotel that also sells by
+    the hour. Until a type is declared hourly its lets are read as nights: a
+    room let three times a day reports 300% occupancy, and its ₦3,000 rate is
+    averaged into the overnight ADR. Declaring it fixes the *history* too —
+    bookings defer to their type unless a negotiated length was stored on the
+    row — so this is worth setting even years in.
+    """
+    name = room_type.strip()
+    if not name:
+        return False, "❌ Room type cannot be empty."
+    if hours <= 0:
+        return False, "❌ Stay length must be more than 0 hours."
+    if hours > 24:
+        return False, (
+            "❌ A stay longer than 24 hours is measured in nights, not hours.\n"
+            "Book it with `/room <type> <qty> <nights>` instead."
+        )
+
+    db.set_room_type_hours(name, hours)
+    if hours == 24:
+        return True, (
+            f"✅ *{name.title()}* set back to a full night.\n"
+            "Its bookings count as room-nights and its rate as ADR again."
+        )
+    return True, (
+        f"✅ *{name.title()}* is an hourly type — {hours:g} hours per let.\n"
+        "Its bookings now count as *lets*, not room-nights, and its rate is "
+        "reported per let instead of as ADR.\n"
+        "_Applies to past bookings too — see_ `/roomstats`."
+    )
 
 
 # ── Expense ───────────────────────────────────────────────────────────
 
 VALID_ACCOUNTS = ("rooms", "bar")
+
+# Expenses have a third home: costs that serve the whole business and belong to
+# neither department. Draws and debtors deliberately do NOT — an owner draw
+# comes out of a real account, and nobody owes money to "overhead".
+VALID_EXPENSE_ACCOUNTS = ("rooms", "bar", "overhead")
 
 
 # Categories that describe the owner taking money out, not a business cost.
@@ -92,11 +152,50 @@ _DRAW_LIKE_CATEGORIES = {
 }
 
 
-def process_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> tuple[bool, str]:
-    if account.lower() not in VALID_ACCOUNTS:
-        return False, f"❌ Account must be *rooms* or *bar*. Got: `{account}`"
+def capital_threshold() -> float:
+    """Minimum spend that can be capital. Naira and policy, so it is a setting."""
+    try:
+        return float(db.get_setting("capital_threshold", "") or metrics.CAPITAL_THRESHOLD)
+    except (TypeError, ValueError):
+        return metrics.CAPITAL_THRESHOLD
+
+
+def process_expense(account: str, category: str, amount: float, description: str = "",
+                    timestamp: str | None = None, recorded_by: str = "",
+                    expense_class: str = "operating", needs_review: bool = False,
+                    obligation_id: int | None = None) -> tuple[bool, str]:
+    """Record an expense on both axes: which account, and what kind of spend.
+
+    ``expense_class`` decides whether the row reaches the P&L at all. Capital
+    and inventory leave the bank without touching profit, so they are excluded
+    from every margin but still subtracted from the cash estimate.
+    """
+    if account.lower() not in VALID_EXPENSE_ACCOUNTS:
+        return False, f"❌ Account must be *rooms*, *bar* or *overhead*. Got: `{account}`"
     if amount <= 0:
         return False, "❌ Amount must be a positive number."
+
+    cls = (expense_class or "operating").strip().lower()
+    if cls not in metrics.EXPENSE_CLASSES:
+        listed = ", ".join(f"*{c}*" for c in metrics.EXPENSE_CLASSES)
+        return False, f"❌ Class must be one of {listed}. Got: `{expense_class}`"
+
+    # The capital test, enforced rather than trusted: under the threshold it is
+    # expensed even when it is technically an asset, so the classification can
+    # never quietly pull a small purchase out of the P&L.
+    threshold = capital_threshold()
+    if cls == metrics.CAPITAL_CLASS and amount < threshold:
+        return False, (
+            f"❌ ₦{amount:,.0f} is under the ₦{threshold:,.0f} capital threshold.\n"
+            "Record it as *operating* — under the threshold you expense it even "
+            "when it is technically an asset."
+        )
+    if cls == "inventory":
+        return False, (
+            "❌ Stock for resale isn't an expense — it's cash converting to stock.\n"
+            "Use `/restock` (paid now) or `/restock_credit` (on supplier credit)."
+        )
+
     if category.strip().lower() in _DRAW_LIKE_CATEGORIES:
         return False, (
             f"❌ *{category.title()}* is an owner withdrawal, not a business expense.\n"
@@ -105,14 +204,112 @@ def process_expense(account: str, category: str, amount: float, description: str
             "See /position for how draws, profit and cash are tracked separately."
         )
 
-    db.record_expense(account.strip(), category.strip(), amount, description.strip(), timestamp=timestamp, recorded_by=recorded_by)
+    db.record_expense(account.strip(), category.strip(), amount, description.strip(),
+                      timestamp=timestamp, recorded_by=recorded_by,
+                      expense_class=cls, needs_review=needs_review,
+                      obligation_id=obligation_id)
     date_note = f"\nDate: {timestamp}" if timestamp else ""
+    if cls == metrics.CAPITAL_CLASS:
+        class_note = ("\n🏗 *Capital* — cash out, but not a cost. It stays out of "
+                      "profit and margins, and shows in its own report section.")
+    elif cls == metrics.RESERVE_CLASS:
+        class_note = ("\n🔁 *Periodic* — drawn from the reserve, not charged to "
+                      "this month. The monthly share was already in the P&L.")
+    else:
+        class_note = ""
+    review_note = "\n🔎 _Flagged for month-end review._" if needs_review else ""
     return True, (
         f"✅ Expense recorded.\n"
         f"Account: *{account.title()}* | Category: *{category.title()}* | Amount: ₦{amount:,.2f}"
         + (f"\nNote: {description}" if description else "")
-        + date_note
+        + date_note + class_note + review_note
     )
+
+
+def process_reclassify_expense(expense_id: int, account: str | None = None,
+                               category: str | None = None,
+                               expense_class: str | None = None,
+                               needs_review: bool | None = None) -> tuple[bool, str]:
+    """Correct one expense's classification. Never touches the amount or date."""
+    row = db.get_expense(expense_id)
+    if row is None:
+        return False, f"❌ No expense with ID `{expense_id}`."
+
+    if account is not None and account.lower() not in VALID_EXPENSE_ACCOUNTS:
+        return False, f"❌ Account must be *rooms*, *bar* or *overhead*. Got: `{account}`"
+    if expense_class is not None:
+        cls = expense_class.strip().lower()
+        if cls not in metrics.EXPENSE_CLASSES:
+            return False, f"❌ Unknown class `{expense_class}`."
+        if cls == metrics.CAPITAL_CLASS and float(row["amount"]) < capital_threshold():
+            return False, (
+                f"❌ ₦{float(row['amount']):,.0f} is under the "
+                f"₦{capital_threshold():,.0f} capital threshold — keep it operating."
+            )
+
+    if not db.reclassify_expense(expense_id, account=account, category=category,
+                                 expense_class=expense_class, needs_review=needs_review):
+        return False, "❌ Nothing to change."
+
+    after = db.get_expense(expense_id)
+    return True, (
+        f"✅ Entry `{expense_id}` reclassified.\n"
+        f"*{str(after['account']).title()}* / *{str(after['category']).title()}* · "
+        f"{str(after.get('expense_class') or 'operating').title()} · "
+        f"₦{float(after['amount']):,.2f}\n"
+        "_Amount and date untouched._"
+    )
+
+
+# ── Periodic obligations (the accrual register) ───────────────────────
+
+def process_add_obligation(name: str, expected_amount: float, months: int,
+                           account: str = "rooms", category: str = "maintenance",
+                           recorded_by: str = "") -> tuple[bool, str]:
+    """Register a bill that recurs every few months, so it can be accrued.
+
+    Without a register there is nothing to accrue against: you cannot charge a
+    monthly share of a cost the books have never been told to expect. Accrual
+    starts today, never earlier — adding an obligation now must not retroactively
+    rewrite months that have already been reported.
+    """
+    if not name.strip():
+        return False, "❌ Give the bill a name (e.g. soakaway evacuation)."
+    if expected_amount <= 0:
+        return False, "❌ Expected amount must be a positive number."
+    if months < 2:
+        return False, ("❌ A bill that recurs monthly (or more often) is just an "
+                       "operating expense — record it with 💸 Expense.")
+    if months > 60:
+        return False, "❌ Spread it over 60 months or fewer."
+    if account.lower() not in VALID_EXPENSE_ACCOUNTS:
+        return False, f"❌ Account must be *rooms*, *bar* or *overhead*. Got: `{account}`"
+
+    ob_id = db.add_obligation(name, expected_amount, months, account=account,
+                              category=category, recorded_by=recorded_by)
+    share = expected_amount / months
+    return True, (
+        f"✅ *{name.strip().title()}* registered.\n"
+        f"{_naira(expected_amount)} ÷ {months} months = *{_naira(share)}/month*\n"
+        f"Charged to *{account.title()}* / {category.title()} from this month on.\n"
+        "_When the bill actually arrives, record it as a *periodic* expense — "
+        "it draws from the reserve instead of hitting profit._"
+    )
+
+
+def process_retire_obligation(obligation_id: int) -> tuple[bool, str]:
+    """Stop a bill accruing. Never deletes — past accruals are past profit."""
+    if not db.set_obligation_active(obligation_id, False):
+        return False, f"❌ No periodic bill with ID `{obligation_id}`."
+    return True, (
+        f"✅ Bill `{obligation_id}` retired — it stops accruing from now.\n"
+        "_Everything it already set aside stays in the reserve and in the months "
+        "that carried it._"
+    )
+
+
+def _naira(amount: float) -> str:
+    return f"₦{amount:,.2f}"
 
 
 # ── Owner draws ───────────────────────────────────────────────────────
@@ -257,7 +454,8 @@ def process_restock(drink: str, qty: int, cost_price: float, recorded_by: str = 
 # ── Stocktake ─────────────────────────────────────────────────────────
 
 def process_stock_count(drink: str, counted: int, note: str = "", recorded_by: str = "",
-                        timestamp: str | None = None) -> tuple[bool, str]:
+                        timestamp: str | None = None,
+                        location: str = "bar") -> tuple[bool, str]:
     """Record a physical bar count, log the variance, and true the books up.
 
     Variance is the only signal the system has for breakage, unrecorded sales
@@ -271,27 +469,93 @@ def process_stock_count(drink: str, counted: int, note: str = "", recorded_by: s
     if existing is None:
         return False, f"❌ '{drink}' not found in inventory. Restock it first with /restock."
 
-    expected = int(existing["current_stock"])
+    loc = "store" if str(location).strip().lower() == "store" else "bar"
+    expected = int(existing["store_stock" if loc == "store" else "current_stock"])
     cost = float(existing.get("cost_price") or 0)
     result = db.record_stock_count(
         name, expected=expected, counted=counted, cost_price=cost,
-        note=note, recorded_by=recorded_by, timestamp=timestamp,
+        note=note, recorded_by=recorded_by, timestamp=timestamp, location=loc,
     )
 
     variance, value = result["variance"], result["value"]
-    header = f"✅ Counted *{drink.title()}*: {counted} units (books said {expected})."
+    where = loc.title()
+    pct = round(variance / expected * 100, 1) if expected else 0.0
+    header = (f"✅ Counted *{drink.title()}* in the *{where}*: {counted} units "
+              f"(books said {expected}).")
     if variance == 0:
         return True, f"{header}\n🎯 Exact match — no variance."
     if variance < 0:
+        mark, _note = metrics.variance_status(pct)
         return True, (
             f"{header}\n"
-            f"🔻 *Short by {abs(variance)} units* — ₦{abs(value):,.2f} at cost.\n"
-            f"Bar stock corrected to {counted}. Check breakage, unrecorded sales or theft."
+            f"{mark} *Short by {abs(variance)} units* ({pct:+.1f}%) — ₦{abs(value):,.2f} at cost.\n"
+            f"{where} stock corrected to {counted}. Check breakage, unrecorded sales or theft."
         )
+    # A surplus is never a clean count: it is the same leak from the other side.
     return True, (
         f"{header}\n"
-        f"🔺 *Over by {variance} units* — ₦{value:,.2f} at cost.\n"
-        f"Bar stock corrected to {counted}. Usually a missed transfer or a sale keyed twice."
+        f"🔴 *Over by {variance} units* ({pct:+.1f}%) — ₦{value:,.2f} at cost.\n"
+        f"{where} stock corrected to {counted}.\n"
+        "_Not good news — usually a sale that was never rung up, or a purchase "
+        "logged twice. Investigate it like a shortage._"
+    )
+
+
+# ── Room audit ────────────────────────────────────────────────────────
+
+def process_room_audit(audit_date: str, rooms_total: int, nights_logged: int,
+                       nights_actual: int, rate_variance: float = 0.0,
+                       variance_count: int = 0, recorded_by: str = "") -> tuple[bool, str]:
+    """Store one audited day. Capture rate is only meaningful as a trend."""
+    if nights_actual < 0 or nights_logged < 0:
+        return False, "❌ Night counts cannot be negative."
+    if nights_actual > rooms_total > 0:
+        return False, (
+            f"❌ {nights_actual} nights occupied but the hotel has {rooms_total} rooms.\n"
+            "Check the figure, or update the room count with `/setrooms`."
+        )
+
+    db.record_room_audit(
+        audit_date, rooms_total, nights_logged, nights_actual,
+        rate_variance=rate_variance, variance_count=variance_count,
+        recorded_by=recorded_by,
+    )
+    missing = max(nights_actual - nights_logged, 0)
+    if missing:
+        return True, (f"✅ {audit_date} recorded — *{missing} unlogged "
+                      f"{'night' if missing == 1 else 'nights'}* found.")
+    return True, f"✅ {audit_date} recorded — every night was in the system."
+
+
+# ── Turnaways (refused bookings) ──────────────────────────────────────
+
+def process_turnaway(quantity: int = 1, room_type: str = "", reason: str = "",
+                     recorded_by: str = "", timestamp: str | None = None) -> tuple[bool, str]:
+    """Record guests turned away because nothing suitable was free.
+
+    The books can prove a night was full. They can never show how much demand
+    kept arriving after it filled, and that difference is the whole argument
+    for a rate rise — 100% occupancy with nobody refused means the rate is
+    about right, 100% with twenty refusals means it is too low.
+    """
+    if quantity <= 0:
+        return False, "❌ Number turned away must be at least 1."
+    if quantity > 500:
+        return False, f"❌ {quantity} turned away in one entry looks like a typo."
+
+    db.record_turnaway(
+        room_type=room_type, quantity=quantity, reason=reason,
+        recorded_by=recorded_by, timestamp=timestamp,
+    )
+
+    who = f"{quantity} turned away"
+    if room_type.strip():
+        who += f" wanting *{room_type.strip().title()}*"
+    when = f" on {timestamp}" if timestamp else ""
+    tail = f"\n_Reason: {reason.strip()}_" if reason.strip() else ""
+    return True, (
+        f"📝 Logged: {who}{when}.{tail}\n"
+        "Counts toward the demand you could not serve — see `/roomstats dow`."
     )
 
 

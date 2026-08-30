@@ -257,6 +257,10 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
             )
         """))
         conn.execute(text("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS recorded_by TEXT DEFAULT ''"))
+        # Hours one stay-unit occupies the room. 0/NULL means "ask the room
+        # type", so every historical row is reinterpreted correctly the moment
+        # a short-stay type is configured — nothing needs backfilling.
+        conn.execute(text("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS duration_hours FLOAT DEFAULT 0"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id          SERIAL PRIMARY KEY,
@@ -267,6 +271,38 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
                 description TEXT
             )
         """))
+        # The second classification axis. Deliberately NOT a category value: a
+        # category holds one string, so "Maintenance that happens to be capital"
+        # could only be recorded by giving up the category. Defaulting to
+        # 'operating' means every pre-existing row keeps the behaviour it had.
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS expense_class TEXT DEFAULT 'operating'"))
+        # Set when the person entering it wasn't sure, or the category is Misc.
+        # Over-expensing understates profit, which is the safe way to be wrong —
+        # so an unsure row still lands in the P&L, it just gets listed at month end.
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS needs_review BOOLEAN DEFAULT FALSE"))
+        # Which periodic obligation a payment settles. Null for everything else,
+        # and for a periodic payment nobody attributed — that still drains the
+        # reserve, it just cannot be charged to a particular bill.
+        conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS obligation_id INTEGER"))
+        # The register of bills that recur every few months. Without it there is
+        # nothing to accrue *against*: you cannot charge a monthly share of a
+        # cost the books have never been told to expect.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS periodic_obligations (
+                id              SERIAL PRIMARY KEY,
+                name            TEXT NOT NULL,
+                account         TEXT NOT NULL DEFAULT 'rooms',
+                category        TEXT NOT NULL DEFAULT 'maintenance',
+                expected_amount FLOAT NOT NULL DEFAULT 0,
+                months          INTEGER NOT NULL DEFAULT 12,
+                start_date      TEXT,
+                active          BOOLEAN NOT NULL DEFAULT TRUE,
+                retired_on      TEXT DEFAULT '',
+                created_at      TEXT DEFAULT '',
+                recorded_by     TEXT DEFAULT ''
+            )
+        """))
+        conn.execute(text("ALTER TABLE periodic_obligations ADD COLUMN IF NOT EXISTS retired_on TEXT DEFAULT ''"))
         # Migrations: add columns to existing databases that predate them
         conn.execute(text("ALTER TABLE sales    ADD COLUMN IF NOT EXISTS id SERIAL"))
         conn.execute(text("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS id SERIAL"))
@@ -365,6 +401,47 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
                 variance    INTEGER NOT NULL DEFAULT 0,
                 cost_price  FLOAT   NOT NULL DEFAULT 0,
                 note        TEXT DEFAULT '',
+                recorded_by TEXT DEFAULT ''
+            )
+        """))
+        # Bar and store are counted separately: a bottle moved to the bar and a
+        # bottle sold look identical in a combined figure, so a single total
+        # cannot tell a transfer from a loss. Legacy rows are bar counts.
+        conn.execute(text("ALTER TABLE stock_counts ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'bar'"))
+        # Which month this count verifies. A month with no count is reported
+        # UNVERIFIED rather than silently treated as clean.
+        conn.execute(text("ALTER TABLE stock_counts ADD COLUMN IF NOT EXISTS period TEXT DEFAULT ''"))
+        # Room audits — was every room-night actually logged, at the rate charged?
+        # The days are chosen by the bot, never by the operator: a person picks
+        # days they remember clearly, and those are the days most likely correct.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS room_audits (
+                id             SERIAL PRIMARY KEY,
+                timestamp      TEXT,
+                audit_date     TEXT,
+                period         TEXT DEFAULT '',
+                rooms_total    INTEGER NOT NULL DEFAULT 0,
+                nights_logged  INTEGER NOT NULL DEFAULT 0,
+                nights_actual  INTEGER NOT NULL DEFAULT 0,
+                rate_variance  FLOAT   NOT NULL DEFAULT 0,
+                variance_count INTEGER NOT NULL DEFAULT 0,
+                note           TEXT DEFAULT '',
+                recorded_by    TEXT DEFAULT ''
+            )
+        """))
+        # Turnaways — guests refused because nothing suitable was free. The one
+        # thing the books cannot infer: a night that sold out looks identical
+        # whether one guest was turned away or twenty, and only the second is
+        # evidence that the rate is too low. Nothing here touches money, so it
+        # is deliberately outside every P&L path.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS turnaways (
+                id          SERIAL PRIMARY KEY,
+                timestamp   TEXT,
+                created_at  TEXT DEFAULT '',
+                room_type   TEXT DEFAULT '',
+                quantity    INTEGER NOT NULL DEFAULT 1,
+                reason      TEXT DEFAULT '',
                 recorded_by TEXT DEFAULT ''
             )
         """))
@@ -577,19 +654,26 @@ def record_sale(drink: str, qty: int, price: float, timestamp: str | None = None
 
 # ── Room-booking record ───────────────────────────────────────────────
 
-def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None, recorded_by: str = "") -> int:
-    """Insert one booking. Returns the new row id so callers can offer a targeted undo."""
+def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: str | None = None,
+                recorded_by: str = "", duration_hours: float = 0) -> int:
+    """Insert one booking. Returns the new row id so callers can offer a targeted undo.
+
+    ``nights`` is really *stay units*: nights for a nightly room type, lets for
+    an hourly one. ``duration_hours`` is how long one unit holds the room —
+    pass it only for a negotiated stay; 0 leaves the row deferring to whatever
+    the room type is configured for, which is what keeps history correctable.
+    """
     engine = get_engine()
     with engine.connect() as conn:
         result = conn.execute(text("""
-            INSERT INTO rooms (timestamp, created_at, room_type, quantity, price_per_night, nights, total_revenue, recorded_by)
-            VALUES (:ts, :created, :rtype, :qty, :price, :nights, :total, :recorded_by)
+            INSERT INTO rooms (timestamp, created_at, room_type, quantity, price_per_night, nights, total_revenue, recorded_by, duration_hours)
+            VALUES (:ts, :created, :rtype, :qty, :price, :nights, :total, :recorded_by, :hours)
             RETURNING id
         """), {
             "ts": _ts(timestamp), "created": now_str(), "rtype": room_type.lower(),
             "qty": qty, "price": price, "nights": nights,
             "total": round(qty * price * nights, 2),
-            "recorded_by": recorded_by,
+            "recorded_by": recorded_by, "hours": max(float(duration_hours or 0), 0),
         })
         new_id = int(result.scalar_one())
         conn.commit()
@@ -598,19 +682,59 @@ def record_room(room_type: str, qty: int, price: float, nights: int, timestamp: 
 
 # ── Expense record ────────────────────────────────────────────────────
 
-def record_expense(account: str, category: str, amount: float, description: str = "", timestamp: str | None = None, recorded_by: str = "") -> None:
+def record_expense(account: str, category: str, amount: float, description: str = "",
+                   timestamp: str | None = None, recorded_by: str = "",
+                   expense_class: str = "operating", needs_review: bool = False,
+                   obligation_id: int | None = None) -> None:
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
-            INSERT INTO expenses (timestamp, account, category, amount, description, recorded_by)
-            VALUES (:ts, :account, :category, :amount, :desc, :recorded_by)
+            INSERT INTO expenses (timestamp, account, category, amount, description,
+                                  recorded_by, expense_class, needs_review, obligation_id)
+            VALUES (:ts, :account, :category, :amount, :desc, :recorded_by, :cls, :review, :ob)
         """), {
             "ts": _ts(timestamp), "account": account.lower(),
             "category": category.lower(),
             "amount": round(amount, 2), "desc": description,
             "recorded_by": recorded_by,
+            "cls": expense_class.lower(), "review": bool(needs_review),
+            "ob": int(obligation_id) if obligation_id else None,
         })
         conn.commit()
+
+
+def reclassify_expense(expense_id: int, account: str | None = None,
+                       category: str | None = None, expense_class: str | None = None,
+                       needs_review: bool | None = None) -> bool:
+    """Correct an existing expense's classification. Amounts are never touched.
+
+    The month-end check asks the repair-vs-replace question of every large
+    entry; without this it could only ever be advice, since the bot's other
+    option is delete-and-rekey, which loses the original timestamp and author.
+    """
+    sets, params = [], {"id": int(expense_id)}
+    for col, val in (("account", account), ("category", category),
+                     ("expense_class", expense_class)):
+        if val is not None:
+            sets.append(f"{col} = :{col}")
+            params[col] = str(val).strip().lower()
+    if needs_review is not None:
+        sets.append("needs_review = :needs_review")
+        params["needs_review"] = bool(needs_review)
+    if not sets:
+        return False
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(f"UPDATE expenses SET {', '.join(sets)} WHERE id = :id"), params)
+        conn.commit()
+        return result.rowcount > 0
+
+
+def get_expense(expense_id: int) -> dict[str, Any] | None:
+    rows = _rows("SELECT * FROM expenses WHERE id = :id", {"id": int(expense_id)})
+    return rows[0] if rows else None
 
 
 # ── Owner-draw record ─────────────────────────────────────────────────
@@ -1283,7 +1407,8 @@ def get_undoable_entry(entry_type: str, entry_id: int, username: str,
 
 def record_stock_count(drink: str, expected: int, counted: int, cost_price: float,
                        note: str = "", recorded_by: str = "",
-                       timestamp: str | None = None) -> dict[str, Any]:
+                       timestamp: str | None = None, location: str = "bar",
+                       period: str = "") -> dict[str, Any]:
     """Log one physical count and true the bar stock up to what was counted.
 
     Both halves matter: the log preserves the variance for the shrinkage report
@@ -1291,26 +1416,57 @@ def record_stock_count(drink: str, expected: int, counted: int, cost_price: floa
     stops one bad count cascading into every later figure.
     """
     name = drink.strip().lower()
+    loc = "store" if str(location).strip().lower() == "store" else "bar"
     variance = int(counted) - int(expected)
     engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("""
             INSERT INTO stock_counts
-                (timestamp, drink_name, expected, counted, variance, cost_price, note, recorded_by)
-            VALUES (:ts, :name, :expected, :counted, :variance, :cost, :note, :recorded_by)
+                (timestamp, drink_name, expected, counted, variance, cost_price,
+                 note, recorded_by, location, period)
+            VALUES (:ts, :name, :expected, :counted, :variance, :cost,
+                    :note, :recorded_by, :loc, :period)
         """), {
             "ts": _ts(timestamp), "name": name,
             "expected": int(expected), "counted": int(counted), "variance": variance,
             "cost": round(float(cost_price), 2), "note": note, "recorded_by": recorded_by,
+            "loc": loc, "period": period or _ts(timestamp)[:7],
         })
+        # True up the column that was actually counted — writing a store count
+        # into current_stock would move phantom units onto the bar shelf.
+        column = "store_stock" if loc == "store" else "current_stock"
         conn.execute(text(
-            "UPDATE inventory SET current_stock = :counted WHERE lower(drink_name) = :name"
+            f"UPDATE inventory SET {column} = :counted WHERE lower(drink_name) = :name"
         ), {"counted": int(counted), "name": name})
         conn.commit()
     return {
         "drink": name, "expected": int(expected), "counted": int(counted),
         "variance": variance, "value": round(variance * float(cost_price), 2),
+        "location": loc,
     }
+
+
+def record_turnaway(room_type: str = "", quantity: int = 1, reason: str = "",
+                    recorded_by: str = "", timestamp: str | None = None) -> int:
+    """Log guests turned away for want of a room. Returns the new row's id.
+
+    Writes no revenue, no expense and no stock movement — a turnaway is demand
+    that never became a transaction. It exists purely so a full night can be
+    told apart from a night that was full *and* still selling.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            INSERT INTO turnaways (timestamp, created_at, room_type, quantity, reason, recorded_by)
+            VALUES (:ts, :created, :rtype, :qty, :reason, :recorded_by)
+            RETURNING id
+        """), {
+            "ts": _ts(timestamp), "created": now_str(),
+            "rtype": room_type.strip().lower(), "qty": max(int(quantity), 0),
+            "reason": reason.strip(), "recorded_by": recorded_by,
+        }).fetchone()
+        conn.commit()
+    return int(row[0]) if row else 0
 
 
 # ── Supplier credit (payables) ────────────────────────────────────────
@@ -1518,6 +1674,116 @@ def get_all_room_type_counts() -> dict[str, int]:
         if rtype and count > 0:
             out[rtype] = count
     return out
+
+
+def get_room_type_hours(room_type: str) -> float | None:
+    """Hours one stay-unit of this room type occupies the room, if configured."""
+    val = get_setting(f"roomtype_hours:{room_type.strip().lower()}")
+    try:
+        return float(val) if val else None
+    except ValueError:
+        return None
+
+
+def set_room_type_hours(room_type: str, hours: float) -> None:
+    set_setting(f"roomtype_hours:{room_type.strip().lower()}", str(round(float(hours), 2)))
+
+
+def get_all_room_type_hours() -> dict[str, float]:
+    """All configured per-type stay lengths as {lower-cased type: hours}.
+
+    A type absent from this map is nightly — the overwhelming majority — so the
+    map stays small and an unconfigured hotel behaves exactly as it always has.
+    """
+    raw = _rows("SELECT key, value FROM settings WHERE key LIKE 'roomtype_hours:%' ORDER BY key")
+    out: dict[str, float] = {}
+    for r in raw:
+        rtype = str(r["key"]).replace("roomtype_hours:", "").strip().lower()
+        try:
+            hours = float(r["value"])
+        except (TypeError, ValueError):
+            continue
+        if rtype and hours > 0:
+            out[rtype] = hours
+    return out
+
+
+# ── Room audits ───────────────────────────────────────────────────────
+
+def record_room_audit(audit_date: str, rooms_total: int, nights_logged: int,
+                      nights_actual: int, rate_variance: float = 0.0,
+                      variance_count: int = 0, period: str = "", note: str = "",
+                      recorded_by: str = "") -> int:
+    """Store one day's audit. Capture rate is a trend, not a one-off."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            INSERT INTO room_audits
+                (timestamp, audit_date, period, rooms_total, nights_logged,
+                 nights_actual, rate_variance, variance_count, note, recorded_by)
+            VALUES (:ts, :d, :p, :rt, :nl, :na, :rv, :vc, :note, :by)
+            RETURNING id
+        """), {
+            "ts": now_str(), "d": audit_date, "p": period or audit_date[:7],
+            "rt": int(rooms_total), "nl": int(nights_logged), "na": int(nights_actual),
+            "rv": round(float(rate_variance), 2), "vc": int(variance_count),
+            "note": note, "by": recorded_by,
+        }).fetchone()
+        conn.commit()
+    return int(row[0]) if row else 0
+
+
+def get_room_audits(limit: int = 60) -> list[dict[str, Any]]:
+    return _rows("SELECT * FROM room_audits ORDER BY audit_date DESC LIMIT :n",
+                 {"n": int(limit)})
+
+
+# ── Periodic obligations (the accrual register) ───────────────────────
+
+def add_obligation(name: str, expected_amount: float, months: int,
+                   account: str = "rooms", category: str = "maintenance",
+                   start_date: str = "", recorded_by: str = "") -> int:
+    """Register a bill that recurs every few months. Returns its id."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            INSERT INTO periodic_obligations
+                (name, account, category, expected_amount, months, start_date, active, created_at, recorded_by)
+            VALUES (:name, :account, :category, :amount, :months, :start, TRUE, :created, :by)
+            RETURNING id
+        """), {
+            "name": name.strip(), "account": account.strip().lower(),
+            "category": category.strip().lower(),
+            "amount": round(float(expected_amount), 2), "months": int(months),
+            "start": start_date or now_str()[:10], "created": now_str(), "by": recorded_by,
+        }).fetchone()
+        conn.commit()
+    return int(row[0]) if row else 0
+
+
+def get_obligations(include_inactive: bool = False) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM periodic_obligations"
+    if not include_inactive:
+        sql += " WHERE active = TRUE"
+    return _rows(sql + " ORDER BY id")
+
+
+def set_obligation_active(obligation_id: int, active: bool) -> bool:
+    """Retire (or restore) an obligation.
+
+    Deliberately not a delete, and deliberately dated: the accruals it already
+    made are part of past months' profit. Stamping `retired_on` stops it
+    accruing from that day while everything before it stands — reading the flag
+    alone erased the whole history and flipped the reserve negative.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("UPDATE periodic_obligations SET active = :a, retired_on = :on WHERE id = :id"),
+            {"a": bool(active), "on": "" if active else now_str()[:10],
+             "id": int(obligation_id)})
+        conn.commit()
+        return result.rowcount > 0
 
 
 # ── User management ───────────────────────────────────────────────────

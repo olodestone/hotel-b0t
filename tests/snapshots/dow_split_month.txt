@@ -1,0 +1,34 @@
+🗓 *Hotel 85 — Night by Night*
+📅 Period: June 2026 (current month)
+──────────────────────────────
+*Flat rise is the right shape.*
+_Occupancy is level across the week (+3.8 points) and the rate is effectively the same every night. Demand is not telling you to treat the weekend differently._
+──────────────────────────────
+```
+Night  Occ    ADR      RevPAR   Away
+Mon    2%     25,000   625      ·
+Tue    3%     25,000   781      1
+Wed    0%     0        0        ·
+Thu    0%     0        0        ·
+Fri    6%     15,000   938      2
+Sat    6%     15,000   938      1
+Sun    6%     15,000   938      ·
+```
+  Busiest: *Friday & Saturday & Sunday*  ·  Quietest: *Wednesday & Thursday*
+──────────────────────────────
+*WEEKDAY vs WEEKEND*  _(weekend = Fri & Sat nights)_
+  • *Weekday* — ADR ₦20,000 · 2.4% full · RevPAR ₦476
+      _21 nights · 4 room-nights sold · ₦80,000_
+  • *Weekend* — ADR ₦15,000 · 6.2% full · RevPAR ₦938
+      _8 nights · 4 room-nights sold · ₦60,000_
+  _Weekend runs 3.8 points fuller and is priced 25% lower._
+──────────────────────────────
+*TURNED AWAY*
+  🚪 *4 guests turned away* across 3 days
+  _≈ ₦70,000 of demand not served, priced at your own ADR._
+  _Wanted: Standard (2), Deluxe (1), Unspecified (1)_
+  _Reasons: fully booked (3), not given (1)_
+──────────────────────────────
+_A blended rate hides the difference between your best night and your_
+_worst. This screen is what a weekday/weekend split is argued from._
+_Generated 29 Jun 2026 14:30_

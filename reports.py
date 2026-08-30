@@ -52,7 +52,17 @@ def _days(value: float | None, dash: str = "—") -> str:
 
 
 def _plural(count: int, word: str, suffix: str = "s") -> str:
-    return f"{count} {word}" + ("" if count == 1 else suffix)
+    """Pluralise, honouring the -y → -ies rule.
+
+    "2 entrys" appeared in the month-end header. A consonant before the y takes
+    -ies (entry → entries); a vowel keeps it (day → days), which is why the rule
+    checks the preceding letter rather than just the ending.
+    """
+    if count == 1:
+        return f"{count} {word}"
+    if suffix == "s" and word.endswith("y") and word[-2:-1].lower() not in "aeiou":
+        return f"{count} {word[:-1]}ies"
+    return f"{count} {word}{suffix}"
 
 
 def _esc(text: str) -> str:
@@ -169,6 +179,15 @@ def _room_type_counts() -> dict[str, int]:
     return db.get_all_room_type_counts()
 
 
+def _room_type_hours() -> dict[str, float]:
+    """Hours per stay-unit for the hourly room types (lower-cased).
+
+    Empty for a hotel that only sells nights, which is why configuring nothing
+    leaves every existing figure exactly where it was.
+    """
+    return db.get_all_room_type_hours()
+
+
 def _range_label(start: date, end: date) -> str:
     """Name a window the way an owner would say it out loud."""
     if start == end:
@@ -264,6 +283,68 @@ def _period_days(for_date: date | None, for_month: tuple[int, int] | None,
     return monthrange(year, month)[1]
 
 
+def _window_bounds(for_date: date | None, for_month: tuple[int, int] | None,
+                   all_time: bool, rows: list[dict] | tuple = ()) -> tuple[date, date]:
+    """The [start, end] the same arguments select, as real dates.
+
+    `_apply_filter` answers "is this row in the period"; the accrual needs the
+    period itself, because it charges by elapsed days rather than by rows.
+    """
+    today = clock.now().date()
+    if for_date:
+        return for_date, for_date
+    if all_time:
+        seen = [dt.date() for dt in (_parse_ts(r.get("timestamp")) for r in rows) if dt]
+        return (min(seen) if seen else today), today
+    year, month = for_month if for_month else (today.year, today.month)
+    start = date(year, month, 1)
+    return start, min(date(year, month, monthrange(year, month)[1]), today)
+
+
+def _obligations() -> list:
+    """The accrual register as metrics.Obligation values."""
+    out = []
+    # Retired bills are included: their past accruals are part of the
+    # reserve and of months already reported.
+    for r in db.get_obligations(include_inactive=True):
+        try:
+            start = datetime.strptime(str(r.get("start_date") or "")[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            start = date(2000, 1, 1)      # no start recorded: accrue from always
+        try:
+            retired = datetime.strptime(str(r.get("retired_on") or "")[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            retired = None
+        out.append(metrics.Obligation(
+            id=int(r["id"]), name=str(r["name"]),
+            account=str(r.get("account") or "rooms").lower(),
+            category=str(r.get("category") or "maintenance").lower(),
+            expected_amount=float(r.get("expected_amount") or 0),
+            months=int(r.get("months") or 0),
+            start_date=start, active=bool(r.get("active", True)),
+            retired_on=retired,
+        ))
+    return out
+
+
+def _with_accrual(expense_rows: list[dict], for_date, for_month, all_time,
+                  rows_for_span: list[dict] | tuple = ()) -> list[dict]:
+    """Expense rows plus this window's periodic accrual.
+
+    One helper, used by every surface that computes profit, so the accrual can
+    never appear on one screen and be missing from the next. The synthesised
+    rows carry a real account and category, so they flow through the Bar/Rooms/
+    Overhead split and the category breakdown without anything downstream
+    needing to know they aren't real entries.
+    """
+    obligations = _obligations()
+    if not obligations:
+        return expense_rows
+    start, end = _window_bounds(for_date, for_month, all_time,
+                               rows_for_span or expense_rows)
+    return expense_rows + metrics.accrual_rows(obligations, start, end)
+
+
 def _cost_price_map() -> dict[str, float]:
     """Current cost price per drink (lower-cased name → cost) from inventory."""
     return {r["drink_name"].lower(): float(r["cost_price"]) for r in db.read_all("inventory")}
@@ -290,7 +371,10 @@ def generate_full_report(
 
     # All P&L arithmetic (Bar/Rooms split, COGS, restock exclusion) lives in
     # metrics.compute_pnl — the single source of truth shared with the dashboard.
-    pnl = metrics.compute_pnl(sales_rows, room_rows, expense_rows, _cost_price_map())
+    pnl = metrics.compute_pnl(
+        sales_rows, room_rows,
+        _with_accrual(expense_rows, for_date, for_month, all_time, room_rows),
+        _cost_price_map())
     bar, rooms = pnl.bar, pnl.rooms
 
     if staff_view:
@@ -314,6 +398,7 @@ def generate_full_report(
     lines = [
         f"🏨 *{HOTEL_NAME} — Financial Report*",
         f"📅 Period: {label}",
+        *_verification_note(for_date, for_month, all_time),
         _SEP,
         "🍺 *BAR ACCOUNT*",
         f"  Revenue: {_fmt(bar.revenue)}",
@@ -340,7 +425,8 @@ def generate_full_report(
 
     # Yield metrics — only meaningful once the hotel's room count is recorded.
     rm = metrics.compute_room_metrics(
-        room_rows, _total_rooms(), _period_days(for_date, for_month, all_time, room_rows)
+        room_rows, _total_rooms(), _period_days(for_date, for_month, all_time, room_rows),
+        hours_by_type=_room_type_hours(),
     )
     if rm.room_nights_sold:
         lines.append(f"  Room-nights sold: {rm.room_nights_sold}  ·  ADR {_fmt(rm.adr)}")
@@ -348,6 +434,9 @@ def generate_full_report(
             lines.append(f"  Occupancy: {_pct(rm.occupancy_pct)}  ·  RevPAR {_fmt(rm.revpar)}")
         else:
             lines.append("  _Set the room count with_ `/setrooms <n>` _for occupancy & RevPAR._")
+    if rm.has_short_stay:
+        # Kept on its own line: lets are not nights and their rate is not ADR.
+        lines.append(f"  Short-stay lets: {rm.short_lets}  ·  Avg per let {_fmt(rm.arl)}")
 
     if rooms.other_breakdown:
         lines.append("  _Other breakdown:_")
@@ -361,8 +450,17 @@ def generate_full_report(
         f"  Total Outgoings: {_fmt(pnl.total_outgoings)}",
         f"  {net_emoji} *Net Profit:    {_fmt(pnl.net_profit)}*",
         f"  Net Margin:      {_pct(pnl.net_margin_pct)}  _(₦ kept per ₦100 of sales)_",
-        _SEP,
     ]
+    # Read beside net profit, never instead of it. The money was spent — this
+    # answers the different question of whether the month traded badly or
+    # something simply broke.
+    if pnl.has_one_offs:
+        lines += [
+            f"  🌩 One-off costs:  {_fmt(pnl.irregular_spend)}",
+            f"  *Underlying:      {_fmt(pnl.underlying_profit)}*  "
+            f"({_pct(pnl.underlying_margin_pct)})  _— if nothing had broken_",
+        ]
+    lines.append(_SEP)
 
     if pnl.restock_spend > 0:
         lines += [
@@ -439,6 +537,7 @@ def generate_sales_report(
 
     lines = [
         f"🍺 *Sales Report — {label}*",
+        *_verification_note(for_date, for_month, all_time),
         f"Transactions: {len(sales_rows)}",
         "```",
         header,
@@ -460,19 +559,33 @@ def generate_expense_report(
     all_time: bool = False,
 ) -> str:
     """Expense breakdown by account and category."""
-    expense_rows = _active(db.read_all("expenses"))
-    expense_rows = _apply_filter(expense_rows, for_date, for_month, all_time)
+    every_row = _active(db.read_all("expenses"))
+    expense_rows = _apply_filter(every_row, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
-    if not expense_rows:
+    obligations = _obligations()
+    start, end = _window_bounds(for_date, for_month, all_time, expense_rows)
+    accruals = metrics.accrual_rows(obligations, start, end)
+
+    if not expense_rows and not accruals:
         return f"💸 *Expense Report — {label}*\n\nNo expenses recorded for this period."
 
     # Restock (inventory purchases) is a cash → stock movement, not an operating
     # expense — shown separately so it never inflates the expense total.
     restock_total = _restock_spend(expense_rows)
-    expense_rows = _operating_expenses(expense_rows)
-    bar_expenses = [r for r in expense_rows if r.get("account") == "bar"]
-    room_expenses = [r for r in expense_rows if r.get("account") == "rooms"]
+    all_rows = expense_rows
+    capital = metrics.capital_rows(all_rows)
+    # Periodic *payments* are reserve draws, not costs, so they come from the
+    # raw rows — operating_expenses drops them on the way past.
+    periodic = metrics.periodic_rows(all_rows)
+    # A reserve is a running balance, so it reads every row ever recorded;
+    # windowing it would report the month's movement as the whole pot.
+    reserve = metrics.compute_reserve(obligations, _active(every_row), end)
+
+    expense_rows = _operating_expenses(expense_rows + accruals)
+    bar_expenses  = [r for r in expense_rows if metrics.expense_account(r) == "bar"]
+    room_expenses = [r for r in expense_rows if metrics.expense_account(r) == "rooms"]
+    over_expenses = [r for r in expense_rows if metrics.expense_account(r) == "overhead"]
 
     def _section(rows: list[dict], title: str) -> list[str]:
         if not rows:
@@ -490,8 +603,7 @@ def generate_expense_report(
         if salary_rows:
             out.append(f"  👤 *Salary* — {_fmt(salary_total)}")
             for e in salary_rows:
-                ts = e.get("timestamp", "")[:10]
-                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{_note(e)}")
+                out.append(f"    {_entry_ref(e)}  {_fmt(float(e['amount']))}{_note(e)}")
             cat_total += salary_total
 
         # Other expenses grouped by category
@@ -505,32 +617,207 @@ def generate_expense_report(
             cat_total += cat_sum
             out.append(f"  *{_esc(cat)}* — {_fmt(cat_sum)}")
             for e in entries:
-                ts = e.get("timestamp", "")[:10]
-                out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))}{_note(e)}")
+                out.append(f"    {_entry_ref(e)}  {_fmt(float(e['amount']))}{_note(e)}")
 
         out.append(f"  *Subtotal: {_fmt(cat_total)}*")
         return out
 
-    bar_section = _section(bar_expenses, "🍺 *BAR EXPENSES*")
-    room_section = _section(room_expenses, "🛏 *ROOMS EXPENSES*")
+    sections = [s for s in (
+        _section(bar_expenses,  "🍺 *BAR EXPENSES*"),
+        _section(room_expenses, "🛏 *ROOMS EXPENSES*"),
+        _section(over_expenses, "🏢 *OVERHEAD*"),
+    ) if s]
     grand_total = sum(float(r["amount"]) for r in expense_rows)
 
-    lines = [
-        f"💸 *Expense Report — {label}*",
-        _SEP,
-        *bar_section,
-    ]
-    if bar_section and room_section:
-        lines.append(_SEP)
-    lines += [
-        *room_section,
-        _SEP,
-        f"*Grand Total: {_fmt(grand_total)}*",
-    ]
+    # ① OPERATING P&L — operating + periodic only. Capital and inventory were
+    #    already filtered out above, so nothing here can inflate a margin.
+    lines = [f"💸 *Expense Report — {label}*", _SEP,
+             "*① OPERATING — in the P&L*"]
+    for i, s in enumerate(sections):
+        if i:
+            lines.append(_SEP)
+        lines += s
+    if not sections:
+        lines.append("  _No operating expenses this period._")
+    lines += [_SEP, f"*Operating total: {_fmt(grand_total)}*"]
+
+    # ② CAPITAL SPEND — cash out, deliberately outside every margin.
+    lines += _capital_section(capital)
+
+    # ③ RESERVE — what the accruals built up, and what was drawn from it.
+    lines += _reserve_section(reserve, periodic)
+
     if restock_total > 0:
-        lines.append(f"📦 Stock purchased: {_fmt(restock_total)} _(inventory buy — not an operating expense)_")
+        lines += [
+            _SEP,
+            f"📦 Stock purchased: {_fmt(restock_total)} _(inventory buy — cash to stock, not a cost)_",
+        ]
+    flagged = metrics.review_rows(all_rows)
+    if flagged:
+        lines.append(f"🔎 _{_plural(len(flagged), 'entry')} flagged for review "
+                     f"— tap_ ⚙️ Manage → 🔎 Review")
     lines.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
     return "\n".join(lines)
+
+
+def _capital_section(rows: list[dict]) -> list[str]:
+    """Asset purchases: cash out, never a cost.
+
+    Listed in full rather than as a total, because the month-end check is a
+    per-item question — do I now own something I did not own before? — and it
+    cannot be asked of a lump sum.
+    """
+    if not rows:
+        return []
+    total = sum(float(r["amount"]) for r in rows)
+    out = [_SEP, "*② CAPITAL SPEND — cash out, not a cost*"]
+    for e in sorted(rows, key=lambda r: -float(r["amount"])):
+        ts = str(e.get("timestamp", ""))[:10]
+        desc = str(e.get("description") or "").strip()
+        out.append(f"  `[{e['id']}]` {ts}  {_fmt(float(e['amount']))} — "
+                   f"{_esc(str(e['account']).title())}/{_esc(str(e['category']).title())}"
+                   + (f" _{_esc(desc)}_" if desc else ""))
+    out += [
+        f"  *Capital total: {_fmt(total)}*",
+        "  _Excluded from profit, margins and GOPPAR. It still left the bank,_",
+        "  _so /position counts it against cash._",
+    ]
+    return out
+
+
+def _entry_ref(e: dict) -> str:
+    """`[id] date` for a real entry; an accrual has neither to show."""
+    if e.get("accrual"):
+        return "  🔁 _accrual_"
+    return f"`[{e['id']}]` {str(e.get('timestamp', ''))[:10]}"
+
+
+def _reserve_section(reserve, payments: list[dict]) -> list[str]:
+    """What the accruals have built up, and what has been drawn from it.
+
+    The reserve is the whole point of accruing: a bill that lands every six
+    months is a cost of all six, so each month puts its share aside and the
+    invoice, when it comes, is a draw rather than a disaster. A negative
+    balance is the useful signal — it means the bill arrived before enough
+    months had paid into it, which is worth seeing rather than smoothing over.
+    """
+    if not reserve.lines and not payments:
+        return []
+
+    out = [_SEP, "*③ RESERVE — periodic bills*"]
+    if reserve.monthly_total:
+        out.append(f"  Accruing {_fmt(reserve.monthly_total)}/month across "
+                   f"{_plural(len([l for l in reserve.lines if l.obligation.active]), 'bill')}")
+
+    for line in sorted(reserve.lines, key=lambda l: -l.obligation.monthly_share):
+        ob = line.obligation
+        mark = " ⚠️" if line.materially_short else ""
+        out.append(
+            f"  • *{_esc(ob.name)}* — {_fmt(ob.expected_amount)} ÷ {ob.months} "
+            f"= {_fmt(ob.monthly_share)}/mo"
+        )
+        out.append(
+            f"      _set aside {_fmt(line.accrued)} · paid {_fmt(line.paid)} · "
+            f"balance {_fmt(line.balance)}{mark}_"
+        )
+
+    out.append(f"  *Reserve balance: {_fmt(reserve.balance)}*")
+    if reserve.unlinked_paid:
+        out.append(f"  _Includes {_fmt(reserve.unlinked_paid)} paid without a bill attached._")
+
+    if payments:
+        out.append("  *Drawn this period:*")
+        for e in sorted(payments, key=lambda r: -float(r["amount"])):
+            ts = str(e.get("timestamp", ""))[:10]
+            out.append(f"    `[{e['id']}]` {ts}  {_fmt(float(e['amount']))} — "
+                       f"{_esc(str(e['category']).title())}")
+
+    under = reserve.underfunded
+    if under:
+        out.append("  ⚠️ _Paid out before enough months had been set aside: "
+                   + _esc(", ".join(l.obligation.name for l in under)) + "._")
+    out.append("  _The monthly share is in section ①. These payments are draws,_")
+    out.append("  _not costs — counting both would charge the bill twice._")
+    return out
+
+
+def generate_review_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+) -> str:
+    """The month-end check: every entry big enough to be capital, plus the flagged ones.
+
+    Two lists, because they are two different mistakes. A large entry may have
+    been classified perfectly and still deserves the repair-vs-replace question
+    asked of it once — the same tradesman produces a repair and an asset, and
+    the invoice looks identical. A flagged entry is one the person recording it
+    already said they were unsure about.
+    """
+    rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
+    label = _period_label(for_date, for_month, all_time)
+    threshold = _capital_threshold()
+
+    big = sorted(
+        [r for r in rows
+         if float(r["amount"]) >= threshold
+         and metrics.expense_class(r) in metrics.PNL_CLASSES],
+        key=lambda r: -float(r["amount"]),
+    )
+    flagged = [r for r in metrics.review_rows(rows) if r not in big]
+
+    lines = [f"🔎 *Month-End Check — {label}*", _SEP]
+    if not big and not flagged:
+        lines.append(f"✅ Nothing to review. No entry reached {_fmt(threshold)} "
+                     "and nothing was flagged.")
+        lines.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
+        return "\n".join(lines)
+
+    if big:
+        lines += [
+            f"*{_plural(len(big), 'entry')} at or above {_fmt(threshold)}*",
+            "_Two questions for each:_",
+            "_1. Do you now own something you did not own before?_ "
+            "_No — maintenance. Yes — capital._",
+            "_2. Was it a one-off nobody could have forecast?_ "
+            "_If so, tag it — it stays a real cost, but the month can then be_ "
+            "_read without it, and it sizes your buffer._",
+            "",
+        ]
+        for e in big:
+            lines += _review_line(e)
+        lines.append(_SEP)
+
+    if flagged:
+        lines += [f"*{_plural(len(flagged), 'entry')} flagged as unsure*", ""]
+        for e in flagged:
+            lines += _review_line(e)
+        lines.append(_SEP)
+
+    lines += [
+        "_Reclassify from_ ⚙️ Manage → 🔎 Review_, or_ `/reclassify <id> <field> <value>`",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+def _review_line(e: dict) -> list[str]:
+    desc = str(e.get("description") or "").strip()
+    cls = metrics.expense_class(e)
+    return [
+        f"  `[{e['id']}]` *{_fmt(float(e['amount']))}* — "
+        f"{_esc(str(e['account']).title())}/{_esc(str(e['category']).title())}"
+        f"  ·  {cls.title()}",
+        f"      _{str(e.get('timestamp', ''))[:10]}"
+        + (f" · {_esc(desc)}" if desc else "") + "_",
+    ]
+
+
+def _capital_threshold() -> float:
+    try:
+        return float(db.get_setting("capital_threshold", "") or metrics.CAPITAL_THRESHOLD)
+    except (TypeError, ValueError):
+        return metrics.CAPITAL_THRESHOLD
 
 
 # ── Staff report ──────────────────────────────────────────────────────
@@ -647,11 +934,15 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
     total_rev = bar_rev + room_rev
 
     # Restock (inventory purchase) is a cash/stock movement, not a P&L cost.
+    # One day accrues one day's share of each periodic bill — small, but the
+    # alternative is a summary that disagrees with the month it belongs to.
+    expense_rows = _with_accrual(expense_rows, today, None, False)
     op_expenses = _operating_expenses(expense_rows)
-    bar_exp = sum(float(r["amount"]) for r in op_expenses if r.get("account") == "bar")
-    room_exp = sum(float(r["amount"]) for r in op_expenses if r.get("account") == "rooms")
+    bar_exp = sum(float(r["amount"]) for r in op_expenses if metrics.expense_account(r) == "bar")
+    room_exp = sum(float(r["amount"]) for r in op_expenses if metrics.expense_account(r) == "rooms")
+    over_exp = sum(float(r["amount"]) for r in op_expenses if metrics.expense_account(r) == "overhead")
     cost_drinks = _cost_of_drinks_sold(sales_rows)
-    total_out = bar_exp + room_exp + cost_drinks
+    total_out = bar_exp + room_exp + over_exp + cost_drinks
     net = total_rev - total_out
     net_emoji = "📈" if net >= 0 else "📉"
 
@@ -667,6 +958,7 @@ def generate_daily_summary(target: date | None = None, staff_view: bool = False)
         f"  Drink Cost:    {_fmt(cost_drinks)}",
         f"  Bar Expenses:  {_fmt(bar_exp)}",
         f"  Room Expenses: {_fmt(room_exp)}",
+        *( [f"  Overhead:      {_fmt(over_exp)}"] if over_exp else [] ),
         f"  *Total:        {_fmt(total_out)}*",
         _SEP,
         f"{net_emoji} *Net for Today:  {_fmt(net)}*",
@@ -729,6 +1021,50 @@ def _burn_rate_label(rate: float) -> str:
 
 # ── Allocation report ─────────────────────────────────────────────────
 
+def _contingency_block(buffer_pct: float) -> list[str]:
+    """Is the buffer big enough for what actually goes wrong?
+
+    Sized from history rather than a forecast: nobody can name the compressor
+    that fails next March, but the tagged one-offs say what the unforeseeable
+    has really been costing. Advisory on purpose — it reports the gap and
+    leaves the percentage alone, because silently re-sizing an allocation the
+    owner set deliberately is how a tool stops being trusted.
+    """
+    c = metrics.compute_contingency(
+        _active(db.read_all("expenses")), _active(db.read_all("sales")),
+        _active(db.read_all("rooms")), buffer_pct, clock.now(),
+    )
+    if not c.has_history:
+        return [
+            "",
+            "  🌩 _No one-off costs tagged yet, so there is nothing to size the_",
+            "  _buffer against. Tag them as they happen — ⚙️ Manage → 🔎 Review._",
+        ]
+
+    out = ["", f"  🌩 *Contingency check* _(last {_plural(c.months_observed, 'month')})_"]
+    if not c.reliable:
+        # An average off two or three months is an accident, not a rate.
+        return out + [
+            f"      {_fmt(c.total_irregular)} of one-off costs so far",
+            f"      _Too little history to size a buffer from — "
+            f"{_plural(metrics.MIN_CONTINGENCY_MONTHS, 'month')} makes the_",
+            "      _average mean something. Keep tagging them._",
+        ]
+    out.append(f"      One-offs have cost {_fmt(c.monthly_average)}/month on average")
+    out.append(f"      Your {c.buffer_pct:g}% buffer sets aside {_fmt(c.buffer_monthly)}/month")
+    if c.covered:
+        out.append(f"      ✅ _Covered, with {_fmt(abs(c.gap))}/month to spare._")
+    else:
+        out.append(f"      ⚠️ _Short by {_fmt(c.gap)}/month — "
+                   f"{c.suggested_pct:g}% would cover it._")
+        out.append(f"      _Raise it with_ `/setallocation buffer {c.suggested_pct:g}`")
+    if c.biggest:
+        top = c.biggest[0]
+        desc = str(top.get("description") or top.get("category") or "").strip()
+        out.append(f"      _Biggest: {_fmt(float(top['amount']))} — {_esc(desc.title())}_")
+    return out
+
+
 def generate_allocation_report(
     for_date: date | None = None,
     for_month: tuple[int, int] | None = None,
@@ -741,6 +1077,7 @@ def generate_allocation_report(
     sales_rows  = _apply_filter(_active(db.read_all("sales")),    for_date, for_month, all_time)
     room_rows   = _apply_filter(_active(db.read_all("rooms")),    for_date, for_month, all_time)
     expense_rows = _apply_filter(_active(db.read_all("expenses")), for_date, for_month, all_time)
+    expense_rows = _with_accrual(expense_rows, for_date, for_month, all_time, room_rows)
     label = _period_label(for_date, for_month, all_time)
 
     # All allocation arithmetic lives in metrics.compute_allocation (shared with
@@ -799,6 +1136,9 @@ def generate_allocation_report(
         "  _How to split it:_",
         f"  From Bar Account:   {_fmt(bar_share)}",
         f"  From Rooms Account: {_fmt(room_share)}",
+    ]
+    lines += _contingency_block(buffer_pct)
+    lines += [
         _SEP,
         "💸 *COSTS* _(what reduces profit)_",
         f"  🍺 Cost of stock sold: {_fmt(cost_of_drinks)}",
@@ -899,7 +1239,7 @@ def generate_position_report() -> str:
     pos = metrics.compute_cash_position(
         sales_all, rooms_all, expense_all, draws_all, debtor_rows,
         stock_value=stock_value, opening=opening, anchor_dt=anchor_dt,
-        cost_map=_cost_price_map(), now=now,
+        cost_map=_cost_price_map(), now=now, obligations=_obligations(),
     )
 
     if anchor_dt:
@@ -919,6 +1259,10 @@ def generate_position_report() -> str:
         f"  + Collected sales:  {_fmt(pos.collected)}",
         f"  − Expenses:         {_fmt(pos.opex_cash)}",
         f"  − Stock purchases:  {_fmt(pos.restock_cash)}",
+        # Capital never reduced profit, but it certainly reduced the bank.
+        *([f"  − Asset purchases:  {_fmt(pos.capital_cash)}"] if pos.capital_cash else []),
+        # Drawn from the reserve, but the money still left the bank.
+        *([f"  − Periodic bills:   {_fmt(pos.periodic_cash)}"] if pos.periodic_cash else []),
         f"  − Owner draws:      {_fmt(pos.draws_cash)}",
         f"  = *💰 {_fmt(pos.cash)}*",
         "  _Money in, minus stock bought, expenses & draws._",
@@ -954,6 +1298,11 @@ def generate_position_report() -> str:
 # ── Cash conversion cycle / working capital ───────────────────────────
 
 _CCC_WINDOW_DAYS = 30
+
+# How far back to widen the row scan so a stay that began before the window is
+# still credited for the nights it occupies inside it. Longer than any
+# plausible stay at this hotel, and cheap — the rows are clipped afterwards.
+_MAX_STAY_LOOKBACK = 30
 
 _DIO_BASIS_NOTE = {
     "snapshots": "from daily stock snapshots",
@@ -1066,10 +1415,18 @@ def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
     all_sales, all_rooms = _active(db.read_all("sales")), _active(db.read_all("rooms"))
     all_exp = _active(db.read_all("expenses"))
 
+    obligations = _obligations()
+
     def _month(year, month):
+        # Break-even and the room target both read a month's costs, so both
+        # accrue that month's share — otherwise /cashcycle disagrees with the
+        # /report for the same month by exactly the accrual.
+        last = monthrange(year, month)[1]
+        m_start, m_end = date(year, month, 1), min(date(year, month, last), now.date())
         return (_filter_by_month(all_sales, year, month),
                 _filter_by_month(all_rooms, year, month),
-                _filter_by_month(all_exp, year, month))
+                _filter_by_month(all_exp, year, month)
+                + metrics.accrual_rows(obligations, m_start, m_end))
 
     be_year, be_month = now.year, now.month
     month_sales, month_rooms, month_exp = _month(be_year, be_month)
@@ -1138,61 +1495,289 @@ def generate_cashcycle_report(window_days: int = _CCC_WINDOW_DAYS) -> str:
 
 # ── Stocktake variance (shrinkage) ────────────────────────────────────
 
+def _verification_note(for_date, for_month, all_time) -> list[str]:
+    """A month with no stocktake is UNVERIFIED, and every report must say so.
+
+    Silence would let an uncounted month read exactly like a clean one. The
+    figures are still the best available — they are just the books talking to
+    themselves, with no independent observation behind them.
+    """
+    if all_time:
+        return []
+    now = clock.now()
+    year, month = ((for_date.year, for_date.month) if for_date
+                   else for_month if for_month else (now.year, now.month))
+    counted = any(str(r.get("timestamp", ""))[:7] == f"{year:04d}-{month:02d}"
+                  for r in db.read_all("stock_counts"))
+    if counted:
+        return []
+    return ["⚠️ _UNVERIFIED — no stocktake entered for this month._"]
+
+
+def generate_count_sheet() -> str:
+    """STEP 1 — the sheet that gets carried and filled in by hand.
+
+    Blanks stay blank. A sheet pre-filled with what the books expect is not a
+    count: whoever carries it will read the expected figure and tick it, and
+    the one independent observation the business has is gone.
+    """
+    items = inv.get_inventory_summary()
+    if not items:
+        return "📋 *Count Sheet*\n\nNo stock items yet — add one with `/restock`."
+
+    last = {}
+    for r in db.read_all("stock_counts"):
+        name = str(r["drink_name"]).lower()
+        ts = str(r.get("timestamp", ""))[:10]
+        if ts > last.get(name, ""):
+            last[name] = ts
+
+    width = max(len(i["drink"]) for i in items)
+    width = max(min(width, 16), 8)
+    header = (f"{'ITEM':<{width}} {'COST':>7} {'LAST':>10}  BAR   STORE  TOTAL")
+    body = ""
+    for i in sorted(items, key=lambda r: r["drink"]):
+        name = i["drink"][:width]
+        seen = last.get(i["drink"].lower(), "never")[-5:] if last.get(i["drink"].lower()) else "never"
+        body += (f"{name:<{width}} {float(i['cost_price']):>7,.0f} {seen:>10}  "
+                 f"____  ____   ____\n")
+
+    return "\n".join([
+        f"📋 *{HOTEL_NAME} — Count Sheet*",
+        f"📅 {clock.now().strftime('%d %b %Y')}",
+        _SEP,
+        "```",
+        header,
+        body + "```",
+        "_Count *bar* and *store* separately — a bottle moved and a bottle sold_",
+        "_look identical in one total._",
+        "_Never estimate. Never count from memory. Same day each month._",
+        "",
+        "When the sheet is filled, enter it with ⚙️ Manage → 📦 Stocktake.",
+    ])
+
+
 def generate_variance_report(
     for_date: date | None = None,
     for_month: tuple[int, int] | None = None,
     all_time: bool = False,
 ) -> str:
-    """Physical counts vs what the books expected — the only view of shrinkage."""
-    rows = _apply_filter(db.read_all("stock_counts"), for_date, for_month, all_time)
+    """STEPS 3-4 — variance per item, then the summary and the trend.
+
+    Reports variance only. No count is ever attributed to a person: the figure
+    is about the process, and naming whoever happened to hold the sheet turns a
+    control into an accusation.
+    """
+    all_counts = db.read_all("stock_counts")
+    rows = _apply_filter(all_counts, for_date, for_month, all_time)
     label = _period_label(for_date, for_month, all_time)
 
     if not rows:
         return (
             f"🔍 *Stock Variance — {label}*\n\n"
-            "No stocktakes recorded for this period.\n"
-            "Count the bar with `/count <drink> <units>` — the books can't spot "
-            "breakage or theft on their own."
+            "⚠️ *This month is UNVERIFIED.*\n"
+            "No stocktake has been entered, so every stock and bar figure for "
+            "the period is the books talking to themselves.\n\n"
+            "Start with ⚙️ Manage → 📦 Stocktake."
         )
 
-    vs = metrics.summarize_variance(rows, _cost_price_map())
+    cost_map = _cost_price_map()
+    sales = _apply_filter(_active(db.read_all("sales")), for_date, for_month, all_time)
+    cogs = metrics.cost_of_drinks_sold(sales, cost_map)
+    vs = metrics.summarize_variance(rows, cost_map, cogs)
+
     lines = [
         f"🔍 *{HOTEL_NAME} — Stock Variance*",
         f"📅 Period: {label}",
         _SEP,
-        f"  Counts taken: {vs.counts} across {vs.drinks} drinks",
-    ]
-
-    if vs.shrink_units:
-        lines += [
-            f"  🔻 *Shortages: {abs(vs.shrink_units)} units — {_fmt(abs(vs.shrink_value))}*",
-            "  _Money lost to breakage, unrecorded sales or theft._",
-        ]
-    else:
-        lines.append("  ✅ No shortages recorded — every count matched or ran over.")
-
-    net_word = "short" if vs.total_units < 0 else "over"
-    lines += [
-        f"  Net position: {abs(vs.total_units)} units {net_word} ({_fmt(abs(vs.total_value))})",
+        f"  Counts taken: {vs.counts} across {vs.drinks} items",
         _SEP,
-        "*BY DRINK*",
+        "*BY ITEM* _(worst by value first)_",
     ]
+
+    width = max((len(d["drink"]) for d in vs.by_drink), default=8)
+    width = max(min(width, 14), 8)
+    table = f"{'ITEM':<{width}} {'EXP':>5} {'CNT':>5} {'VAR':>5} {'₦ VALUE':>9}\n"
+    for d in vs.by_drink:
+        table += (f"{d['drink'][:width]:<{width}} {d['expected']:>5} {d['counted']:>5} "
+                  f"{d['units']:>+5} {d['value']:>9,.0f}\n")
+    lines.append("```\n" + table + "```")
+
     for d in vs.by_drink:
         if d["units"] == 0:
-            mark, detail = "🎯", "exact"
-        elif d["units"] < 0:
-            mark, detail = "🔻", f"{abs(d['units'])} short ({_fmt(abs(d['value']))})"
-        else:
-            mark, detail = "🔺", f"{d['units']} over ({_fmt(d['value'])})"
-        lines.append(f"  {mark} {_esc(d['drink'])}: {detail}")
+            continue
+        lines.append(f"  {d['status']} *{_esc(d['drink'])}* {d['pct']:+.1f}% — {d['status_note']}")
 
+    lines += [_SEP, "*SUMMARY*"]
+    if vs.shrink_units:
+        pct = f" ({_pct(vs.shrink_pct_of_cogs)} of stock sold)" if vs.cogs else ""
+        lines.append(f"  🔻 *Shrinkage: {_fmt(abs(vs.shrink_value))}*{pct}")
+    # A surplus is not a clean count. More units than the books expect is the
+    # same leak seen from the other side — sales that were never rung up.
+    if vs.surplus_units:
+        lines += [
+            f"  🔺 *Surplus: {vs.surplus_units} units — {_fmt(vs.surplus_value)}*",
+            "  _Not good news: usually sales that were never recorded, or a_",
+            "  _purchase logged twice. Investigate it like a shortage._",
+        ]
+    if vs.clean:
+        lines.append("  🎯 Every count matched exactly.")
+
+    if vs.worst:
+        lines += ["", "  *Worst by value:*"]
+        for d in vs.worst:
+            lines.append(f"    {d['status']} {_esc(d['drink'])} — {_fmt(abs(d['value']))} "
+                         f"({d['units']:+} units)")
+
+    lines += _shrinkage_trend_block(all_counts, cost_map)
     lines += [
         _SEP,
-        "_Count weekly, same day, before opening — a variance only means_",
+        "_Count the same day each month, before opening — a variance only means_",
         "_something if the count is routine._",
         f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
+
+
+def _shrinkage_trend_block(all_counts: list[dict], cost_map: dict) -> list[str]:
+    """Shrinkage % across the last three months — one month is not a trend."""
+    now = clock.now()
+    all_sales = _active(db.read_all("sales"))
+    cogs_by_month = {}
+    for yr, mo in {(int(str(r["timestamp"])[:4]), int(str(r["timestamp"])[5:7]))
+                   for r in all_counts if str(r.get("timestamp", ""))[:7]}:
+        cogs_by_month[(yr, mo)] = metrics.cost_of_drinks_sold(
+            _filter_by_month(all_sales, yr, mo), cost_map)
+
+    trend = metrics.variance_trend(all_counts, cost_map, cogs_by_month, now)
+    if sum(1 for _l, p, _v in trend if p is not None) < 2:
+        return []
+
+    out = [_SEP, "*TREND* _(shrinkage as % of stock sold)_"]
+    parts = []
+    for label, pct, _value in trend:
+        parts.append(f"{label} —" if pct is None else f"{label} {pct:.1f}%")
+    out.append("  " + "  ·  ".join(parts))
+
+    known = [(l, p) for l, p, _v in trend if p is not None]
+    if len(known) >= 2:
+        first, last = known[0][1], known[-1][1]
+        if last > first + 0.5:
+            out.append("  🔻 _Getting worse — losses are growing against sales._")
+        elif last < first - 0.5:
+            out.append("  ✅ _Improving._")
+        else:
+            out.append("  ➖ _Holding steady._")
+    if any(p is None for _l, p, _v in trend):
+        out.append("  _A dash is a month with no count — unverified, not clean._")
+    return out
+
+
+# ── Room audit ────────────────────────────────────────────────────────
+
+def audit_sheet(days: list, year: int, month: int) -> str:
+    """STEP 2 — every room on each sampled date, occupied and vacant.
+
+    The vacant lines are the exercise. An occupied room that was logged proves
+    nothing; a room the system swears was empty is where an unlogged night
+    hides, and it can only be seen by printing the empties alongside.
+    """
+    all_rooms = _active(db.read_all("rooms"))
+    hours = _room_type_hours()
+    total = _total_rooms() or sum(_room_type_counts().values())
+
+    lines = [f"🔎 *{HOTEL_NAME} — Room Audit*",
+             f"📅 {date(year, month, 1).strftime('%B %Y')} — "
+             f"{_plural(len(days), 'day')} drawn at random",
+             _SEP]
+    if not total:
+        lines.append("⚠️ _Set your room count first — `/setrooms <n>` — or the_")
+        lines.append("_vacant lines cannot be worked out._")
+        return "\n".join(lines)
+
+    for day in days:
+        d = metrics.build_audit_day(all_rooms, day, total, hours)
+        lines.append(f"*{day.strftime('%a %d %b')}*")
+        rows = "```\nTYPE            RATE      ✓\n"
+        for e in d.logged:
+            rate = e.revenue / e.rooms if e.rooms else 0.0
+            rows += f"{e.room_type[:14]:<14}  {rate:>8,.0f}  __\n"
+        for _ in range(d.vacant):
+            rows += f"{'VACANT (per system)':<14}{'':>10}  __\n"
+        lines.append(rows + "```")
+        lines.append(f"  _{d.nights_logged} logged · {d.vacant} shown vacant "
+                     f"of {total} rooms_")
+    lines += [
+        _SEP,
+        "_Check each line against the physical register. Mark a vacant room_",
+        "_that was actually occupied, and any rate that differs from what was_",
+        "_charged. Then enter the totals._",
+    ]
+    return "\n".join(lines)
+
+
+def generate_room_audit_report(result, audit_rows=()) -> str:
+    """STEP 4 — capture rate, rate variance and the monthly leak it implies."""
+    lines = [f"🔎 *{HOTEL_NAME} — Audit Result*", _SEP,
+             f"  Nights logged .......... {result.nights_logged}",
+             f"  Nights actual .......... {result.nights_actual}",
+             f"  Capture rate ........... *{_pct(result.capture_pct)}*  _(target 100%)_"]
+
+    if result.variance_count:
+        lines.append(f"  Rate variance .......... {_fmt(result.rate_variance)} "
+                     f"across {_plural(result.variance_count, 'entry')}")
+    if result.missing:
+        lines.append(f"  Estimated monthly leak . *{_fmt(result.monthly_leak)}*")
+        lines.append("  _The gap, scaled to a month at the rate you actually achieve._")
+
+    if not result.trustworthy:
+        lines += [
+            _SEP,
+            f"🔴 *Capture is below {metrics.CAPTURE_FLOOR:g}% — do not act on any "
+            "pricing decision yet.*",
+            "_A rate rise on nights you are not collecting widens the gap rather_",
+            "_than closing it. Fix the recording first._",
+        ]
+    elif result.capture_pct >= 100:
+        lines += [_SEP, "✅ _Every night in the register was in the system._"]
+    else:
+        lines += [_SEP, "🟡 _Close, but not everything is being captured._"]
+
+    trend = metrics.capture_trend(audit_rows)
+    if len(trend) >= 2:
+        lines += [_SEP, "*CAPTURE TREND*",
+                  "  " + "  ·  ".join(f"{d[-5:]} {p:.0f}%" for d, p in trend)]
+
+    lines += _rate_spread_block()
+    lines.append(f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_")
+    return "\n".join(lines)
+
+
+def _rate_spread_block(for_month: tuple[int, int] | None = None) -> list[str]:
+    """STEP 5 — runs on the full month, always, and needs no audit input.
+
+    A single flat rate across a whole month is the finding. Real trade produces
+    walk-ins, regulars, negotiated stays and the odd favour; a perfectly even
+    rate means discounts are being given off-book, or the rate is not captured
+    as charged.
+    """
+    now = clock.now()
+    year, month = for_month if for_month else (now.year, now.month)
+    rows = _filter_by_month(_active(db.read_all("rooms")), year, month)
+    spreads = metrics.rate_spread(rows, _room_type_hours())
+    if not spreads:
+        return []
+
+    out = [_SEP, "*RATE SPREAD* _(full month)_"]
+    for s in spreads:
+        out.append(f"  • *{_esc(s.room_type)}* — {_plural(s.nights, 'night')}")
+        out.append(f"      _min {_fmt(s.min_rate)} · max {_fmt(s.max_rate)} · "
+                   f"mode {_fmt(s.mode_rate)} · {s.distinct} distinct_")
+        if s.suspicious:
+            out.append("      🔴 _One single rate across the whole month. That is_")
+            out.append("      _not normal pricing — either discounts are going_")
+            out.append("      _off-book, or rates are not captured as charged._")
+    return out
 
 
 # ── Room performance (occupancy / ADR / RevPAR) ───────────────────────
@@ -1220,7 +1805,9 @@ def generate_room_stats_report(
     if rooms_from_types:
         total_rooms = derived
 
-    rm = metrics.compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=counts)
+    hours = _room_type_hours()
+    rm = metrics.compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=counts,
+                                      hours_by_type=hours)
 
     header = f"📅 Period: {label}"
     if prior:
@@ -1238,12 +1825,16 @@ def generate_room_stats_report(
     all_expenses = _active(db.read_all("expenses"))
     cost_map = _cost_price_map()
 
+    obligations = _obligations()
+
     def _goppar_for(w_start, w_end, room_slice, available):
+        # Both windows accrue on their own elapsed days, so a like-for-like
+        # comparison stays like-for-like — a half month accrues half a share.
+        expenses = (metrics.filter_by_range(all_expenses, w_start, w_end)
+                    + metrics.accrual_rows(obligations, w_start, w_end))
         pnl = metrics.compute_pnl(
             metrics.filter_by_range(all_sales, w_start, w_end),
-            room_slice,
-            metrics.filter_by_range(all_expenses, w_start, w_end),
-            cost_map,
+            room_slice, expenses, cost_map,
         )
         return metrics.compute_goppar(pnl, available, room_revenue=pnl.rooms.revenue)
 
@@ -1255,7 +1846,7 @@ def generate_room_stats_report(
         p_days = max((p_end - p_start).days + 1, 0)
         p_rooms = metrics.filter_by_range(all_rooms, p_start, p_end)
         p_rm = metrics.compute_room_metrics(
-            p_rooms, total_rooms, p_days, rooms_by_type=counts,
+            p_rooms, total_rooms, p_days, rooms_by_type=counts, hours_by_type=hours,
         )
         trend = metrics.compare_room_metrics(rm, p_rm, label, p_label)
         gp_trend = metrics.compare_goppar(
@@ -1278,6 +1869,7 @@ def generate_room_stats_report(
     ]
     if not (trend and trend.comparable):
         lines[-1] += "  _(average rate per night sold)_"
+    lines += _short_stay_block(rm)
 
     if not total_rooms:
         lines += [
@@ -1320,18 +1912,22 @@ def generate_room_stats_report(
         lines += [_SEP, "*BY ROOM TYPE*"]
         ranked = sorted(rm.by_type.items(), key=lambda kv: -kv[1]["revenue"])
         for rtype, d in ranked:
-            head = f"  • *{_esc(rtype)}* — ADR {_fmt(d['adr'])}"
+            rate_label = "per let" if d["is_short"] else "ADR"
+            head = f"  • *{_esc(rtype)}* — {rate_label} {_fmt(d['adr'])}"
             head += f" · RevPAR {_fmt(d['revpar'])}" if d["rooms"] else " · RevPAR _n/a_"
             lines.append(head)
+            units = (_plural(d["lets"], "let") if d["is_short"]
+                     else _plural(d["nights"], "night") + " sold")
             if d["rooms"]:
+                fill = (f"{_pct(d['utilization_pct'])} of its hours"
+                        if d["is_short"] else f"{_pct(d['occupancy_pct'])} full")
                 lines.append(
-                    f"      _{_plural(d['rooms'], 'room')} · "
-                    f"{_plural(d['nights'], 'night')} sold · "
-                    f"{_pct(d['occupancy_pct'])} full · {_fmt(d['revenue'])}_"
+                    f"      _{_plural(d['rooms'], 'room')} · {units} · "
+                    f"{fill} · {_fmt(d['revenue'])}_"
                 )
             else:
                 lines.append(
-                    f"      _{_plural(d['nights'], 'night')} sold · {_fmt(d['revenue'])}_  "
+                    f"      _{units} · {_fmt(d['revenue'])}_  "
                     f"·  _set rooms:_ `/setrooms {rtype.lower()} <n>`"
                 )
 
@@ -1344,6 +1940,31 @@ def generate_room_stats_report(
         f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
     ]
     return "\n".join(lines)
+
+
+def _short_stay_block(rm) -> list[str]:
+    """The hourly trade, reported in its own units.
+
+    Kept apart from ADR and occupancy on purpose. A two-hour let is not a
+    night, and averaging the two produced a rate the hotel never charged for
+    anything; counting lets as nights produced occupancy above 100%. What the
+    two trades *can* share is RevPAR, since revenue per available room-day is
+    a fair question however the room earned it — so that line stays combined.
+    """
+    if not rm.has_short_stay:
+        return []
+    lines = [
+        f"  🕐 *Short stays: {_plural(rm.short_lets, 'let')}*  ·  "
+        f"avg {_fmt(rm.arl)} per let",
+    ]
+    if rm.available_room_hours:
+        lines.append(
+            f"  _Room-time used: {_pct(rm.utilization_pct)} "
+            f"({rm.room_hours_sold:,.0f} of {rm.available_room_hours:,.0f} room-hours, both trades)_"
+        )
+    if rm.room_nights_sold:
+        lines.append("  _Occupancy and ADR above are overnight only — lets are counted here._")
+    return lines
 
 
 def _goppar_block(gp, gp_trend) -> list[str]:
@@ -1412,6 +2033,198 @@ def _yield_gap_note(ranked: list[tuple[str, dict]]) -> list[str]:
         f"  _earns {_fmt(best['revpar'])} from the same space. {_esc(name)} is only "
         f"{_pct(top['occupancy_pct'])} full._",
     ]
+
+
+# ── Night-by-night split (flat rise vs weekend premium) ───────────────
+
+def generate_dow_split_report(
+    for_date: date | None = None,
+    for_month: tuple[int, int] | None = None,
+    all_time: bool = False,
+    for_week: date | None = None,
+) -> str:
+    """Room performance split across the seven nights, plus turnaways.
+
+    The screen for one decision: does a single rate fit every night, or do
+    Friday and Saturday carry demand the working week does not? A blended
+    RevPAR cannot answer it — a hotel full every Friday and half empty every
+    Tuesday reports one middling occupancy that describes neither night.
+
+    Turnaways sit alongside because they are the other half of the evidence: a
+    night at 100% looks identical whether nobody or twenty people were refused,
+    and only the second says the rate is too low.
+    """
+    all_rooms = _active(db.read_all("rooms"))
+    (start, end, label), _ = _room_windows(for_date, for_month, all_time, for_week, all_rooms)
+    room_rows = metrics.filter_by_range(all_rooms, start, end)
+
+    # Stays that began before the window still occupy nights inside it, so the
+    # rows are widened backwards; compute_dow_split clips to [start, end].
+    lookback = metrics.filter_by_range(
+        all_rooms, start - timedelta(days=_MAX_STAY_LOOKBACK), start - timedelta(days=1),
+    )
+    turnaways = db.read_all("turnaways")
+
+    counts = _room_type_counts()
+    total_rooms = _total_rooms() or sum(counts.values())
+    split = metrics.compute_dow_split(
+        room_rows + lookback, start, end, total_rooms, turnaway_rows=turnaways,
+        hours_map=_room_type_hours(),
+    )
+    ta = metrics.summarize_turnaways(turnaways, start, end, adr=split.overall.adr)
+
+    lines = [
+        f"🗓 *{HOTEL_NAME} — Night by Night*",
+        f"📅 Period: {label}",
+        _SEP,
+    ]
+
+    if not split.overall.nights_sold:
+        lines.append("No room-nights fall in this period.")
+        return "\n".join(lines)
+
+    # The answer first — this report exists to settle one question. When the
+    # hotel runs both trades there are two answers, and they can disagree:
+    # overnight demand peaks at the weekend far more reliably than hourly does.
+    if split.verdict:
+        head = "🛏 *Overnight:* " if split.short_verdict else "*"
+        tail = "" if split.short_verdict else "*"
+        lines += [f"{head}{_esc(split.verdict)}{tail}", f"_{_esc(split.detail)}_"]
+    if split.short_verdict:
+        if split.verdict:
+            lines.append("")
+        lines += [f"🕐 *Hourly:* {_esc(split.short_verdict)}",
+                  f"_{_esc(split.short_detail)}_"]
+    if split.verdict or split.short_verdict:
+        lines.append(_SEP)
+
+    # Monospace table: weekday names are fixed width, so the columns line up
+    # without the padding gymnastics the drink table needs.
+    # A hotel that also sells by the hour needs the lets column and the
+    # time-based fill; one that doesn't must not be shown two empty columns.
+    hourly = split.overall.lets > 0
+    if hourly:
+        header = "```\nNight  Use    Nights Lets  ADR      RevPAR   Away\n"
+    else:
+        header = "```\nNight  Occ    ADR      RevPAR   Away\n"
+    body = ""
+    for i, b in enumerate(split.by_dow):
+        if not b.days:
+            continue
+        revpar = f"{b.revpar:,.0f}" if split.has_rooms else "—"
+        away = str(b.turnaways) if b.turnaways else "·"
+        if hourly:
+            fill = f"{b.utilization_pct:.0f}%" if split.has_rooms else "—"
+            body += (f"{metrics.DOW_SHORT[i]:<6} {fill:<6} {b.nights_sold:<6} "
+                     f"{b.lets:<5} {b.adr:<8,.0f} {revpar:<8} {away}\n")
+        else:
+            occ = f"{b.occupancy_pct:.0f}%" if split.has_rooms else "—"
+            body += (f"{metrics.DOW_SHORT[i]:<6} {occ:<6} {b.adr:<8,.0f} "
+                     f"{revpar:<8} {away}\n")
+    lines.append(header + body + "```")
+    if hourly:
+        lines.append("  _Use = share of room-hours sold · ADR is the overnight rate_")
+
+    # Either end can come back empty when too many nights tie to name a peak,
+    # so they are rendered independently rather than as one line that vanishes.
+    peaks = [f"Busiest: *{split.busiest}*"] if split.busiest else []
+    peaks += [f"Quietest: *{split.quietest}*"] if split.quietest else []
+    if peaks:
+        lines.append("  " + "  ·  ".join(peaks))
+
+    # The comparison the decision actually turns on.
+    lines += [_SEP, "*WEEKDAY vs WEEKEND*  _(weekend = Fri & Sat nights)_"]
+    for b in (split.weekday, split.weekend):
+        head = f"  • *{b.label}* — ADR {_fmt(b.adr)}"
+        if b.lets:
+            head += f" · {_fmt(b.arl)} per let"
+        if split.has_rooms:
+            head += f" · {_pct(b.occupancy_pct)} full · RevPAR {_fmt(b.revpar)}"
+        lines.append(head)
+        sold = _plural(b.nights_sold, "room-night") + " sold"
+        if b.lets:
+            sold += f" · {_plural(b.lets, 'let')}"
+        lines.append(f"      _{_plural(b.days, 'night')} · {sold} · {_fmt(b.revenue)}_")
+    if split.has_rooms:
+        gap = split.occupancy_gap_pt
+        direction = "fuller" if gap >= 0 else "emptier"
+        lines.append(
+            f"  _Weekend runs {abs(gap):,.1f} points {direction}"
+            f" and is priced {_signed_pct(split.adr_gap_pct)}._"
+        )
+
+    lines += _turnaway_block(ta, split)
+
+    lines += [
+        _SEP,
+        "_A blended rate hides the difference between your best night and your_",
+        "_worst. This screen is what a weekday/weekend split is argued from._",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
+
+
+def _signed_pct(pct: float) -> str:
+    """'8% higher' / '5% lower' / 'the same' — for a rate gap read in prose."""
+    if pct > metrics.TREND_BAND:
+        return f"{pct:,.0f}% higher"
+    if pct < -metrics.TREND_BAND:
+        return f"{abs(pct):,.0f}% lower"
+    return "about the same"
+
+
+def _turnaway_block(ta, split) -> list[str]:
+    """Refused bookings — the demand a full night leaves invisible.
+
+    When nothing has ever been recorded the block says so plainly rather than
+    printing a zero. Zero turnaways and no turnaway *tracking* are opposite
+    findings: one says demand stops at the door, the other says nobody looked.
+    """
+    lines = [_SEP, "*TURNED AWAY*"]
+
+    if not ta.tracked:
+        lines += [
+            "  ⚠️ _Nothing recorded for this period._",
+            "  _A sold-out night and a night that turned away twenty guests_",
+            "  _look identical in the books. Until these are logged, occupancy_",
+            "  _cannot tell you whether your rate is too low._",
+            "  Log them as they happen: `/turnaway <how many> [type] [reason]`",
+        ]
+        return lines
+
+    lines.append(
+        f"  🚪 *{_plural(ta.total, 'guest')} turned away* "
+        f"across {_plural(ta.days_with_data, 'day')}"
+    )
+    if ta.lost_revenue:
+        lines.append(
+            f"  _≈ {_fmt(ta.lost_revenue)} of demand not served, priced at your own ADR._"
+        )
+    if ta.by_type:
+        top = ", ".join(f"{_esc(t)} ({n})" for t, n in list(ta.by_type.items())[:4])
+        lines.append(f"  _Wanted: {top}_")
+    if ta.by_reason and list(ta.by_reason) != ["not given"]:
+        top = ", ".join(f"{_esc(r)} ({n})" for r, n in list(ta.by_reason.items())[:3])
+        lines.append(f"  _Reasons: {top}_")
+
+    # This is the pricing signal: refusals concentrated on nights that are
+    # already full mean the rate on those nights is below what the market will
+    # pay. Refusals on quiet nights mean the wrong *type* of room, not price.
+    wknd = split.weekend.turnaways
+    wkdy = split.weekday.turnaways
+    if split.has_rooms and ta.total:
+        if wknd > wkdy and split.weekend.occupancy_pct >= 70:
+            lines.append(
+                "  💡 _Concentrated on nights that are already full — that is "
+                "unmet demand at the weekend, and the clearest case there is for "
+                "a weekend premium rather than a flat rise._"
+            )
+        elif wkdy > wknd:
+            lines.append(
+                "  💡 _Mostly on working-week nights — check whether it is the "
+                "room type you are short of rather than the price._"
+            )
+    return lines
 
 
 # ── Supplier invoices (payables) ──────────────────────────────────────

@@ -63,8 +63,12 @@ from telegram.request import HTTPXRequest
 
 import clock
 import database as db
+import random
+from calendar import monthrange
+
 import inventory as inv
 import logic
+import metrics
 import reports
 from config import (
     ADMIN_IDS,
@@ -222,6 +226,35 @@ def _extract_date(args: list[str]) -> tuple[list[str], str | None]:
     return args, None
 
 
+_HOURS_RE = re.compile(r"^(\d+(?:\.\d+)?)h$", re.IGNORECASE)
+
+
+def _extract_hours(args: list[str]) -> tuple[list[str], float | None]:
+    """Peel off a `<n>h` token — a stay length negotiated for this booking only.
+
+    Same shape as _extract_date: the token can sit anywhere the caller put it,
+    it is optional, and leaving it out means the room type's own configured
+    length applies. `3h` on a nightly type is how a one-off short let is
+    recorded without declaring the whole type hourly.
+    """
+    # Skip index 0: that slot is the room type, and a hotel is entitled to
+    # call a type "2h" without the booking losing its name to this parser.
+    for i, arg in enumerate(args):
+        if i == 0:
+            continue
+        m = _HOURS_RE.match(arg)
+        if m:
+            try:
+                hours = float(m.group(1))
+            except ValueError:
+                continue
+            # Peeled off even when out of range, so process_room_sale can say
+            # why. Leaving `25h` in the args made it a silently ignored token
+            # and booked a full night instead.
+            return args[:i] + args[i + 1:], hours
+    return args, None
+
+
 def _to_int(value: str, label: str) -> tuple[int | None, str]:
     try:
         v = int(value)
@@ -259,20 +292,22 @@ def _to_float(value: str, label: str) -> tuple[float | None, str]:
         return None, f"❌ *{label}* must be a positive number. Got: `{value}`"
 
 
-async def _reply(update: Update, text: str) -> None:
+async def _reply(update: Update, text: str, reply_markup=None) -> None:
     """Send a reply, falling back to plain text if MarkdownV2 parsing fails."""
     try:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                        reply_markup=reply_markup)
     except Exception:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
 
-async def _send_chunk_cb(q, text: str) -> None:
+async def _send_chunk_cb(q, text: str, reply_markup=None) -> None:
     """Send one chunk from a callback context, falling back to plain text if Markdown fails."""
     try:
-        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+        await q.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                   reply_markup=reply_markup)
     except Exception:
-        await q.message.reply_text(text)
+        await q.message.reply_text(text, reply_markup=reply_markup)
 
 
 async def _edit_cb(q, text: str) -> None:
@@ -286,24 +321,32 @@ async def _edit_cb(q, text: str) -> None:
             pass
 
 
-async def _reply_long_cb(q, text: str) -> None:
-    """Send a long reply from a CallbackQuery context."""
+async def _reply_long_cb(q, text: str, reply_markup=None) -> None:
+    """Send a long reply from a CallbackQuery context.
+
+    ``reply_markup`` rides on the **last** chunk only — a follow-up button
+    belongs under the end of the report, not repeated down the middle of one
+    that had to be split.
+    """
     limit = 4000
     if len(text) <= limit:
-        await _send_chunk_cb(q, text)
+        await _send_chunk_cb(q, text, reply_markup)
         return
     lines = text.split("\n")
+    chunks: list[str] = []
     chunk: list[str] = []
     size = 0
     for line in lines:
         if size + len(line) + 1 > limit and chunk:
-            await _send_chunk_cb(q, "\n".join(chunk))
+            chunks.append("\n".join(chunk))
             chunk = []
             size = 0
         chunk.append(line)
         size += len(line) + 1
     if chunk:
-        await _send_chunk_cb(q, "\n".join(chunk))
+        chunks.append("\n".join(chunk))
+    for i, c in enumerate(chunks):
+        await _send_chunk_cb(q, c, reply_markup if i == len(chunks) - 1 else None)
 
 
 async def _send_chunk(update: Update, text: str) -> None:
@@ -378,8 +421,9 @@ def _help_text(is_admin: bool = False) -> str:
         "`/sell` — 🍺 tap-to-sell guided flow _(easiest)_\n"
         "`/book` — 🛏 tap-to-book room guided flow _(easiest)_\n"
         "`/sell_drink <drink> <qty>` — quick text sale\n"
-        "`/room <type> <qty> <nights>` — quick text room booking\n"
+        "`/room <type> <qty> <nights>` — quick text room booking\n"        "_add_ `3h` _for a one-off short let, e.g._ `/room standard 1 5000 1 3h`\n"
         "`/undo` — undo your last entry within 2 minutes\n"
+        "`/turnaway <how many> [type] [reason]` — log guests you had no room for\n"
         "`/cancel` — cancel a guided flow\n"
         "\n"
         "*📊 Viewing*\n"
@@ -399,7 +443,7 @@ def _help_text(is_admin: bool = False) -> str:
         return staff_cmds
     admin_cmds = (
         "\n\n*🔧 Admin Commands*\n"
-        "`/expense <room|bar> <category> <amount> [note] [YYYY-MM-DD]`\n"
+        "`/expense <rooms|bar|overhead> <category> <amount> [note] [YYYY-MM-DD]`\n"
         "`/draw <amount> [note] [YYYY-MM-DD]` — owner withdrawal _(not an expense)_\n"
         "`/draws` | `/draws YYYY-MM` | `/draws all` — list owner draws\n"
         "`/add_debtor <room|bar> <name> <amount> [note] [by:<staff>] [YYYY-MM-DD]`\n"
@@ -414,7 +458,9 @@ def _help_text(is_admin: bool = False) -> str:
         "`/deletedrink <drink>` — remove a zero-stock drink\n"
         "`/delete <sale|room|expense|draw> <id>`\n"
         "`/setprice <drink> <price>`\n"
-        "`/setroomtype <type> <price>` — set room type preset price\n"
+        "`/setroomtype <type> <price>` — set room type preset price\n"        "`/setduration <type> <hours>` — mark a room type as sold by the hour\n"        "`/stocktake` — month-end count sheet, then enter bar & store counts\n"
+        "`/roomaudit` — were all room-nights logged, at the rate charged?\n"        "`/review [period]` — month-end check: big entries + flagged ones\n"
+        "`/reclassify <id> <account|class> <value>` — correct a classification\n"
         "`/report` | `/report today` | `/report YYYY-MM` | `/report all`\n"
         "`/position` — what you have: cash, stock & receivables\n"
         "`/position set <amount> <YYYY-MM-DD>` — anchor cash to your real balance on that day _(counts from then; re-anchor anytime)_\n"
@@ -430,6 +476,7 @@ def _help_text(is_admin: bool = False) -> str:
         "`/cashcycle [days]` — how long cash is locked in stock & debtors, + break-even\n"
         "`/menu [days]` — which drinks to protect, push, reprice or drop\n"
         "`/roomstats [week|lastweek|period]` — occupancy, ADR, RevPAR & GOPPAR vs the period before\n"
+        "`/roomstats dow [period]` — night-by-night split + turnaways _(flat rise vs weekend premium)_\n"
         "`/setrooms <n>` — your room count _(needed for occupancy & RevPAR)_\n"
         "`/setrooms <type> <n>` — rooms of one type _(unlocks RevPAR per room type)_\n"
         "\n"
@@ -534,6 +581,38 @@ async def cmd_setroomtype(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await _reply(update, f"✅ *{reports._esc(room_type.title())}* preset set to ₦{price:,.0f}/night.\nStaff can now use: `/room {room_type.lower()} <qty> <nights>`")
 
 
+@_require_admin
+async def cmd_setduration(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Declare a room type as hourly — what tells lets apart from nights."""
+    args = _parse_args(ctx)
+    if len(args) < 2:
+        configured = db.get_all_room_type_hours()
+        body = (
+            "Usage: `/setduration <type> <hours>`\n"
+            "Example: `/setduration short time 2`  _(a 2-hour let)_\n"
+            "Example: `/setduration standard 24`   _(back to a full night)_\n\n"
+            "_Rooms sold by the hour are recorded as room types with_ `nights=1`_,_\n"
+            "_so without this a room let 3× in a day reports 300% occupancy and_\n"
+            "_its rate is averaged into your overnight ADR. Setting it also fixes_\n"
+            "_past bookings._"
+        )
+        if configured:
+            listed = "\n".join(
+                f"  • *{reports._esc(t.title())}* — {h:g}h per let"
+                for t, h in sorted(configured.items())
+            )
+            body += f"\n\n*Hourly types now:*\n{listed}"
+        await _reply(update, body)
+        return
+
+    hours, err = _to_float(args[-1], "hours")
+    if err:
+        await _reply(update, err)
+        return
+    ok, msg = logic.process_set_room_duration(" ".join(args[:-1]), hours)
+    await _reply(update, msg)
+
+
 # ── /prices ──────────────────────────────────────────────────────────
 
 @_require_auth
@@ -595,6 +674,7 @@ async def cmd_restock(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @_require_auth
 async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args, ts = _extract_date(_parse_args(ctx))
+    args, hours = _extract_hours(args)
     if len(args) < 3:
         await _reply(
             update,
@@ -602,7 +682,9 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Or:    `/room <type> <qty> <price> <nights> [YYYY-MM-DD]`\n"
             "Example: `/room standard 1 3`\n"
             "Example: `/room standard 1 12000 3`  _(negotiated price)_\n"
-            "Set room prices: `/setroomtype standard 15000`",
+            "Example: `/room standard 1 5000 1 3h`  _(a one-off 3-hour let)_\n"
+            "Set room prices: `/setroomtype standard 15000`\n"
+            "Rooms always sold by the hour: `/setduration short time 2`",
         )
         return
 
@@ -642,7 +724,8 @@ async def cmd_room(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg, _room_id = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts, recorded_by=recorded_by)
+    ok, msg, _room_id = logic.process_room_sale(room_type, qty, price, nights, timestamp=ts,
+                                                recorded_by=recorded_by, duration_hours=hours)
     if ok and price_note:
         msg += f"\n{price_note}"
     await _reply(update, msg)
@@ -1405,6 +1488,13 @@ async def cmd_roomstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     args = _parse_args(ctx)
     arg = (args[0] if args else "").lower()
 
+    # `dow` switches to the night-by-night split; the period argument that
+    # follows is parsed exactly as it is for the headline view.
+    dow = arg in ("dow", "days", "nights", "weekday", "weekend")
+    if dow:
+        args = args[1:]
+        arg = (args[0] if args else "").lower()
+
     # Weeks are roomstats-only: rate/volume moves show up week to week long
     # before a month closes, which is when a discount is still worth reversing.
     if arg in ("week", "lastweek", "last_week"):
@@ -1418,8 +1508,12 @@ async def cmd_roomstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             update,
             "Usage: `/roomstats` | `/roomstats week` | `/roomstats lastweek`\n"
             "       `/roomstats today` | `/roomstats YYYY-MM-DD`\n"
-            "       `/roomstats YYYY-MM` | `/roomstats all`",
+            "       `/roomstats YYYY-MM` | `/roomstats all`\n"
+            "       `/roomstats dow [period]` — night-by-night split + turnaways",
         )
+        return
+    if dow:
+        await _reply_long(update, reports.generate_dow_split_report(**kwargs))
         return
     await _reply_long(update, reports.generate_room_stats_report(**kwargs))
 
@@ -1490,6 +1584,111 @@ async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     note = " ".join(args[2:])
     ok, msg = logic.process_stock_count(
         args[0], counted, note=note,
+        recorded_by=_actor(update), timestamp=custom_date,
+    )
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_stocktake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Month-end stocktake — prints the count sheet to carry."""
+    await _reply(
+        update, reports.generate_count_sheet(),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📦 Enter the counts", callback_data="stk:start")],
+            [InlineKeyboardButton("📊 Variance report", callback_data="vfy:variance")],
+        ]),
+    )
+
+
+@_require_admin
+async def cmd_roomaudit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Room audit — the bot draws the days, never the operator."""
+    await _reply(
+        update,
+        "🔎 *Room Audit*\n"
+        "_Confirms every room-night was logged, at the rate charged._\n\n"
+        "_Three days are drawn at random from this month. You do not choose_\n"
+        "_them: days you remember clearly are the days most likely to be right._",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🎲 Draw the days", callback_data="rau:start")]]),
+    )
+
+
+@_require_admin
+async def cmd_reclassify(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Correct one expense's classification in place. Amounts are never touched."""
+    args = _parse_args(ctx)
+    if len(args) < 3:
+        await _reply(
+            update,
+            "Usage: `/reclassify <id> <account|class> <value>`\n\n"
+            "Examples:\n"
+            "`/reclassify 42 class capital`\n"
+            "`/reclassify 42 account overhead`\n\n"
+            "_Classes:_ operating, periodic, capital\n"
+            "_Accounts:_ bar, rooms, overhead\n\n"
+            "_Or tap_ ⚙️ Manage → 🔎 Review_._",
+        )
+        return
+    entry_id, err = _to_int(args[0], "entry ID")
+    if err:
+        await _reply(update, err)
+        return
+    field, value = args[1].lower(), args[2].lower()
+    if field not in ("account", "class"):
+        await _reply(update, "❌ Field must be `account` or `class`.")
+        return
+    kwargs = {"expense_class": value} if field == "class" else {"account": value}
+    ok, msg = logic.process_reclassify_expense(entry_id, needs_review=False, **kwargs)
+    await _reply(update, msg)
+
+
+@_require_admin
+async def cmd_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Month-end check: large entries plus anything flagged as unsure."""
+    args = _parse_args(ctx)
+    kwargs = _period_kwargs(args[0] if args else "")
+    if kwargs is None:
+        await _reply(update, "Usage: `/review` | `/review YYYY-MM` | `/review all`")
+        return
+    await _reply_long(update, reports.generate_review_report(**kwargs))
+
+
+@_require_auth
+async def cmd_turnaway(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log guests turned away — the demand a full night leaves invisible."""
+    args, custom_date = _extract_date(_parse_args(ctx))
+    if not args:
+        await _reply(
+            update,
+            "🚪 *Turned someone away?*\n"
+            "_Log the people you had no room for. No money moves — this is the_\n"
+            "_demand a full night hides, and it is what says whether your rate_\n"
+            "_is too low._\n\n"
+            "_Typing works too:_ `/turnaway 2 standard fully booked`",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚪 Log a turnaway", callback_data="ta:start")]]
+            ),
+        )
+        return
+
+    qty, err = _to_int(args[0], "number turned away")
+    if err:
+        await _reply(update, err)
+        return
+
+    # A room type may contain spaces ("short time"), so match the longest known
+    # type that the remaining words start with rather than taking one token.
+    rest = " ".join(args[1:]).strip()
+    room_type = ""
+    for known in sorted(_known_room_types(), key=len, reverse=True):
+        if rest.lower() == known or rest.lower().startswith(known + " "):
+            room_type, rest = known, rest[len(known):].strip()
+            break
+
+    ok, msg = logic.process_turnaway(
+        qty, room_type=room_type, reason=rest,
         recorded_by=_actor(update), timestamp=custom_date,
     )
     await _reply(update, msg)
@@ -2300,6 +2499,14 @@ _DSF_DEBT, _DSF_STAFF = range(67, 69)  # edit-debt-staff flow: pick debt → pic
 _SUP_DRINK, _SUP_DRINK_TEXT, _SUP_QTY, _SUP_QTY_TEXT, _SUP_COST, _SUP_WHO, _SUP_WHO_TEXT, _SUP_DUE, _SUP_DUE_TEXT = range(69, 78)
 _SPY_INV, _SPY_AMT = range(78, 80)  # pay-supplier flow: pick invoice → full/partial
 _SRC_PICK, _SRC_TYPE_TEXT, _SRC_COUNT = range(80, 83)  # room-count flow: pick total/type → how many
+_TA_QTY, _TA_QTY_TEXT, _TA_TYPE, _TA_REASON, _TA_REASON_TEXT = range(83, 88)  # turnaway flow
+_SSL_PICK, _SSL_TYPE_TEXT, _SSL_HOURS, _SSL_HOURS_TEXT = range(88, 92)  # stay-length flow
+_EXP_CLASS = 92                     # expense axis 2: operating/periodic/capital
+_RCL_PICK, _RCL_FIELD, _RCL_VALUE = range(93, 96)  # reclassify flow
+_POB_NAME, _POB_AMT, _POB_MONTHS, _POB_ACCT = range(96, 100)   # register a periodic bill
+_STK_ITEM, _STK_BAR, _STK_STORE = range(102, 105)              # month-end stocktake
+_RAU_ACTUAL, _RAU_ACTUAL_TEXT, _RAU_RATE, _RAU_RATE_TEXT = range(105, 109)  # room audit
+_PPY_PICK, _PPY_AMT = range(100, 102)                          # pay one from the reserve
 
 
 def _drink_keyboard() -> InlineKeyboardMarkup:
@@ -2337,11 +2544,21 @@ def _nights_keyboard() -> InlineKeyboardMarkup:
 
 def _room_type_keyboard() -> InlineKeyboardMarkup:
     presets = db.get_all_room_type_prices()
+    hours = db.get_all_room_type_hours()
     rows = []
     for p in presets:
-        label = f"{p['room_type']} — ₦{int(p['price']):,}/night"
+        # An hourly type is not priced per night; saying so here is where the
+        # front desk first sees which trade they are booking into.
+        h = hours.get(str(p["room_type"]).strip().lower())
+        unit = f"/{h:g}h let" if h and h < metrics.NIGHT_HOURS else "/night"
+        label = f"{p['room_type']} — ₦{int(p['price']):,}{unit}"
         rows.append([InlineKeyboardButton(label, callback_data=f"bt:{p['room_type'].lower()}")])
     rows.append([InlineKeyboardButton("✏️ Other type", callback_data="bt:__other__")])
+    # Deliberately NOT a `bt:` callback: the booking conversation only claims
+    # `^bt:`, so this falls straight through to the turnaway conversation
+    # instead of needing a second tap to escape the booking flow.
+    rows.append([InlineKeyboardButton("🚪 No room free — log a turnaway",
+                                      callback_data="ta:start")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2792,7 +3009,7 @@ async def _cb_history_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     from datetime import datetime as _dt
-    date_str = _dt.now().strftime("%Y-%m-%d") if val == "today" else val
+    date_str = clock.today().strftime("%Y-%m-%d") if val == "today" else val
     label = _dt.strptime(date_str, "%Y-%m-%d").strftime("%d %b %Y")
     entries = db.get_entries_by_date(date_str)
 
@@ -2843,9 +3060,10 @@ async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await q.edit_message_text("🔒 Admin only.")
         return
 
-    from datetime import datetime as _dt
     action = q.data[4:]
-    now = _dt.now()
+    # clock.now() answers in the *hotel's* timezone; datetime.now() reads the
+    # server's, which on Railway is UTC and files a late entry under yesterday.
+    now = clock.now()
 
     if action == "cashcycle":
         text = reports.generate_cashcycle_report()
@@ -2859,6 +3077,14 @@ async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=_roomstats_period_keyboard(),
         )
         return
+    elif action == "dow":
+        await q.edit_message_text(
+            "🗓 *Night by Night* — which period?\n"
+            "_Occupancy, rate and turnaways split across the seven nights._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_period_keyboard("dow"),
+        )
+        return
     elif action == "variance":
         text = reports.generate_variance_report(for_month=(now.year, now.month))
     elif action == "payables":
@@ -2868,6 +3094,17 @@ async def _cb_insights_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_long_cb(q, text)
 
 
+def _period_kwargs_for(choice: str) -> dict | None:
+    """Period button → report kwargs, on the hotel's clock, not the server's."""
+    today = clock.today()
+    return {
+        "week":     {"for_week": today},
+        "lastweek": {"for_week": today - timedelta(days=7)},
+        "month":    {"for_month": (today.year, today.month)},
+        "all":      {"all_time": True},
+    }.get(choice)
+
+
 async def _cb_roomstats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """📈 Insights → 🛏 Room Stats → period. Mirrors /roomstats exactly."""
     q = update.callback_query
@@ -2875,19 +3112,24 @@ async def _cb_roomstats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     if not _is_admin(q.from_user.id):
         await q.edit_message_text("🔒 Admin only.")
         return
-
-    from datetime import datetime as _dt
-    choice = q.data[4:]
-    today = _dt.now().date()
-    kwargs = {
-        "week":     {"for_week": today},
-        "lastweek": {"for_week": today - timedelta(days=7)},
-        "month":    {"for_month": (today.year, today.month)},
-        "all":      {"all_time": True},
-    }.get(choice)
+    kwargs = _period_kwargs_for(q.data[4:])
     if kwargs is None:
         return
     await _reply_long_cb(q, reports.generate_room_stats_report(**kwargs))
+
+
+async def _cb_dow_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """📈 Insights → 🗓 Night by Night → period. Mirrors /roomstats dow."""
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    kwargs = _period_kwargs_for(q.data[4:])
+    if kwargs is None:
+        return
+    await _reply_long_cb(q, reports.generate_dow_split_report(**kwargs),
+                         reply_markup=_TA_AGAIN_KB)
 
 
 async def _cb_suppliers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2898,6 +3140,772 @@ async def _cb_suppliers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await q.edit_message_text("🔒 Admin only.")
         return
     await _reply_long_cb(q, reports.generate_payables_report())
+
+
+# ── Month-end verification: stocktake & room audit ────────────────────
+#
+# Both exist because the books can only ever confirm their own arithmetic. A
+# physical count and a register check are the two independent observations the
+# business has, and without them a month's figures are self-referential.
+
+async def _cb_verify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    now = clock.now()
+    counted = any(str(r.get("timestamp", ""))[:7] == now.strftime("%Y-%m")
+                  for r in db.read_all("stock_counts"))
+    audited = any(str(r.get("audit_date", ""))[:7] == now.strftime("%Y-%m")
+                  for r in db.get_room_audits())
+    await q.edit_message_text(
+        "🧾 *Month-End Verification*\n"
+        f"_{now.strftime('%B %Y')}_\n\n"
+        f"  {'✅' if counted else '⚠️'} Stocktake "
+        f"{'entered' if counted else '*not done* — the month is UNVERIFIED'}\n"
+        f"  {'✅' if audited else '⚠️'} Room audit "
+        f"{'done' if audited else 'not done'}\n\n"
+        "_Run both on the last day of the month, before any report._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Print count sheet", callback_data="vfy:sheet")],
+            [InlineKeyboardButton("📦 Enter stocktake", callback_data="stk:start")],
+            [InlineKeyboardButton("🔎 Room audit", callback_data="rau:start")],
+            [InlineKeyboardButton("📊 Variance report", callback_data="vfy:variance")],
+        ]),
+    )
+
+
+async def _cb_verify_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    now = clock.now()
+    if q.data == "vfy:sheet":
+        await _reply_long_cb(q, reports.generate_count_sheet())
+    else:
+        await _reply_long_cb(q, reports.generate_variance_report(
+            for_month=(now.year, now.month)))
+
+
+# ── Stocktake entry: every item, bar then store ───────────────────────
+
+def _stk_items():
+    return sorted(inv.get_inventory_summary(), key=lambda r: r["drink"])
+
+
+async def _stk_prompt(send, ctx) -> int:
+    """Ask for the next item, or finish and show the variance report."""
+    items = ctx.user_data.get("stk_items", [])
+    i = ctx.user_data.get("stk_i", 0)
+    if i >= len(items):
+        now = clock.now()
+        done = ctx.user_data.get("stk_done", 0)
+        ctx.user_data.clear()
+        await send(f"✅ Stocktake entered — {_plural_items(done)} counted.\n"
+                   "_This month is now verified._",
+                   parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+        return ConversationHandler.END
+
+    it = items[i]
+    await send(
+        f"📦 *{reports._esc(it['drink'].title())}*  ({i + 1} of {len(items)})\n"
+        f"_Books say: bar {it['bar_stock']} · store {it['store_stock']}_\n\n"
+        "*How many in the BAR?*  _(or ⏭ to skip)_",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏭ Skip this item", callback_data="stk_sk:1")]]),
+    )
+    return _STK_BAR
+
+
+def _plural_items(n):
+    return f"{n} item" + ("" if n == 1 else "s")
+
+
+async def _stk_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+    items = _stk_items()
+    if not items:
+        await q.edit_message_text("No stock items yet — add one with `/restock`.")
+        return ConversationHandler.END
+    ctx.user_data.update(stk_items=items, stk_i=0, stk_done=0)
+    return await _stk_prompt(q.edit_message_text, ctx)
+
+
+async def _stk_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["stk_i"] = ctx.user_data.get("stk_i", 0) + 1
+    return await _stk_prompt(q.edit_message_text, ctx)
+
+
+async def _stk_bar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    counted, err = _to_count(update.message.text.strip(), "bar count")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number of units:")
+        return _STK_BAR
+    ctx.user_data["stk_bar"] = counted
+    items = ctx.user_data["stk_items"]
+    it = items[ctx.user_data["stk_i"]]
+    await update.message.reply_text(
+        f"🏪 *{reports._esc(it['drink'].title())}* — *how many in the STORE?*\n"
+        f"_Books say {it['store_stock']}._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏭ Skip this item", callback_data="stk_sk:1")]]))
+    return _STK_STORE
+
+
+async def _stk_store(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    counted, err = _to_count(update.message.text.strip(), "store count")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number of units:")
+        return _STK_STORE
+
+    items = ctx.user_data["stk_items"]
+    it = items[ctx.user_data["stk_i"]]
+    actor = _actor(update)
+    # Two rows, one per location: a bottle moved to the bar and a bottle sold
+    # look identical in a combined figure.
+    _ok_b, msg_b = logic.process_stock_count(it["drink"], ctx.user_data.pop("stk_bar", 0),
+                                             recorded_by=actor, location="bar")
+    _ok_s, msg_s = logic.process_stock_count(it["drink"], counted,
+                                             recorded_by=actor, location="store")
+    await update.message.reply_text(msg_b, parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(msg_s, parse_mode=ParseMode.MARKDOWN_V2)
+
+    ctx.user_data["stk_i"] += 1
+    ctx.user_data["stk_done"] = ctx.user_data.get("stk_done", 0) + 1
+    return await _stk_prompt(update.message.reply_text, ctx)
+
+
+# ── Room audit: the bot draws the days ────────────────────────────────
+
+async def _rau_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+
+    now = clock.now()
+    all_rooms = reports._active(db.read_all("rooms"))
+    # random.SystemRandom, and never seeded from anything the operator supplies:
+    # days a person picks are days they remember, and those are the days most
+    # likely to be correct.
+    days = metrics.audit_days(all_rooms, now.year, now.month, 3, random.SystemRandom())
+    if not days:
+        await q.edit_message_text("No days to audit in this month yet.")
+        return ConversationHandler.END
+
+    ctx.user_data["rau_days"] = days
+    ctx.user_data["rau_logged"] = logged = sum(
+        metrics.build_audit_day(all_rooms, d, _audit_rooms(), reports._room_type_hours()
+                                ).nights_logged for d in days)
+    await _reply_long_cb(q, reports.audit_sheet(days, now.year, now.month))
+    await q.message.reply_text(
+        f"🔎 *The system logged {_plural_nights(logged)} across those days.*\n"
+        "_Checking the register: how many did it MISS?_\n"
+        "_Count the rooms marked VACANT that were actually occupied._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_rau_missing_keyboard())
+    return _RAU_ACTUAL
+
+
+def _plural_nights(n: int) -> str:
+    return f"{n} night" + ("" if n == 1 else "s")
+
+
+def _audit_rooms() -> int:
+    return reports._total_rooms() or sum(reports._room_type_counts().values())
+
+
+def _rau_missing_keyboard() -> InlineKeyboardMarkup:
+    """Asked as a delta, not an absolute.
+
+    "How many were actually occupied" forces mental arithmetic against a figure
+    the bot already knows. The answer that matters is how many it missed, and
+    that is nearly always a small number — so it is a tap.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ None — all logged", callback_data="rau_m:0")],
+        [InlineKeyboardButton(f"+{n}", callback_data=f"rau_m:{n}") for n in (1, 2, 3)],
+        [InlineKeyboardButton(f"+{n}", callback_data=f"rau_m:{n}") for n in (4, 5, 6)],
+        [InlineKeyboardButton("✏️ Other", callback_data="rau_m:__other__")],
+    ])
+
+
+def _rau_rate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Every rate matched", callback_data="rau_r:0")],
+        [InlineKeyboardButton("✏️ Enter the difference", callback_data="rau_r:__other__")],
+    ])
+
+
+async def _rau_ask_rate(send) -> int:
+    await send(
+        "💰 *Did the rates match?*\n"
+        "_What the register shows charged, against what the system logged._",
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_rau_rate_keyboard())
+    return _RAU_RATE
+
+
+async def _rau_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val == "__other__":
+        await q.edit_message_text("Type how many nights the system missed:")
+        return _RAU_ACTUAL_TEXT
+    ctx.user_data["rau_actual"] = ctx.user_data.get("rau_logged", 0) + int(val)
+    return await _rau_ask_rate(q.edit_message_text)
+
+
+async def _rau_missing_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    missing, err = _to_count(update.message.text.strip(), "nights missed")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number (0 if none):")
+        return _RAU_ACTUAL_TEXT
+    ctx.user_data["rau_actual"] = ctx.user_data.get("rau_logged", 0) + missing
+    return await _rau_ask_rate(update.message.reply_text)
+
+
+async def _rau_rate_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if q.data[6:] == "__other__":
+        await q.edit_message_text(
+            "Type the difference in ₦ (negative if you charged less than logged):")
+        return _RAU_RATE_TEXT
+    return await _rau_finish(q.message.reply_text, ctx, 0.0, _actor(update))
+
+
+async def _rau_rate_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip().replace(",", "")
+    try:
+        variance = float(raw)
+    except ValueError:
+        await update.message.reply_text("❌ Enter an amount (0 if rates all matched):")
+        return _RAU_RATE_TEXT
+    return await _rau_finish(update.message.reply_text, ctx, variance, _actor(update))
+
+
+async def _rau_finish(send, ctx, variance: float, actor: str) -> int:
+    days = ctx.user_data.pop("rau_days", [])
+    actual = ctx.user_data.pop("rau_actual", 0)
+    logged = ctx.user_data.pop("rau_logged", 0)
+    ctx.user_data.clear()
+
+    now = clock.now()
+    all_rooms = reports._active(db.read_all("rooms"))
+    hours = reports._room_type_hours()
+    total = _audit_rooms()
+
+    month_rows = metrics.filter_by_month(all_rooms, now.year, now.month)
+    rm = metrics.compute_room_metrics(month_rows, total,
+                                      monthrange(now.year, now.month)[1],
+                                      hours_by_type=hours)
+    for d in days:
+        day_logged = metrics.build_audit_day(all_rooms, d, total, hours).nights_logged
+        logic.process_room_audit(
+            d.strftime("%Y-%m-%d"), total, day_logged,
+            # The corrections are entered in total, so the extra nights are
+            # attributed evenly rather than guessed onto one day.
+            day_logged + round((actual - logged) / max(len(days), 1)),
+            rate_variance=variance / max(len(days), 1),
+            variance_count=1 if variance else 0, recorded_by=actor,
+        )
+
+    result = metrics.compute_room_audit(
+        days=len(days), nights_logged=logged, nights_actual=actual,
+        rate_variance=variance, variance_count=1 if variance else 0,
+        adr=rm.adr, days_in_month=monthrange(now.year, now.month)[1],
+    )
+    await send(reports.generate_room_audit_report(result, db.get_room_audits()),
+               parse_mode=ParseMode.MARKDOWN_V2)
+    return ConversationHandler.END
+
+
+# ── Periodic bills: register & pay (⚙️ Manage → 🔁 Periodic) ──────────
+#
+# A bill landing every six months is a cost of all six. Registering it here is
+# what lets the P&L charge a monthly share; paying it later draws that share
+# back out of the reserve instead of dropping the whole invoice on one month.
+
+_POB_MONTH_PRESETS = [("Every 3 months", 3), ("Every 6 months", 6),
+                      ("Every year", 12), ("Every 2 years", 24)]
+
+
+async def _cb_periodic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    obligations = reports._obligations()
+    reserve = metrics.compute_reserve(
+        obligations, reports._active(db.read_all("expenses")), clock.today())
+
+    lines = ["🔁 *Periodic Bills*",
+             "_Bills that land every few months. Each one sets aside its share_",
+             "_every month, so the invoice is a draw, not a shock._", ""]
+    if obligations:
+        lines.append(f"  Accruing *{reports._fmt(reserve.monthly_total)}/month*")
+        lines.append(f"  Reserve balance: *{reports._fmt(reserve.balance)}*")
+    else:
+        lines.append("  _Nothing registered yet._")
+
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Register a bill", callback_data="pob:start")],
+            [InlineKeyboardButton("💸 Pay one", callback_data="ppy:start")],
+            [InlineKeyboardButton("📋 Reserve detail", callback_data="mgr:reserve")],
+        ]),
+    )
+
+
+async def _cb_reserve_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """The reserve lives in section ③ of the expense report — no second view of
+    the same numbers, which is how two screens start disagreeing."""
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    now = clock.now()
+    await _reply_long_cb(q, reports.generate_expense_report(for_month=(now.year, now.month)))
+
+
+async def _pob_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+    await q.edit_message_text(
+        "🔁 *What is the bill?*\n"
+        "_e.g. soakaway evacuation, generator major service, permit renewal_",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _POB_NAME
+
+
+async def _pob_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Give it a name:")
+        return _POB_NAME
+    ctx.user_data["pob_name"] = name
+    await update.message.reply_text(
+        f"💰 *What does {reports._esc(name.title())} cost each time?* (₦)",
+        parse_mode=ParseMode.MARKDOWN_V2)
+    return _POB_AMT
+
+
+async def _pob_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    amt, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter the amount in figures (e.g. 90000):")
+        return _POB_AMT
+    ctx.user_data["pob_amt"] = amt
+    await update.message.reply_text(
+        "📅 *How often does it come round?*", parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"{lbl} — {reports._fmt(amt / n)}/mo",
+                                   callback_data=f"pob_m:{n}")]
+             for lbl, n in _POB_MONTH_PRESETS]
+            + [[InlineKeyboardButton("✏️ Other", callback_data="pob_m:__other__")]]
+        ),
+    )
+    return _POB_MONTHS
+
+
+async def _pob_ask_account(send) -> int:
+    await send("📂 *Whose cost is it?*", parse_mode=ParseMode.MARKDOWN_V2,
+               reply_markup=_expense_account_keyboard("pob_ac"))
+    return _POB_ACCT
+
+
+async def _pob_months(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    if val == "__other__":
+        await q.edit_message_text("Type how many months between bills (e.g. 6):")
+        return _POB_MONTHS
+    ctx.user_data["pob_months"] = int(val)
+    return await _pob_ask_account(q.edit_message_text)
+
+
+async def _pob_months_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    months, err = _to_int(update.message.text.strip(), "months")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number of months:")
+        return _POB_MONTHS
+    ctx.user_data["pob_months"] = months
+    return await _pob_ask_account(update.message.reply_text)
+
+
+async def _pob_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    acct = q.data.split(":")[1]
+    ok, msg = logic.process_add_obligation(
+        ctx.user_data.pop("pob_name", ""), ctx.user_data.pop("pob_amt", 0.0),
+        ctx.user_data.pop("pob_months", 12), account=acct,
+        category="maintenance", recorded_by=_actor(update),
+    )
+    ctx.user_data.clear()
+    await q.edit_message_text(
+        msg, parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔁 Periodic bills", callback_data="mgr:periodic")]]
+        ) if ok else None,
+    )
+    return ConversationHandler.END
+
+
+async def _ppy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+
+    obligations = reports._obligations()
+    if not obligations:
+        await q.edit_message_text(
+            "🔁 No periodic bills registered yet — register one first so the "
+            "payment has a reserve to draw from.")
+        return ConversationHandler.END
+
+    reserve = metrics.compute_reserve(
+        obligations, reports._active(db.read_all("expenses")), clock.today())
+    ctx.user_data["ppy_obs"] = obligations
+    rows = [[InlineKeyboardButton(
+        f"{l.obligation.name} — set aside {reports._fmt(l.balance)}",
+        callback_data=f"ppy_id:{i}")] for i, l in enumerate(reserve.lines)]
+    await q.edit_message_text(
+        "💸 *Which bill are you paying?*", parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _PPY_PICK
+
+
+async def _ppy_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    obs = ctx.user_data.get("ppy_obs", [])
+    idx = int(q.data[7:])
+    if idx >= len(obs):
+        await q.edit_message_text("❌ Selection expired — open 🔁 Periodic again.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    ob = obs[idx]
+    ctx.user_data["ppy_ob"] = ob
+    await q.edit_message_text(
+        f"💸 *How much did {reports._esc(ob.name.title())} come to?* (₦)\n"
+        f"_Expected {reports._fmt(ob.expected_amount)}._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _PPY_AMT
+
+
+async def _ppy_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    amt, err = _to_float(update.message.text.strip(), "amount")
+    if err:
+        await update.message.reply_text("❌ Enter the amount in figures:")
+        return _PPY_AMT
+    ob = ctx.user_data.pop("ppy_ob", None)
+    ctx.user_data.clear()
+    if ob is None:
+        await update.message.reply_text("❌ Lost track of which bill — start again.")
+        return ConversationHandler.END
+
+    ok, msg = logic.process_expense(
+        ob.account, ob.category, amt, ob.name,
+        recorded_by=_actor(update), expense_class="periodic",
+        obligation_id=ob.id,
+    )
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_get_keyboard(update.effective_user.id),
+    )
+    return ConversationHandler.END
+
+
+# ── Month-end review & reclassify (⚙️ Manage → 🔎 Review) ─────────────
+#
+# The month-end check is only advice unless something can act on it. The bot's
+# other option is delete-and-rekey, which loses the original date and author,
+# so classification is corrected in place — amounts are never touched.
+
+_RCL_CLASS_LABELS = [
+    ("🔁 Operating", "operating"),
+    ("🌩 One-off", "irregular"),
+    ("📅 Periodic", "periodic"),
+    ("🏗 Capital", "capital"),
+]
+
+
+async def _cb_review(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return
+    now = clock.now()
+    await _reply_long_cb(q, reports.generate_review_report(for_month=(now.year, now.month)),
+                         reply_markup=InlineKeyboardMarkup(
+                             [[InlineKeyboardButton("✏️ Reclassify an entry",
+                                                    callback_data="rcl:start")]]))
+
+
+async def _rcl_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+
+    now = clock.now()
+    rows = reports._apply_filter(
+        reports._active(db.read_all("expenses")), None, (now.year, now.month), False)
+    threshold = logic.capital_threshold()
+    candidates = sorted(
+        [r for r in rows
+         if float(r["amount"]) >= threshold or r in metrics.review_rows(rows)],
+        key=lambda r: -float(r["amount"]),
+    )[:20]
+    if not candidates:
+        await q.edit_message_text("✅ Nothing this month needs reclassifying.")
+        return ConversationHandler.END
+
+    ctx.user_data["rcl_rows"] = candidates
+    rows_kb = [[InlineKeyboardButton(
+        f"[{r['id']}] ₦{float(r['amount']):,.0f} · {str(r['account']).title()}/"
+        f"{str(r['category']).title()} · {metrics.expense_class(r).title()}",
+        callback_data=f"rcl_id:{i}")] for i, r in enumerate(candidates)]
+    await q.edit_message_text(
+        "✏️ *Which entry?*", parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(rows_kb),
+    )
+    return _RCL_PICK
+
+
+async def _rcl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    rows = ctx.user_data.get("rcl_rows", [])
+    idx = int(q.data[7:])
+    if idx >= len(rows):
+        await q.edit_message_text("❌ Selection expired — open 🔎 Review again.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    row = rows[idx]
+    ctx.user_data["rcl_id"] = int(row["id"])
+    await q.edit_message_text(
+        f"✏️ *Entry {row['id']}* — ₦{float(row['amount']):,.0f}\n"
+        f"_{reports._esc(str(row['account']).title())}/"
+        f"{reports._esc(str(row['category']).title())} · "
+        f"{metrics.expense_class(row).title()}_\n\n"
+        "*What needs correcting?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏷 Class", callback_data="rcl_f:class"),
+             InlineKeyboardButton("📂 Account", callback_data="rcl_f:account")],
+            [InlineKeyboardButton("✅ Reviewed — clear the flag", callback_data="rcl_f:clear")],
+        ]),
+    )
+    return _RCL_FIELD
+
+
+async def _rcl_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    field = q.data[6:]
+    ctx.user_data["rcl_field"] = field
+
+    if field == "clear":
+        ok, msg = logic.process_reclassify_expense(ctx.user_data.pop("rcl_id"),
+                                                   needs_review=False)
+        ctx.user_data.clear()
+        await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+        return ConversationHandler.END
+
+    if field == "class":
+        kb = [[InlineKeyboardButton(lbl, callback_data=f"rcl_v:{val}")]
+              for lbl, val in _RCL_CLASS_LABELS]
+        prompt = ("🏷 *Which class?*\n"
+                  "_Do you now own something you did not own before?_\n"
+                  "_No — operating. Yes — capital._\n"
+                  "_And was it a one-off nobody could have forecast? — one-off._")
+    else:
+        kb = [[InlineKeyboardButton("🍺 Bar", callback_data="rcl_v:bar"),
+               InlineKeyboardButton("🛏 Rooms", callback_data="rcl_v:rooms")],
+              [InlineKeyboardButton("🏢 Overhead", callback_data="rcl_v:overhead")]]
+        prompt = "📂 *Which account?*"
+    await q.edit_message_text(prompt, parse_mode=ParseMode.MARKDOWN_V2,
+                              reply_markup=InlineKeyboardMarkup(kb))
+    return _RCL_VALUE
+
+
+async def _rcl_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[6:]
+    field = ctx.user_data.pop("rcl_field", "class")
+    expense_id = ctx.user_data.pop("rcl_id", 0)
+    ctx.user_data.clear()
+
+    kwargs = {"expense_class": val} if field == "class" else {"account": val}
+    # A corrected row has been looked at, so the unsure flag comes off with it.
+    ok, msg = logic.process_reclassify_expense(expense_id, needs_review=False, **kwargs)
+    await q.edit_message_text(
+        msg, parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✏️ Reclassify another", callback_data="rcl:start")]]
+        ) if ok else None,
+    )
+    return ConversationHandler.END
+
+
+# ── Turnaway flow (🛏 Book Room → 🚪 No room free) ────────────────────
+#
+# Entered from the room-type picker, because that is the moment a turnaway is
+# discovered: you go to book someone in and there is nothing free. Reaching it
+# costs no slot on the staff keyboard, which is full at six by design.
+
+_TA_REASONS = [
+    ("🚫 Fully booked", "fully booked"),
+    ("🛏 Wrong room type", "wrong room type"),
+    ("💰 Price too high", "price too high"),
+    ("🕐 Wrong hours", "wrong hours"),
+]
+
+
+async def _ta_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🚪 *How many did you turn away?*\n"
+        "_People you had no room for. No money moves — this is the demand a_\n"
+        "_full night hides._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(n), callback_data=f"taq:{n}") for n in (1, 2, 3)],
+            [InlineKeyboardButton(str(n), callback_data=f"taq:{n}") for n in (4, 5, 10)],
+            [InlineKeyboardButton("✏️ Other", callback_data="taq:__other__")],
+        ]),
+    )
+    return _TA_QTY
+
+
+async def _ta_type_prompt(send, ctx) -> int:
+    types = _known_room_types()
+    ctx.user_data["ta_types"] = types
+    rows = [[InlineKeyboardButton(t.title(), callback_data=f"tat:{i}")]
+            for i, t in enumerate(types)]
+    rows.append([InlineKeyboardButton("🤷 Didn't say / any room",
+                                      callback_data="tat:__skip__")])
+    await send("🛏 *What were they looking for?*", reply_markup=InlineKeyboardMarkup(rows))
+    return _TA_TYPE
+
+
+async def _ta_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]
+    if val == "__other__":
+        await q.edit_message_text("Type how many you turned away:")
+        return _TA_QTY_TEXT
+    ctx.user_data["ta_qty"] = int(val)
+
+    async def send(text, reply_markup):
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                  reply_markup=reply_markup)
+    return await _ta_type_prompt(send, ctx)
+
+
+async def _ta_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    qty, err = _to_int(update.message.text.strip(), "how many")
+    if err:
+        await update.message.reply_text("❌ Enter a whole number (e.g. 3):")
+        return _TA_QTY_TEXT
+    ctx.user_data["ta_qty"] = qty
+
+    async def send(text, reply_markup):
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                        reply_markup=reply_markup)
+    return await _ta_type_prompt(send, ctx)
+
+
+async def _ta_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]
+    if val == "__skip__":
+        ctx.user_data["ta_type"] = ""
+    else:
+        types = ctx.user_data.get("ta_types", [])
+        idx = int(val)
+        if idx >= len(types):
+            await q.edit_message_text("❌ Selection expired — start again from 🛏 Book Room.")
+            ctx.user_data.clear()
+            return ConversationHandler.END
+        ctx.user_data["ta_type"] = types[idx]
+
+    rows = [[InlineKeyboardButton(label, callback_data=f"tar:{i}")]
+            for i, (label, _) in enumerate(_TA_REASONS)]
+    rows.append([InlineKeyboardButton("✏️ Other reason", callback_data="tar:__other__")])
+    rows.append([InlineKeyboardButton("⏭ Skip", callback_data="tar:__skip__")])
+    await q.edit_message_text(
+        "❓ *Why couldn't you take them?*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return _TA_REASON
+
+
+async def _ta_save(send, ctx, actor: str, reason: str) -> int:
+    ok, msg = logic.process_turnaway(
+        ctx.user_data.pop("ta_qty", 1),
+        room_type=ctx.user_data.pop("ta_type", ""),
+        reason=reason, recorded_by=actor,
+    )
+    ctx.user_data.pop("ta_types", None)
+    await send(msg, _TA_AGAIN_KB if ok else None)
+    return ConversationHandler.END
+
+
+async def _ta_pick_reason(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[4:]
+    if val == "__other__":
+        await q.edit_message_text("Type the reason:")
+        return _TA_REASON_TEXT
+    reason = "" if val == "__skip__" else _TA_REASONS[int(val)][1]
+
+    async def send(text, kb):
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    return await _ta_save(send, ctx, _actor(update), reason)
+
+
+async def _ta_reason_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    async def send(text, kb):
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                        reply_markup=kb)
+    return await _ta_save(send, ctx, _actor(update), update.message.text.strip())
 
 
 # ── Keyboard shortcut handlers ────────────────────────────────────────
@@ -2924,7 +3932,14 @@ def _manage_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚙️ Settings",    callback_data="mgr:settings")],
         [InlineKeyboardButton("👥 Staff",        callback_data="mgr:staff"),
          InlineKeyboardButton("📈 Insights",     callback_data="mgr:insights")],
-        [InlineKeyboardButton("🧾 Suppliers",    callback_data="mgr:suppliers")],
+        # `ta:start` rather than an `mgr:` callback so the tap lands directly on
+        # the turnaway conversation's entry point — the same one the booking
+        # flow's "no room free" button uses, so there is one flow, not two.
+        [InlineKeyboardButton("🧾 Suppliers",    callback_data="mgr:suppliers"),
+         InlineKeyboardButton("🚪 Turnaway",     callback_data="ta:start")],
+        [InlineKeyboardButton("🔎 Review",       callback_data="mgr:review"),
+         InlineKeyboardButton("🔁 Periodic",     callback_data="mgr:periodic")],
+        [InlineKeyboardButton("🧾 Month-End Verification", callback_data="mgr:verify")],
     ])
 
 
@@ -2936,19 +3951,25 @@ def _insights_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🍽 Menu",         callback_data="ins:menu")],
         [InlineKeyboardButton("🛏 Room Stats",   callback_data="ins:roomstats"),
          InlineKeyboardButton("🔍 Variance",     callback_data="ins:variance")],
+        [InlineKeyboardButton("🗓 Night by Night", callback_data="ins:dow")],
         [InlineKeyboardButton("🧾 Supplier Bills", callback_data="ins:payables")],
     ])
 
 
-def _roomstats_period_keyboard() -> InlineKeyboardMarkup:
+def _period_keyboard(prefix: str) -> InlineKeyboardMarkup:
     """Room yield is the one report worth reading weekly — a discount is still
-    worth reversing mid-month, long before the month closes."""
+    worth reversing mid-month, long before the month closes. Shared by the
+    headline view and the night-by-night split so the two can't drift."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📆 This week",  callback_data="rms:week"),
-         InlineKeyboardButton("⏪ Last week",  callback_data="rms:lastweek")],
-        [InlineKeyboardButton("📅 This month", callback_data="rms:month"),
-         InlineKeyboardButton("🔁 All time",   callback_data="rms:all")],
+        [InlineKeyboardButton("📆 This week",  callback_data=f"{prefix}:week"),
+         InlineKeyboardButton("⏪ Last week",  callback_data=f"{prefix}:lastweek")],
+        [InlineKeyboardButton("📅 This month", callback_data=f"{prefix}:month"),
+         InlineKeyboardButton("🔁 All time",   callback_data=f"{prefix}:all")],
     ])
+
+
+def _roomstats_period_keyboard() -> InlineKeyboardMarkup:
+    return _period_keyboard("rms")
 
 
 def _suppliers_menu_keyboard() -> InlineKeyboardMarkup:
@@ -2993,26 +4014,75 @@ def _settings_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💰 Drink Prices",    callback_data="sset:price"),
          InlineKeyboardButton("🛏 Room Prices",     callback_data="sset:roomtype")],
         [InlineKeyboardButton("🏨 Room Counts",     callback_data="sset:roomcount"),
-         InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold")],
+         InlineKeyboardButton("🕐 Stay Length",     callback_data="sset:stay")],
+        [InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold")],
         [InlineKeyboardButton("📊 Allocation %",    callback_data="sset:allocation"),
          InlineKeyboardButton("📅 Daily Report",    callback_data="sset:dailyreport")],
     ])
 
 
 def _account_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    """Bar / Rooms. Debtors and draws only ever belong to one of these two."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🍺 Bar",   callback_data=f"{prefix}:bar"),
         InlineKeyboardButton("🛏 Rooms", callback_data=f"{prefix}:rooms"),
     ]])
 
 
-def _expense_cat_keyboard() -> InlineKeyboardMarkup:
-    cats = ["Salary", "Utilities", "Maintenance", "Supplies", "Cleaning", "Marketing"]
-    rows = [[
-        InlineKeyboardButton(cats[i],   callback_data=f"exp_cat:{cats[i].lower()}"),
-        InlineKeyboardButton(cats[i+1], callback_data=f"exp_cat:{cats[i+1].lower()}"),
-    ] for i in range(0, len(cats), 2)]
+def _expense_account_keyboard(prefix: str = "exp_ac") -> InlineKeyboardMarkup:
+    """Expenses get a third home: costs serving the whole business.
+
+    Overhead is not a dumping ground for anything shared-ish — salaries stay on
+    the department that causes them and diesel stays on rooms, because the
+    room-target and break-even calculations are both built on that split.
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍺 Bar",   callback_data=f"{prefix}:bar"),
+         InlineKeyboardButton("🛏 Rooms", callback_data=f"{prefix}:rooms")],
+        [InlineKeyboardButton("🏢 Overhead — whole business", callback_data=f"{prefix}:overhead")],
+    ])
+
+
+# The category map, per account. "Salary" is spelled the same on every account
+# because split_salary() matches that exact string — "Salaries" would silently
+# stop being a salary and land in the other-expenses bucket.
+_EXPENSE_CATEGORIES = {
+    "rooms": ["Salary", "Cleaning", "Pest Control", "Linen", "Fuel",
+              "Utilities", "Maintenance", "Consumables", "Misc"],
+    "bar": ["Salary", "Consumables", "Maintenance", "Utilities", "Misc"],
+    "overhead": ["Salary", "Software", "Admin", "Levies", "Misc"],
+}
+
+
+def _expense_cat_keyboard(account: str = "bar") -> InlineKeyboardMarkup:
+    """Categories for the account chosen. Offering the right answer is the whole
+    point: a category that needs typing gets a near-miss picked instead."""
+    cats = _EXPENSE_CATEGORIES.get(account.lower(), _EXPENSE_CATEGORIES["bar"])
+    rows = [[InlineKeyboardButton(c, callback_data=f"exp_cat:{c.lower()}")
+             for c in cats[i:i + 2]] for i in range(0, len(cats), 2)]
     rows.append([InlineKeyboardButton("✏️ Other", callback_data="exp_cat:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _expense_class_keyboard(amount: float, threshold: float) -> InlineKeyboardMarkup:
+    """Axis 2. Capital is only offered at or above the threshold — below it you
+    expense the thing even when it is technically an asset, so the button that
+    would break that rule simply isn't there."""
+    rows = [
+        [InlineKeyboardButton("🔁 Operating — bought again next month",
+                              callback_data="exp_cl:operating")],
+        # Stays in the P&L like operating; tagged so a month that only looks
+        # bad because something broke can be read as what it was.
+        [InlineKeyboardButton("🌩 One-off — couldn't have seen it coming",
+                              callback_data="exp_cl:irregular")],
+        [InlineKeyboardButton("📅 Periodic — every 3–12 months",
+                              callback_data="exp_cl:periodic")],
+    ]
+    if amount >= threshold:
+        rows.append([InlineKeyboardButton("🏗 Capital — an asset lasting 12+ months",
+                                          callback_data="exp_cl:capital")])
+    rows.append([InlineKeyboardButton("🔎 Not sure — expense it and flag",
+                                      callback_data="exp_cl:review")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3139,7 +4209,7 @@ async def _exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.edit_message_text(
         "💸 *Record Expense — which account?*",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_account_keyboard("exp_ac"),
+        reply_markup=_expense_account_keyboard("exp_ac"),
     )
     return _EXP_ACCT
 
@@ -3147,11 +4217,12 @@ async def _exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _exp_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    ctx.user_data["exp_acct"] = q.data.split(":")[1]
+    acct = q.data.split(":")[1]
+    ctx.user_data["exp_acct"] = acct
     await q.edit_message_text(
-        "💸 *Category?*",
+        f"💸 *{acct.title()} — category?*",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_expense_cat_keyboard(),
+        reply_markup=_expense_cat_keyboard(acct),
     )
     return _EXP_CAT
 
@@ -3189,7 +4260,39 @@ async def _exp_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("❌ Enter a valid amount (e.g. 5000):")
         return _EXP_AMT
     ctx.user_data["exp_amt"] = val
-    await update.message.reply_text("📝 Any note? (optional)", reply_markup=_skip_keyboard("exp_note:skip"))
+    return await _exp_ask_class(update.message.reply_text, ctx, val)
+
+
+async def _exp_ask_class(send, ctx, amount: float) -> int:
+    """Axis 2 — asked after the amount, because the capital test needs it.
+
+    At or above the threshold the repair-vs-replace question is put directly:
+    the same tradesman produces both a repair and an asset, so the only thing
+    that separates them is whether you now own something you did not own before.
+    """
+    threshold = logic.capital_threshold()
+    prompt = "🏷 *What kind of spend is this?*"
+    if amount >= threshold:
+        prompt += (
+            f"\n\n_₦{amount:,.0f} is over the ₦{threshold:,.0f} capital line._\n"
+            "*Do you now own something you did not own before?*\n"
+            "_No — a repair. Yes — capital._"
+        )
+    await send(prompt, parse_mode=ParseMode.MARKDOWN_V2,
+               reply_markup=_expense_class_keyboard(amount, threshold))
+    return _EXP_CLASS
+
+
+async def _exp_pick_class(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[7:]
+    # "Not sure" is not a class — it is operating plus a flag. Over-expensing
+    # understates profit, which is the safe way to be wrong.
+    ctx.user_data["exp_class"] = "operating" if val == "review" else val
+    ctx.user_data["exp_review"] = val == "review"
+    await q.edit_message_text("📝 Any note? (optional)",
+                              reply_markup=_skip_keyboard("exp_note:skip"))
     return _EXP_NOTE
 
 
@@ -3232,7 +4335,11 @@ async def _exp_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     note = ctx.user_data.pop("exp_note", "")
     user = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
-    ok, msg = logic.process_expense(acct, cat, amt, note, timestamp=ts, recorded_by=recorded_by)
+    ok, msg = logic.process_expense(
+        acct, cat, amt, note, timestamp=ts, recorded_by=recorded_by,
+        expense_class=ctx.user_data.pop("exp_class", "operating"),
+        needs_review=ctx.user_data.pop("exp_review", False),
+    )
     await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
     return ConversationHandler.END
 
@@ -4045,8 +5152,7 @@ async def _act_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return _ACT_DATE
     if val == "cal_x":
         return _ACT_DATE
-    from datetime import datetime as _dt
-    date_str = _dt.now().strftime("%Y-%m-%d") if val == "today" else val
+    date_str = clock.today().strftime("%Y-%m-%d") if val == "today" else val
     text = reports.generate_activity_log(date_str)
     await _reply_long_cb(q, text)
     return ConversationHandler.END
@@ -4182,6 +5288,132 @@ async def _srt_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 _AGAIN_KB = InlineKeyboardMarkup(
     [[InlineKeyboardButton("🏨 Set another room count", callback_data="sset:roomcount")]]
 )
+_TA_AGAIN_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🚪 Log another turnaway", callback_data="ta:start")]]
+)
+_SSL_AGAIN_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🕐 Set another stay length", callback_data="sset:stay")]]
+)
+
+
+# ── Set Stay Length flow (⚙️ Settings → 🕐 Stay Length) ────────────────
+# Which room types are sold by the hour. This is what tells lets apart from
+# nights: without it a room let three times a day reports 300% occupancy and
+# its rate is averaged into the overnight ADR. Types go by index for the same
+# reason as room counts — "short time" has a space in it.
+
+_STAY_PRESETS = (1, 2, 3, 6)
+
+
+async def _ssl_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    hours = db.get_all_room_type_hours()
+    types = _known_room_types()
+    ctx.user_data["ssl_types"] = types
+
+    lines = ["🕐 *Stay Length*",
+             "_Which room types are sold by the hour, not overnight._", ""]
+    for t in types:
+        h = hours.get(t)
+        lines.append(f"  {reports._esc(t.title())}: "
+                     + (f"*{h:g}h per let*" if h and h < 24 else "_full night_"))
+    if not types:
+        lines.append("  _No room types yet — price one first._")
+    lines.append("\n_Tap a type to change it:_")
+
+    rows = [[InlineKeyboardButton(
+        f"{t.title()} — {f'{hours[t]:g}h' if t in hours and hours[t] < 24 else 'night'}",
+        callback_data=f"ssl_tp:{i}")] for i, t in enumerate(types)]
+    rows.append([InlineKeyboardButton("➕ Other room type", callback_data="ssl_tp:__new__")])
+
+    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+                              reply_markup=InlineKeyboardMarkup(rows))
+    return _SSL_PICK
+
+
+def _ssl_hours_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"{n}h", callback_data=f"ssl_hr:{n}")
+             for n in _STAY_PRESETS]]
+    rows.append([InlineKeyboardButton("🌙 Full night (24h)", callback_data="ssl_hr:24")])
+    rows.append([InlineKeyboardButton("✏️ Other", callback_data="ssl_hr:__other__")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _ssl_ask_hours(send, name: str) -> int:
+    await send(
+        f"🕐 *How long is one {reports._esc(name.title())} let?*\n"
+        "_Pick 🌙 to put it back to a normal overnight room._",
+        _ssl_hours_keyboard(),
+    )
+    return _SSL_HOURS
+
+
+async def _ssl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[7:]
+    if val == "__new__":
+        await q.edit_message_text("Type the room type name (e.g. short time):")
+        return _SSL_TYPE_TEXT
+
+    types = ctx.user_data.get("ssl_types", [])
+    idx = int(val)
+    if idx >= len(types):
+        await q.edit_message_text("❌ Selection expired — open Stay Length again.")
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    ctx.user_data["ssl_target"] = types[idx]
+
+    async def send(text, kb):
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    return await _ssl_ask_hours(send, types[idx])
+
+
+async def _ssl_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip().lower()
+    if not name:
+        await update.message.reply_text("❌ Room type can't be blank:")
+        return _SSL_TYPE_TEXT
+    ctx.user_data["ssl_target"] = name
+
+    async def send(text, kb):
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                        reply_markup=kb)
+    return await _ssl_ask_hours(send, name)
+
+
+async def _ssl_finish(send, ctx, hours: float) -> int:
+    target = ctx.user_data.pop("ssl_target", "")
+    ctx.user_data.pop("ssl_types", None)
+    ok, msg = logic.process_set_room_duration(target, hours)
+    await send(msg, _SSL_AGAIN_KB if ok else None)
+    return ConversationHandler.END
+
+
+async def _ssl_pick_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[7:]
+    if val == "__other__":
+        await q.edit_message_text("Type the number of hours (1–24):")
+        return _SSL_HOURS_TEXT
+
+    async def send(text, kb):
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    return await _ssl_finish(send, ctx, float(val))
+
+
+async def _ssl_hours_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    hours, err = _to_float(update.message.text.strip(), "hours")
+    if err:
+        await update.message.reply_text("❌ Enter a number of hours (e.g. 2):")
+        return _SSL_HOURS_TEXT
+
+    async def send(text, kb):
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
+                                        reply_markup=kb)
+    return await _ssl_finish(send, ctx, hours)
 
 
 def _known_room_types() -> list[str]:
@@ -4784,8 +6016,7 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
 
     if action == "allocation":
-        from datetime import datetime as _dt
-        now = _dt.now()
+        now = clock.now()
         text = reports.generate_allocation_report(for_month=(now.year, now.month))
         await _reply_long_cb(q, text)
 
@@ -4793,8 +6024,7 @@ async def _cb_manage_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply_long_cb(q, reports.generate_position_report())
 
     elif action == "draws":
-        from datetime import datetime as _dt
-        now = _dt.now()
+        now = clock.now()
         await _reply_long_cb(q, reports.generate_draws_report(for_month=(now.year, now.month)))
 
     elif action == "restock_plan":
@@ -5425,6 +6655,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _EXP_CAT:      [CallbackQueryHandler(_exp_pick_cat,  pattern="^exp_cat:")],
             _EXP_CAT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _exp_cat_text)],
             _EXP_AMT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, _exp_amount)],
+            _EXP_CLASS:    [CallbackQueryHandler(_exp_pick_class, pattern="^exp_cl:")],
             _EXP_NOTE:     [
                 CallbackQueryHandler(_exp_note_skip, pattern="^exp_note:skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _exp_note_text),
@@ -5535,6 +6766,84 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _SRC_PICK:      [CallbackQueryHandler(_src_pick, pattern="^src_tp:")],
             _SRC_TYPE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _src_type_text)],
             _SRC_COUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _src_count)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    stk_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_stk_start, pattern="^stk:start$")],
+        states={
+            _STK_BAR:   [CallbackQueryHandler(_stk_skip, pattern="^stk_sk:"),
+                         MessageHandler(filters.TEXT & ~filters.COMMAND, _stk_bar)],
+            _STK_STORE: [CallbackQueryHandler(_stk_skip, pattern="^stk_sk:"),
+                         MessageHandler(filters.TEXT & ~filters.COMMAND, _stk_store)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    rau_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_rau_start, pattern="^rau:start$")],
+        states={
+            _RAU_ACTUAL:      [CallbackQueryHandler(_rau_missing, pattern="^rau_m:")],
+            _RAU_ACTUAL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _rau_missing_text)],
+            _RAU_RATE:        [CallbackQueryHandler(_rau_rate_pick, pattern="^rau_r:")],
+            _RAU_RATE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _rau_rate_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    pob_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_pob_start, pattern="^pob:start$")],
+        states={
+            _POB_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _pob_name)],
+            _POB_AMT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _pob_amount)],
+            _POB_MONTHS: [CallbackQueryHandler(_pob_months, pattern="^pob_m:"),
+                          MessageHandler(filters.TEXT & ~filters.COMMAND, _pob_months_text)],
+            _POB_ACCT:   [CallbackQueryHandler(_pob_account, pattern="^pob_ac:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    ppy_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_ppy_start, pattern="^ppy:start$")],
+        states={
+            _PPY_PICK: [CallbackQueryHandler(_ppy_pick, pattern="^ppy_id:")],
+            _PPY_AMT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _ppy_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    rcl_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_rcl_start, pattern="^rcl:start$")],
+        states={
+            _RCL_PICK:  [CallbackQueryHandler(_rcl_pick,  pattern="^rcl_id:")],
+            _RCL_FIELD: [CallbackQueryHandler(_rcl_field, pattern="^rcl_f:")],
+            _RCL_VALUE: [CallbackQueryHandler(_rcl_value, pattern="^rcl_v:")],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    ssl_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_ssl_start, pattern="^sset:stay$")],
+        states={
+            _SSL_PICK:       [CallbackQueryHandler(_ssl_pick, pattern="^ssl_tp:")],
+            _SSL_TYPE_TEXT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _ssl_type_text)],
+            _SSL_HOURS:      [CallbackQueryHandler(_ssl_pick_hours, pattern="^ssl_hr:")],
+            _SSL_HOURS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _ssl_hours_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
+    # Staff-reachable, so it is not gated behind ⚙️ Manage. Entered from the
+    # room-type picker and from the foot of the night-by-night report.
+    ta_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_ta_start, pattern="^ta:start$")],
+        states={
+            _TA_QTY:         [CallbackQueryHandler(_ta_pick_qty, pattern="^taq:")],
+            _TA_QTY_TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _ta_qty_text)],
+            _TA_TYPE:        [CallbackQueryHandler(_ta_pick_type, pattern="^tat:")],
+            _TA_REASON:      [CallbackQueryHandler(_ta_pick_reason, pattern="^tar:")],
+            _TA_REASON_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _ta_reason_text)],
         },
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
@@ -5664,7 +6973,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
                  rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv,
-                 sup_conv, spy_conv, src_conv):
+                 sup_conv, spy_conv, src_conv, ssl_conv, ta_conv, rcl_conv,
+                 pob_conv, ppy_conv, stk_conv, rau_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
@@ -5681,7 +6991,13 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_undo_inline, pattern="^undo:"))
     app.add_handler(CallbackQueryHandler(_cb_history_date, pattern="^hst:"))
     app.add_handler(CallbackQueryHandler(_cb_manage_menu, pattern="^mgr:(allocation|position|draws|restock_plan|fixstock|settings|staff|insights|suppliers|addstaff|removestaff)$"))
-    app.add_handler(CallbackQueryHandler(_cb_insights_menu, pattern="^ins:(cashcycle|menu|roomstats|variance|payables)$"))
+    app.add_handler(CallbackQueryHandler(_cb_review, pattern="^mgr:review$"))
+    app.add_handler(CallbackQueryHandler(_cb_periodic_menu, pattern="^mgr:periodic$"))
+    app.add_handler(CallbackQueryHandler(_cb_verify_menu, pattern="^mgr:verify$"))
+    app.add_handler(CallbackQueryHandler(_cb_verify_action, pattern="^vfy:(sheet|variance)$"))
+    app.add_handler(CallbackQueryHandler(_cb_reserve_detail, pattern="^mgr:reserve$"))
+    app.add_handler(CallbackQueryHandler(_cb_insights_menu, pattern="^ins:(cashcycle|menu|roomstats|dow|variance|payables)$"))
+    app.add_handler(CallbackQueryHandler(_cb_dow_period, pattern="^dow:(week|lastweek|month|all)$"))
     app.add_handler(CallbackQueryHandler(_cb_suppliers_list, pattern="^sup:list$"))
     app.add_handler(CallbackQueryHandler(_cb_roomstats_period, pattern="^rms:(week|lastweek|month|all)$"))
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
@@ -5726,6 +7042,12 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CommandHandler("roomstats", cmd_roomstats))
     app.add_handler(CommandHandler("setrooms", cmd_setrooms))
     app.add_handler(CommandHandler("count", cmd_count))
+    app.add_handler(CommandHandler("turnaway", cmd_turnaway))
+    app.add_handler(CommandHandler("setduration", cmd_setduration))
+    app.add_handler(CommandHandler("reclassify", cmd_reclassify))
+    app.add_handler(CommandHandler("review", cmd_review))
+    app.add_handler(CommandHandler("stocktake", cmd_stocktake))
+    app.add_handler(CommandHandler("roomaudit", cmd_roomaudit))
     app.add_handler(CommandHandler("variance", cmd_variance))
     app.add_handler(CommandHandler("restock_credit", cmd_restock_credit))
     app.add_handler(CommandHandler("pay_supplier", cmd_pay_supplier))
