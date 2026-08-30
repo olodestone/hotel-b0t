@@ -1061,18 +1061,32 @@ def _room_night(day, qty, nights, revenue, rtype="standard"):
             "duration_hours": 0}
 
 
-def test_revpar_is_unaffected_by_stay_length():
-    """The invariant that makes RevPAR the cross-trade comparator.
+def test_revpar_equals_adr_times_occupancy():
+    """The identity the three headline figures stand on.
 
-    Its denominator is room-*days*, so revenue per available room-day is a fair
-    question whether the room earned it from one guest or six.
+    It is also what caught the wrong denominator: ₦7,341 ADR at 70.0% is
+    ₦5,139, but the report printed RevPAR of ₦5,544. Both halves of RevPAR
+    have to be overnight-only, or the three numbers stop describing each other.
     """
     rows = [_let(5, 1, 3, 9_000), _room_night(5, 3, 1, 45_000)]
-    blind = metrics.compute_room_metrics(rows, 4, 1)
-    aware = metrics.compute_room_metrics(rows, 4, 1, hours_by_type=_HOURLY)
-    assert blind.revpar == aware.revpar == 13_500.0
-    assert blind.revenue == aware.revenue
-    assert blind.occupancy_pct == 150.0 and aware.occupancy_pct == 75.0  # only this moved
+    rm = metrics.compute_room_metrics(
+        rows, 4, 1, rooms_by_type={"short time": 1, "standard": 3},
+        hours_by_type=_HOURLY)
+    assert rm.nightly_rooms == 3            # the hourly-only room is not on sale
+    assert rm.occupancy_pct == 100.0        # 3 nights of 3 room-nights
+    assert rm.adr == 15_000.0
+    assert rm.revpar == 15_000.0
+    assert abs(rm.adr * rm.occupancy_pct / 100 - rm.revpar) < 1
+
+
+def test_hourly_lets_never_inflate_the_overnight_figures():
+    rows = [_let(5, 1, 3, 9_000), _room_night(5, 3, 1, 45_000)]
+    rm = metrics.compute_room_metrics(
+        rows, 4, 1, rooms_by_type={"short time": 1, "standard": 3},
+        hours_by_type=_HOURLY)
+    assert rm.revpar == 15_000.0            # the 9,000 of lets is not in it
+    assert rm.revenue == 54_000.0           # but total revenue still holds both
+    assert rm.short_revenue == 9_000.0
 
 
 def test_configuring_nothing_leaves_every_figure_where_it_was():
@@ -1744,3 +1758,162 @@ def test_an_hourly_only_hotel_has_bookings_even_with_no_nights():
     split = metrics.compute_dow_split(rows, *_JUNE, total_rooms=2, hours_map=_HOURLY)
     assert split.overall.nights_sold == 0
     assert split.overall.sold_units == 3
+
+
+
+# ── Overnight capacity excludes rooms never sold overnight ────────────
+
+def test_a_room_that_only_does_hourly_lets_is_not_overnight_capacity():
+    """273 nights read 70.0% against 13 rooms and 82.7% against the 11 real ones."""
+    rows = [{"timestamp": "2026-08-05 20:00:00", "room_type": "standard",
+             "quantity": 242, "nights": 1, "total_revenue": 1_694_000},
+            {"timestamp": "2026-08-05 20:00:00", "room_type": "executive",
+             "quantity": 31, "nights": 1, "total_revenue": 310_000},
+            {"timestamp": "2026-08-05 14:00:00", "room_type": "short-time",
+             "quantity": 79, "nights": 1, "total_revenue": 158_000}]
+    counts = {"standard": 9, "executive": 2, "short-time": 2}
+    rm = metrics.compute_room_metrics(rows, 13, 30, rooms_by_type=counts,
+                                      hours_by_type={"short-time": 1})
+    assert rm.nightly_rooms == 11
+    assert rm.available_room_nights == 330
+    assert rm.occupancy_pct == 82.7
+    assert rm.revpar == 6_072.73
+    # utilization still spans the whole building — every room has 24 hours
+    assert rm.available_room_hours == 9_360
+    assert rm.utilization_pct == 70.8
+
+
+def test_nightly_rooms_falls_back_rather_than_guessing():
+    """A wrong denominator is worse than an unrefined one."""
+    assert metrics.nightly_rooms(13, None, None) == 13          # nothing configured
+    assert metrics.nightly_rooms(13, {"standard": 13}, {}) == 13  # no hourly types
+    assert metrics.nightly_rooms(2, {"short": 2}, {"short": 1}) == 2  # all hourly
+    assert metrics.nightly_rooms(0, {"short": 2}, {"short": 1}) == 0
+
+
+def test_goppar_shares_the_denominator_and_the_revenue_with_revpar():
+    """Two RevPARs on one screen is the drift the calc core exists to prevent."""
+    rows = [{"timestamp": "2026-08-05 20:00:00", "room_type": "standard",
+             "quantity": 10, "nights": 1, "total_revenue": 100_000},
+            {"timestamp": "2026-08-05 14:00:00", "room_type": "short-time",
+             "quantity": 20, "nights": 1, "total_revenue": 40_000}]
+    counts = {"standard": 9, "short-time": 2}
+    hours = {"short-time": 1}
+    rm = metrics.compute_room_metrics(rows, 11, 30, rooms_by_type=counts,
+                                      hours_by_type=hours)
+    pnl = metrics.compute_pnl([], rows, [], {})
+    gp = metrics.compute_goppar(pnl, rm.available_room_nights,
+                                room_revenue=metrics.overnight_revenue(rows, hours))
+    assert gp.revpar == rm.revpar
+
+
+# ── Stock purchases can never enter the P&L ───────────────────────────
+
+def test_a_stock_purchase_is_inventory_whatever_the_row_claims():
+    """The migration's DEFAULT stamped every existing row 'operating'.
+
+    That beat the category fallback, so ₦345,376 of August's drinks were
+    charged as a bar expense on the same screen that called them cash-to-stock
+    — turning a ₦255,083 bar profit into a ₦90,293 loss.
+    """
+    for category in ("restock", "supplier", "RESTOCK", "Supplier"):
+        row = {"account": "bar", "category": category, "amount": 100,
+               "expense_class": "operating"}      # exactly what the backfill wrote
+        assert metrics.expense_class(row) == "inventory"
+        assert metrics.operating_expenses([row]) == []
+
+
+def test_the_august_bar_reads_as_a_profit_again():
+    bar = [{"account": "bar", "category": "police", "amount": 1_000,
+            "expense_class": "operating"},
+           {"account": "bar", "category": "restock", "amount": 85_391,
+            "expense_class": "operating"},
+           {"account": "bar", "category": "supplier", "amount": 259_986,
+            "expense_class": "operating"}]
+    sales = [{"drink_name": "x", "quantity": 1, "total_revenue": 647_600,
+              "cost_price": 391_517}]
+    pnl = metrics.compute_pnl(sales, [], bar, {})
+    assert pnl.bar.gross_profit == 256_083
+    assert pnl.bar.expense_total == 1_000          # police only
+    assert pnl.bar.profit == 255_083
+    assert pnl.restock_spend == 345_377            # still counted as cash out
+
+
+def test_stock_is_charged_once_not_twice():
+    """Cost reaches the P&L as COGS when it sells, never as the purchase."""
+    bar = [{"account": "bar", "category": "restock", "amount": 50_000}]
+    sales = [{"drink_name": "beer", "quantity": 100, "total_revenue": 100_000,
+              "cost_price": 400}]
+    pnl = metrics.compute_pnl(sales, [], bar, {})
+    assert pnl.bar.cogs == 40_000                  # charged here
+    assert pnl.bar.expense_total == 0              # and nowhere else
+    assert pnl.total_outgoings == 40_000
+
+
+def test_an_explicit_class_still_wins_for_everything_else():
+    """Only stock categories are absolute; capital and periodic are as stored."""
+    assert metrics.expense_class(
+        {"category": "maintenance", "expense_class": "capital"}) == "capital"
+    assert metrics.expense_class(
+        {"category": "maintenance", "expense_class": "periodic"}) == "periodic"
+
+
+# ── Stock purchases against revenue ───────────────────────────────────
+
+def _pr(purchases, revenue, cogs, cap=40):
+    sales = [{"drink_name": "x", "quantity": 1, "total_revenue": revenue,
+              "cost_price": cogs}]
+    exp = [{"account": "bar", "category": "restock", "amount": purchases}]
+    return metrics.compute_purchase_ratio(sales, exp, {}, cap_pct=cap)
+
+
+def test_august_reads_over_the_cap_and_drawing_down():
+    """₦345,377 bought against ₦647,600 taken, while stock still fell."""
+    pr = _pr(345_377, 647_600, 391_517)
+    assert pr.ratio_pct == 53.3
+    assert pr.over_cap is True
+    assert pr.stock_movement == -46_140 and pr.drew_down is True
+    icon, note = metrics.purchase_verdict(pr)
+    assert icon == "⚠️"
+    assert "Count the bar" in note
+
+
+def test_over_the_cap_with_stock_on_the_shelf_is_not_the_same_finding():
+    """Cash moved into inventory — it comes back as those drinks sell."""
+    pr = _pr(300_000, 500_000, 100_000)
+    assert pr.over_cap is True and pr.drew_down is False
+    icon, note = metrics.purchase_verdict(pr)
+    assert icon == "💡" and "on the shelf" in note
+
+
+def test_drawing_down_under_the_cap_is_ordinary():
+    pr = _pr(100_000, 500_000, 150_000)
+    assert pr.over_cap is False and pr.drew_down is True
+    assert metrics.purchase_verdict(pr)[0] == "💡"
+
+
+def test_buying_in_step_is_reported_as_such():
+    pr = _pr(150_000, 500_000, 140_000)
+    assert pr.over_cap is False and pr.drew_down is False
+    assert metrics.purchase_verdict(pr)[0] == "✅"
+
+
+def test_the_cap_is_configurable():
+    assert _pr(345_377, 647_600, 391_517, cap=60).over_cap is False
+    assert _pr(345_377, 647_600, 391_517, cap=40).over_cap is True
+
+
+def test_a_month_with_no_purchases_says_nothing():
+    pr = _pr(0, 500_000, 100_000)
+    assert pr.readable is False
+    assert metrics.purchase_verdict(pr) == ("", "")
+
+
+def test_supplier_settlements_count_as_purchases_too():
+    """restock is paid on delivery, supplier settles an earlier credit buy."""
+    sales = [{"drink_name": "x", "quantity": 1, "total_revenue": 100_000,
+              "cost_price": 10_000}]
+    exp = [{"account": "bar", "category": "restock", "amount": 20_000},
+           {"account": "bar", "category": "supplier", "amount": 30_000}]
+    pr = metrics.compute_purchase_ratio(sales, exp, {}, cap_pct=40)
+    assert pr.purchases == 50_000 and pr.ratio_pct == 50.0

@@ -462,6 +462,8 @@ def generate_full_report(
         ]
     lines.append(_SEP)
 
+    lines += _purchase_ratio_block(sales_rows, expense_rows)
+
     if pnl.restock_spend > 0:
         lines += [
             f"📦 Stock purchased: {_fmt(pnl.restock_spend)}",
@@ -1526,6 +1528,45 @@ def _unmatched_debt_block(pos) -> list[str]:
     return out
 
 
+PURCHASE_CAP_KEY = "purchase_cap"
+
+
+def _purchase_cap() -> float:
+    try:
+        return float(db.get_setting(PURCHASE_CAP_KEY, "") or metrics.DEFAULT_PURCHASE_CAP)
+    except (TypeError, ValueError):
+        return metrics.DEFAULT_PURCHASE_CAP
+
+
+def _purchase_ratio_block(sales_rows: list[dict], expense_rows: list[dict]) -> list[str]:
+    """Stock bought against revenue, read together with stock movement.
+
+    Either number alone is unremarkable. Buying above the cap *while inventory
+    falls* is the pair that needs explaining, and it is easy to miss when the
+    two figures sit in different sections of the report.
+    """
+    pr = metrics.compute_purchase_ratio(
+        sales_rows, expense_rows, _cost_price_map(), _purchase_cap())
+    if not pr.readable:
+        return []
+
+    icon, note = metrics.purchase_verdict(pr)
+    mark = "⚠️ " if pr.over_cap else ""
+    out = [
+        _SEP,
+        f"{mark}📦 *Stock bought: {_fmt(pr.purchases)}* — "
+        f"{_pct(pr.ratio_pct)} of bar revenue _(cap {pr.cap_pct:g}%)_",
+    ]
+    moved = pr.stock_movement
+    out.append(
+        f"  _Sold from stock {_fmt(pr.cogs)} — inventory "
+        f"{'fell' if moved < 0 else 'grew'} {_fmt(abs(moved))} over the period._"
+    )
+    if note:
+        out.append(f"  {icon} _{_esc(note)}_")
+    return out
+
+
 def _verification_note(for_date, for_month, all_time) -> list[str]:
     """A month with no stocktake is UNVERIFIED, and every report must say so.
 
@@ -1923,8 +1964,13 @@ def generate_room_stats_report(
         ))
         if not (trend and trend.comparable):
             lines[-1] += "  _(revenue per available room-night)_"
-        basis = f"  _Basis: {total_rooms} rooms × {days} days"
-        basis += " — from your per-type counts._" if rooms_from_types else "._"
+        basis = f"  _Basis: {rm.nightly_rooms} overnight rooms × {days} days"
+        if rm.nightly_rooms != total_rooms:
+            spare = total_rooms - rm.nightly_rooms
+            basis += (f" — {spare} hourly-only {'room' if spare == 1 else 'rooms'} "
+                      "excluded, never on sale overnight._")
+        else:
+            basis += " — from your per-type counts._" if rooms_from_types else "._"
         lines.append(basis)
 
     # The verdict — the whole reason for comparing two windows.

@@ -6,7 +6,7 @@
   📈 *ADR:  ₦17,500*  ▲ 17%  _(was ₦15,000)_
   🏨 *Occupancy: 3.4%*  ▲ 3.0pt  (8 of 232 room-nights)
   💰 *RevPAR: ₦603*  ▲ 833%  _(was ₦65)_
-  _Basis: 8 rooms × 29 days._
+  _Basis: 8 overnight rooms × 29 days._
 
   ✅ Growing the healthy way — hold rates.
   _The rate rise is sticking — it reached RevPAR._

@@ -27,6 +27,10 @@
   📈 *Net Profit:    ₦31,800*
   Net Margin:      21.6%  _(₦ kept per ₦100 of sales)_
 ──────────────────────────────
+──────────────────────────────
+⚠️ 📦 *Stock bought: ₦30,000* — 428.6% of bar revenue _(cap 40%)_
+  _Sold from stock ₦4,200 — inventory grew ₦25,800 over the period._
+  💡 _Above the cap, but the stock is on the shelf — cash has moved into inventory rather than gone missing. It comes back as those drinks sell._
 📦 Stock purchased: ₦30,000
   _Inventory buy — cash → stock, not a profit cost. See /position._
 ──────────────────────────────

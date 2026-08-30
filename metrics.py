@@ -156,17 +156,26 @@ CAPITAL_THRESHOLD = 50_000.0
 def expense_class(row):
     """Which class a row belongs to, tolerating rows written before the axis existed.
 
-    Legacy rows carry no `expense_class`. Rather than a second exclusion
-    mechanism running alongside this one, the old restock/supplier category
-    rule is expressed *as* a class: those rows are inventory, everything else
-    is operating. That is also the safe default for unclassified history —
-    over-expensing understates profit, which is the right way to be wrong.
+    A stock-purchase category always wins. Everything else defers to the
+    stored class, then to `operating` — the safe default for unclassified
+    history, since over-expensing understates profit rather than flattering it.
     """
+    # Category first, and unconditionally. Stock bought for resale is inventory
+    # whatever a row claims to be: it is cash converting to stock, and its cost
+    # reaches the P&L as COGS when the drink sells. Charging the purchase too
+    # bills every bottle twice.
+    #
+    # This ordering is not belt-and-braces, it is the fix for a real failure.
+    # `ADD COLUMN expense_class TEXT DEFAULT 'operating'` backfilled every
+    # existing row in Postgres, so the restock/supplier fallback below could
+    # never fire — no row was legacy any more. August charged ₦345,376 of stock
+    # as a bar expense on the same screen that named it "cash to stock, not a
+    # profit cost", turning a ₦255,083 profit into a ₦90,293 loss.
+    if str(row.get("category", "")).lower() in STOCK_PURCHASE_CATEGORIES:
+        return "inventory"
     cls = str(row.get("expense_class") or "").strip().lower()
     if cls in EXPENSE_CLASSES:
         return cls
-    if str(row.get("category", "")).lower() in STOCK_PURCHASE_CATEGORIES:
-        return "inventory"
     return "operating"
 
 
@@ -696,6 +705,82 @@ def unmatched_debts(debtor_rows, sales_rows, room_rows):
         rows=tuple(found),
         total=round(sum(float(r["amount"]) for r in found), 2),
     )
+
+
+# ── Stock purchases against revenue ───────────────────────────────────
+#
+# Two numbers that mean little apart and a great deal together.
+#
+# Purchases as a share of bar revenue is a spending discipline: buy above the
+# cap and cash is leaving faster than drinks are earning it. Stock movement —
+# what was bought against what was sold — says where that cash went.
+#
+# The combination is the finding. Buying *over* the cap while inventory still
+# falls means the money went out and the stock did not arrive on the shelf, or
+# did not leave it as a sale. August bought ₦345,377 against ₦647,600 of
+# revenue (53.3%, cap 40%) and still drew stock down ~₦46,000. Either the month
+# outran the cap, or something sits between the purchase and the sale — and
+# only a physical count can say which.
+
+DEFAULT_PURCHASE_CAP = 40.0
+
+
+@dataclass(frozen=True)
+class PurchaseRatio:
+    purchases: float
+    bar_revenue: float
+    cogs: float
+    cap_pct: float
+
+    @property
+    def ratio_pct(self):
+        return pct_of(self.purchases, self.bar_revenue)
+
+    @property
+    def over_cap(self):
+        return self.bar_revenue > 0 and self.ratio_pct > self.cap_pct
+
+    @property
+    def stock_movement(self):
+        """Bought minus sold at cost. Negative means the shelf ran down."""
+        return round(self.purchases - self.cogs, 2)
+
+    @property
+    def drew_down(self):
+        return self.stock_movement < 0
+
+    @property
+    def readable(self):
+        return self.bar_revenue > 0 and self.purchases > 0
+
+
+def compute_purchase_ratio(sales_rows, expense_rows, cost_map, cap_pct=None):
+    """Stock bought against stock sold, and both against revenue."""
+    return PurchaseRatio(
+        purchases=restock_spend(expense_rows),
+        bar_revenue=round(sum_revenue(sales_rows), 2),
+        cogs=cost_of_drinks_sold(sales_rows, cost_map),
+        cap_pct=float(DEFAULT_PURCHASE_CAP if cap_pct is None else cap_pct),
+    )
+
+
+def purchase_verdict(pr):
+    """What the pair says. The quadrant that matters is over-cap *and* down."""
+    if not pr.readable:
+        return ("", "")
+    if pr.over_cap and pr.drew_down:
+        return ("⚠️", "Bought above the cap and stock still fell — the cash went "
+                      "out but the shelf did not gain. Count the bar: either the "
+                      "month outran the cap, or something sits between the "
+                      "purchase and the sale.")
+    if pr.over_cap:
+        return ("💡", "Above the cap, but the stock is on the shelf — cash has "
+                      "moved into inventory rather than gone missing. It comes "
+                      "back as those drinks sell.")
+    if pr.drew_down:
+        return ("💡", "Under the cap, and selling from stock you already had. "
+                      "Fine for a month; expect to buy more next one.")
+    return ("✅", "Buying in step with what you sell.")
 
 
 # ── Contingency: sizing the buffer from history, not a forecast ───────
@@ -1387,6 +1472,27 @@ def compute_rooms_target(sales_rows, room_rows, expense_rows, cost_map):
 NIGHT_HOURS = 24.0  # an overnight stay holds the room for the whole room-day
 
 
+def overnight_revenue(room_rows, hours_map=None):
+    """Room revenue from overnight stays only — the numerator RevPAR needs."""
+    return round(sum(float(r["total_revenue"]) for r in room_rows
+                     if not is_short_stay(r, hours_map)), 2)
+
+
+def nightly_rooms(total_rooms, rooms_by_type=None, hours_by_type=None):
+    """Rooms actually on sale overnight — the honest occupancy denominator.
+
+    Falls back to the full count whenever the split cannot be worked out (no
+    per-type counts, no hourly types, or hourly counts that would leave
+    nothing): a wrong denominator is worse than an unrefined one.
+    """
+    total = max(int(total_rooms), 0)
+    counts = {str(k).lower(): int(v) for k, v in (rooms_by_type or {}).items()}
+    hours = {str(k).lower(): float(v) for k, v in (hours_by_type or {}).items()}
+    hourly = sum(n for t, n in counts.items()
+                 if 0 < hours.get(t, NIGHT_HOURS) < NIGHT_HOURS)
+    return total - hourly if 0 < hourly < total else total
+
+
 def stay_hours(row, hours_map=None):
     """How long one stay-unit of this booking holds the room, in hours.
 
@@ -1413,13 +1519,14 @@ def is_short_stay(row, hours_map=None):
 class RoomMetrics:
     total_rooms: int
     days: int
-    available_room_nights: int
+    available_room_nights: int   # nightly rooms × days — overnight capacity
     room_nights_sold: int   # overnight units only — lets are counted separately
     occupancy_pct: float    # overnight occupancy, the classic figure
     adr: float              # revenue per room-night sold — overnight only
     revpar: float           # revenue per *available* room-night — all trades
     revenue: float
     by_type: dict
+    nightly_rooms: int = 0          # rooms on sale overnight (excludes hourly-only)
     short_lets: int = 0             # hourly units sold
     short_revenue: float = 0.0
     night_revenue: float = 0.0
@@ -1458,9 +1565,16 @@ def compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=None,
     and every type is nightly, which is exactly the old behaviour.
     """
     revenue = round(sum_revenue(room_rows), 2)
-    available = max(int(total_rooms), 0) * max(int(days), 0)
     counts = {str(k).lower(): int(v) for k, v in (rooms_by_type or {}).items()}
     hours_map = {str(k).lower(): float(v) for k, v in (hours_by_type or {}).items()}
+
+    # Overnight capacity is the rooms actually on sale overnight. A room that
+    # only ever does hourly lets was never available for a night, and charging
+    # occupancy for it understates the figure exactly as counting lets as
+    # nights overstated it: 273 nights read 70.0% against all 13 rooms and
+    # 82.7% against the 11 that are really let overnight.
+    nightly = nightly_rooms(total_rooms, counts, hours_map)
+    available = nightly * max(int(days), 0)
 
     nights_sold = lets_sold = 0
     night_revenue = short_revenue = hours_sold = 0.0
@@ -1487,7 +1601,10 @@ def compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=None,
         d["hours"] += units * per_unit
         d["lets" if short else "nights"] += units
 
-    available_hours = available * NIGHT_HOURS
+    # Utilization is the one figure that spans both trades, so it keeps the
+    # whole building in its denominator — every room has 24 hours to sell,
+    # however it sells them.
+    available_hours = max(int(total_rooms), 0) * max(int(days), 0) * NIGHT_HOURS
     for rtype, d in by_type.items():
         # A type's rate is per night or per let, never a blend of the two.
         units = d["lets"] if d["is_short"] else d["nights"]
@@ -1508,8 +1625,12 @@ def compute_room_metrics(room_rows, total_rooms, days, rooms_by_type=None,
         available_room_nights=available, room_nights_sold=nights_sold,
         occupancy_pct=pct_of(nights_sold, available),
         adr=round(night_revenue / nights_sold, 2) if nights_sold else 0.0,
-        revpar=round(revenue / available, 2) if available else 0.0,
+        # Overnight revenue over overnight capacity. Both halves must exclude
+        # the hourly trade or the identity RevPAR == ADR × occupancy breaks —
+        # which is precisely how the wrong denominator was caught.
+        revpar=round(night_revenue / available, 2) if available else 0.0,
         revenue=revenue, by_type=by_type,
+        nightly_rooms=nightly,
         short_lets=lets_sold,
         short_revenue=round(short_revenue, 2),
         night_revenue=round(night_revenue, 2),

@@ -217,7 +217,7 @@ def test_roomstats_falls_back_to_per_type_counts_when_no_total_is_set(monkeypatc
     monkeypatch.setattr(reports.db, "get_all_room_type_counts",
                         lambda: {"standard": 6, "deluxe": 2})
     out = reports.generate_room_stats_report()
-    assert "Basis: 8 rooms" in out
+    assert "Basis: 8 overnight rooms" in out
     assert "from your per-type counts" in out
     assert "Occupancy and RevPAR need your room count" not in out
 
@@ -401,8 +401,12 @@ def test_roomstats_reports_the_two_trades_apart(monkeypatch):
     out = reports.generate_room_stats_report()
     assert "📈 *ADR:  ₦15,000*" in out              # the overnight rate, unblended
     assert "avg ₦3,000 per let" in out
-    assert "Occupancy: 43.1%" in out                # never above 100% again
-    assert "Room-time used: 46.7%" in out
+    # 100 nights over 6 overnight rooms × 29 days — the 2 short-time rooms are
+    # not overnight capacity and no longer sit in the denominator.
+    assert "Occupancy: 57.5%" in out                # never above 100%, never deflated
+    assert "6 overnight rooms × 29 days" in out
+    assert "2 hourly-only rooms excluded" in out
+    assert "Room-time used: 46.7%" in out           # utilization still spans all 8
     assert "• *Short Time* — per let ₦3,000" in out
     assert "of its hours" in out                    # not "% full" for an hourly type
 

@@ -530,6 +530,25 @@ def process_room_audit(audit_date: str, rooms_total: int, nights_logged: int,
     return True, f"✅ {audit_date} recorded — every night was in the system."
 
 
+# ── Stock purchase cap ────────────────────────────────────────────────
+
+def process_set_purchase_cap(pct: float) -> tuple[bool, str]:
+    """The share of bar revenue you are willing to spend on stock in a month.
+
+    A ceiling, not a target: it exists to be noticed when crossed. Read beside
+    stock movement, since buying over it while inventory falls is the pair that
+    actually means something.
+    """
+    if not (0 < pct <= 100):
+        return False, "❌ The cap must be between 1 and 100 percent."
+    db.set_setting(reports.PURCHASE_CAP_KEY, str(round(float(pct), 1)))
+    return True, (
+        f"✅ Stock purchase cap set to *{pct:g}%* of bar revenue.\n"
+        "_Every /report checks the month against it, and flags buying above "
+        "the cap while stock is falling._"
+    )
+
+
 # ── Turnaways (refused bookings) ──────────────────────────────────────
 
 def process_turnaway(quantity: int = 1, room_type: str = "", reason: str = "",

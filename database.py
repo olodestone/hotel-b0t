@@ -281,6 +281,18 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         # could only be recorded by giving up the category. Defaulting to
         # 'operating' means every pre-existing row keeps the behaviour it had.
         conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS expense_class TEXT DEFAULT 'operating'"))
+        # That DEFAULT backfilled every existing row, which stamped stock
+        # purchases as 'operating' and put them into the P&L — ₦345,376 of
+        # August's drinks were charged as a bar expense on the same screen
+        # that called them "cash to stock, not a profit cost". metrics now
+        # resolves the category first so it cannot recur, and this corrects
+        # the stored values so exports and the dashboard read the same.
+        # Idempotent: safe to re-run on every start.
+        conn.execute(text("""
+            UPDATE expenses SET expense_class = 'inventory'
+            WHERE lower(category) IN ('restock', 'supplier')
+              AND COALESCE(expense_class, '') <> 'inventory'
+        """))
         # Set when the person entering it wasn't sure, or the category is Misc.
         # Over-expensing understates profit, which is the safe way to be wrong —
         # so an unsure row still lands in the P&L, it just gets listed at month end.

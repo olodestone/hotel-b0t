@@ -276,6 +276,28 @@ part of. A room debt is checked against room revenue, a bar debt against bar
 sales. Anything looser would flag honest entries, and a control that cries wolf
 gets ignored.
 
+### Stock purchases against revenue (`/report`)
+
+Two numbers that mean little apart and a great deal together, and they used to
+sit in different sections of the same report.
+
+- **Purchases as a share of bar revenue** — a spending discipline, checked
+  against `settings.purchase_cap` (default `metrics.DEFAULT_PURCHASE_CAP`, 40%),
+  set from **⚙️ Manage → ⚙️ Settings → 📉 Purchase Cap**.
+- **Stock movement** — purchases minus COGS. Negative means the shelf ran down.
+
+The finding is the pair, not either half:
+
+| | stock grew | **stock fell** |
+|---|---|---|
+| **over cap** | 💡 cash moved into inventory; it comes back as those drinks sell | ⚠️ **the cash went out and the shelf did not gain — count the bar** |
+| under cap | ✅ buying in step | 💡 selling from stock you had; expect to buy next month |
+
+August bought ₦345,377 against ₦647,600 of bar revenue — **53.3%, over a 40%
+cap** — and still drew stock down ~₦46,000. Either the month outran the cap, or
+something sits between the purchase and the sale, and only a physical count can
+say which. That was spotted by eye; this makes it a standing check.
+
 ### Margins
 
 `metrics.AccountPnL` and `metrics.PnL` expose margins as computed properties, so every surface divides identically:
@@ -329,6 +351,41 @@ before it reads the shape of the day at all.
 This is the same failure as a pre-filled count sheet: a figure the system can
 produce on its own is not an observation, and dressing one up as the other is
 how a control quietly becomes decoration.
+
+### Overnight capacity is the rooms actually on sale overnight
+
+`metrics.nightly_rooms()` subtracts rooms whose type is hourly from
+`total_rooms`, and that — not the full count — is the denominator for
+occupancy, ADR, RevPAR and GOPPAR. A room that only ever does hourly lets was
+never available for a night, and charging occupancy against it understates the
+figure exactly as counting lets as nights overstated it:
+
+| | 273 nights sold |
+|---|---|
+| lets counted as nights, all 13 rooms | 90.3% — inflated |
+| lets excluded, still all 13 rooms | 70.0% — deflated |
+| **lets excluded, 11 overnight rooms** | **82.7% — honest** |
+
+**The identity `RevPAR == ADR × occupancy` is what catches this**, and it is
+worth keeping as the check on any future change here. At ₦7,341 ADR and 70.0%
+the report printed RevPAR of ₦5,544, when the identity demands ₦5,139 — the
+two figures were built on different denominators. Fixing the denominator alone
+was not enough: RevPAR's *numerator* had to become overnight revenue too, or
+the identity still failed. Both halves of every overnight figure exclude the
+hourly trade.
+
+`compute_goppar()` must be passed `metrics.overnight_revenue()`, not
+`pnl.rooms.revenue` — the latter includes hourly takings and would print a
+second, higher RevPAR two lines below the first, on the same screen.
+
+**`utilization_pct` keeps the whole building** in its denominator
+(`total_rooms × days × 24`). It is the one figure that spans both trades: every
+room has 24 hours to sell, however it sells them.
+
+The fallback is deliberate — `nightly_rooms()` returns the full count whenever
+the split cannot be worked out (no per-type counts, no hourly types, or hourly
+counts that would leave nothing). A wrong denominator is worse than an
+unrefined one.
 
 **RevPAR by room type** needs a per-type denominator, stored as `roomtype_rooms:<type>` in `settings` (`db.get_all_room_type_counts()`), set with `/setrooms <type> <n>` or from **⚙️ Manage → ⚙️ Settings → 🏨 Room Counts** (the `src` ConversationHandler). That screen lists the hotel total and every type the hotel has priced, counted or actually booked (`_known_room_types()` unions the three sources), shows which are still unset, and warns when the per-type counts don't sum to the total. Types are picked **by index** — they are free text and can contain spaces (`short time`), so they can't ride in `callback_data`. Because this is a setting you enter three or four times in a row, the confirmation carries a *Set another* button straight back into the flow. Its neighbour `sset:roomtype` sets room **prices**, and is labelled "🛏 Room Prices" so the two aren't confused. Each type divides by *its own* room count — borrowing `total_rooms` would credit every room in the building to one category — so a type with no count recorded shows `RevPAR n/a` and a prompt, never a wrong number. By-type ADR needs no denominator and is always populated. If `total_rooms` is unset but per-type counts exist, their sum becomes the hotel-wide denominator; if both are set and disagree, `/setrooms` warns (legitimate when rooms are out of service).
 
@@ -567,11 +624,26 @@ string, so "Maintenance that happens to be capital" could only be recorded by
 giving up the category. `metrics.operating_expenses()` is the single gate: one
 filter, so no report can drift out of agreement with another.
 
-`metrics.expense_class()` tolerates rows written before the axis existed. Rather
-than running the old category-based exclusion alongside the new one, the legacy
-rule is expressed *as* a class — `restock`/`supplier` rows resolve to
-`inventory`, everything else to `operating`. An unknown class also falls back to
-`operating`: over-expensing understates profit, which is the safe way to be wrong.
+**A stock-purchase category always wins, before the stored class is read.**
+`restock` and `supplier` resolve to `inventory` whatever the row claims to be.
+Everything else defers to the stored class, then to `operating` — the safe
+default, since over-expensing understates profit rather than flattering it.
+
+That ordering is not defensive coding; it is the fix for a real failure.
+`ALTER TABLE expenses ADD COLUMN expense_class TEXT DEFAULT 'operating'`
+**backfilled every existing row in Postgres**, so the category fallback could
+never fire — no row was legacy any more. August charged ₦345,376 of drink
+purchases as a bar expense on the same screen that named them *"inventory buy —
+cash to stock, not a profit cost"*, turning a ₦255,083 bar profit (39.4% net)
+into a ₦90,293 loss. Every bottle was billed twice: once when bought, once as
+COGS when sold. `init_db()` also carries an idempotent `UPDATE` correcting the
+stored values so exports and the dashboard agree with the reports.
+
+**The lesson for any future migration:** a backfilled `DEFAULT` is a *value*,
+not an absence. Every other column added in this codebase defaults to a
+sentinel that means "unset" — `cost_price 0`, `duration_hours 0`, `daypart ''`
+— so a fallback can still fire. `'operating'` was a real classification, and it
+silently overrode the rule it was meant to defer to.
 
 ### The overhead account was silently deleting money
 
@@ -996,7 +1068,7 @@ survives, and drink sales restore bar stock on the way out.
 | `turnaways` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `reason`, `recorded_by` — guests refused for want of a room. Touches no money; the only record of demand that never became a transaction |
 | `payables` | `id`, `timestamp`, `supplier`, `drink_name`, `quantity`, `amount`, `amount_paid`, `due_date`, `status`, `paid_at`, `recorded_by` — supplier credit; makes DPO computable |
 | `inventory_snapshots` | `snapshot_date`, `drink_name`, `bar_stock`, `store_stock`, `cost_price`, `stock_value` — PK `(snapshot_date, drink_name)`; nightly stock history for true DIO |
-| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it), `total_rooms` (occupancy/RevPAR denominator), `roomtype_rooms:<type>` (per-type RevPAR denominator), `roomtype_hours:<type>` (hours per stay-unit — marks a type as hourly) and `capital_threshold` (minimum spend that can be capital) |
+| `settings` | `key`, `value` — stores allocation percentages, `cash_opening` (opening bank balance for `/position`), `cash_opening_date` (optional anchor date; cash counts only flows on/after it), `total_rooms` (occupancy/RevPAR denominator), `roomtype_rooms:<type>` (per-type RevPAR denominator), `roomtype_hours:<type>` (hours per stay-unit — marks a type as hourly) `capital_threshold` (minimum spend that can be capital) and `purchase_cap` (stock spend ceiling as a % of bar revenue) |
 | `periodic_obligations` | `id`, `name`, `account`, `category`, `expected_amount`, `months`, `start_date`, `active`, `retired_on`, `created_at`, `recorded_by` — the accrual register. Without it there is nothing to accrue *against* |
 
 All schema migrations use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` so existing databases upgrade safely on next startup.

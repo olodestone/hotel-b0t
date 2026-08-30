@@ -2506,6 +2506,7 @@ _RCL_PICK, _RCL_FIELD, _RCL_VALUE = range(93, 96)  # reclassify flow
 _POB_NAME, _POB_AMT, _POB_MONTHS, _POB_ACCT = range(96, 100)   # register a periodic bill
 _STK_ITEM, _STK_BAR, _STK_STORE = range(102, 105)              # month-end stocktake
 _BOOK_DAYPART = 109                    # when in the day an hourly let happened
+_PCAP_PICK, _PCAP_TEXT = range(110, 112)   # stock purchase cap
 _RAU_ACTUAL, _RAU_ACTUAL_TEXT, _RAU_RATE, _RAU_RATE_TEXT = range(105, 109)  # room audit
 _PPY_PICK, _PPY_AMT = range(100, 102)                          # pay one from the reserve
 
@@ -4052,7 +4053,8 @@ def _settings_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🛏 Room Prices",     callback_data="sset:roomtype")],
         [InlineKeyboardButton("🏨 Room Counts",     callback_data="sset:roomcount"),
          InlineKeyboardButton("🕐 Stay Length",     callback_data="sset:stay")],
-        [InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold")],
+        [InlineKeyboardButton("🔔 Low Stock Alert", callback_data="sset:threshold"),
+         InlineKeyboardButton("📉 Purchase Cap",   callback_data="sset:pcap")],
         [InlineKeyboardButton("📊 Allocation %",    callback_data="sset:allocation"),
          InlineKeyboardButton("📅 Daily Report",    callback_data="sset:dailyreport")],
     ])
@@ -5331,6 +5333,55 @@ _TA_AGAIN_KB = InlineKeyboardMarkup(
 _SSL_AGAIN_KB = InlineKeyboardMarkup(
     [[InlineKeyboardButton("🕐 Set another stay length", callback_data="sset:stay")]]
 )
+
+
+# ── Stock purchase cap (⚙️ Settings → 📉 Purchase Cap) ────────────────
+
+async def _pcap_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+    current = reports._purchase_cap()
+    await q.edit_message_text(
+        "📉 *Stock Purchase Cap*\n"
+        f"_Now: {current:g}% of bar revenue._\n\n"
+        "_The most you want to spend on stock in a month, as a share of what_\n"
+        "_the bar takes. A ceiling to be noticed when crossed, not a target._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{n}%", callback_data=f"pcap:{n}")
+             for n in (30, 35, 40)],
+            [InlineKeyboardButton(f"{n}%", callback_data=f"pcap:{n}")
+             for n in (45, 50, 60)],
+            [InlineKeyboardButton("✏️ Other", callback_data="pcap:__other__")],
+        ]),
+    )
+    return _PCAP_PICK
+
+
+async def _pcap_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    val = q.data[5:]
+    if val == "__other__":
+        await q.edit_message_text("Type the cap as a percentage (e.g. 40):")
+        return _PCAP_TEXT
+    ok, msg = logic.process_set_purchase_cap(float(val))
+    await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    return ConversationHandler.END
+
+
+async def _pcap_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        pct = float(update.message.text.strip().rstrip("%"))
+    except ValueError:
+        await update.message.reply_text("❌ Enter a number, e.g. 40:")
+        return _PCAP_TEXT
+    ok, msg = logic.process_set_purchase_cap(pct)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    return ConversationHandler.END if ok else _PCAP_TEXT
 
 
 # ── Set Stay Length flow (⚙️ Settings → 🕐 Stay Length) ────────────────
@@ -6861,6 +6912,15 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    pcap_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_pcap_start, pattern="^sset:pcap$")],
+        states={
+            _PCAP_PICK: [CallbackQueryHandler(_pcap_pick, pattern="^pcap:")],
+            _PCAP_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _pcap_text)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     ssl_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_ssl_start, pattern="^sset:stay$")],
         states={
@@ -7012,7 +7072,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
                  rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv,
                  sup_conv, spy_conv, src_conv, ssl_conv, ta_conv, rcl_conv,
-                 pob_conv, ppy_conv, stk_conv, rau_conv):
+                 pob_conv, ppy_conv, stk_conv, rau_conv, pcap_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))

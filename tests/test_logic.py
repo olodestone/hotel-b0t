@@ -417,3 +417,21 @@ def test_paying_a_periodic_bill_links_it_to_its_obligation(monkeypatch):
     assert ok is True
     assert seen["obligation_id"] == 1
     assert "drawn from the reserve" in msg
+
+
+def test_set_purchase_cap(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(logic.db, "set_setting", lambda k, v: seen.update(k=k, v=v))
+    ok, msg = logic.process_set_purchase_cap(45)
+    assert ok is True and seen == {"k": "purchase_cap", "v": "45.0"}
+    assert "45%" in msg
+
+
+def test_purchase_cap_rejects_nonsense(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(logic.db, "set_setting",
+                        lambda k, v: calls.update(n=calls["n"] + 1))
+    for bad in (0, -5, 150):
+        ok, _ = logic.process_set_purchase_cap(bad)
+        assert ok is False
+    assert calls["n"] == 0
