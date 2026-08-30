@@ -424,14 +424,20 @@ def generate_full_report(
     ]
 
     # Yield metrics — only meaningful once the hotel's room count is recorded.
+    # Both maps, always. Passing hours without counts leaves nightly_rooms()
+    # unable to see which rooms are hourly, so it silently falls back to the
+    # full count — which put /report on a 390 denominator while /roomstats
+    # used 330 for the same month.
     rm = metrics.compute_room_metrics(
         room_rows, _total_rooms(), _period_days(for_date, for_month, all_time, room_rows),
-        hours_by_type=_room_type_hours(),
+        rooms_by_type=_room_type_counts(), hours_by_type=_room_type_hours(),
     )
     if rm.room_nights_sold:
         lines.append(f"  Room-nights sold: {rm.room_nights_sold}  ·  ADR {_fmt(rm.adr)}")
         if rm.available_room_nights:
             lines.append(f"  Occupancy: {_pct(rm.occupancy_pct)}  ·  RevPAR {_fmt(rm.revpar)}")
+            lines.append(f"  _On {_plural(rm.nightly_rooms, 'overnight room')} × "
+                         f"{rm.days} days = {rm.available_room_nights} room-nights._")
         else:
             lines.append("  _Set the room count with_ `/setrooms <n>` _for occupancy & RevPAR._")
     if rm.has_short_stay:

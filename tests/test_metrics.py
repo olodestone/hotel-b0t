@@ -1917,3 +1917,25 @@ def test_supplier_settlements_count_as_purchases_too():
            {"account": "bar", "category": "supplier", "amount": 30_000}]
     pr = metrics.compute_purchase_ratio(sales, exp, {}, cap_pct=40)
     assert pr.purchases == 50_000 and pr.ratio_pct == 50.0
+
+
+def test_hours_without_counts_cannot_identify_the_hourly_rooms():
+    """The failure mode behind the /report regression.
+
+    nightly_rooms() needs both maps: hours says which types are hourly, counts
+    says how many rooms each holds. Given only one it falls back to the full
+    count — safe, but silently wrong if the caller meant to pass both.
+    """
+    rows = [{"timestamp": "2026-08-05 20:00:00", "room_type": "standard",
+             "quantity": 273, "nights": 1, "total_revenue": 2_004_000},
+            {"timestamp": "2026-08-05 14:00:00", "room_type": "short-time",
+             "quantity": 79, "nights": 1, "total_revenue": 158_000}]
+    hours = {"short-time": 1}
+    counts = {"standard": 11, "short-time": 2}
+
+    without = metrics.compute_room_metrics(rows, 13, 30, hours_by_type=hours)
+    assert without.nightly_rooms == 13 and without.revpar == 5_138.46
+
+    withboth = metrics.compute_room_metrics(rows, 13, 30, rooms_by_type=counts,
+                                            hours_by_type=hours)
+    assert withboth.nightly_rooms == 11 and withboth.revpar == 6_072.73

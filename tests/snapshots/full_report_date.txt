@@ -16,6 +16,7 @@
   📈 *Profit: ₦90,000*  (100.0% net)
   Room-nights sold: 6  ·  ADR ₦15,000
   Occupancy: 75.0%  ·  RevPAR ₦11,250
+  _On 8 overnight rooms × 1 days = 8 room-nights._
 ──────────────────────────────
 📊 *COMBINED*
   Total Revenue:   ₦90,000

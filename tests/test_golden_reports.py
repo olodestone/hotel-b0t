@@ -658,3 +658,49 @@ def test_dow_report_splits_the_hourly_trade_by_time_of_day(monkeypatch):
 def test_a_nightly_only_hotel_gets_no_time_of_day_block():
     out = reports.generate_dow_split_report(for_month=(2026, 6))
     assert "BY TIME OF DAY" not in out
+
+
+def _mixed_hotel(monkeypatch):
+    """9 standard + 2 executive overnight, 2 short-time hourly."""
+    rooms = [{"id": 1, "timestamp": "2026-06-05 20:00:00", "room_type": "standard",
+              "quantity": 100, "nights": 1, "price_per_night": 7000,
+              "total_revenue": 700_000, "deleted_at": None},
+             {"id": 2, "timestamp": "2026-06-05 14:00:00", "room_type": "short-time",
+              "quantity": 40, "nights": 1, "price_per_night": 2000,
+              "total_revenue": 80_000, "daypart": "Afternoon", "deleted_at": None}]
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [dict(r) for r in rooms] if t == "rooms" else [])
+    monkeypatch.setattr(reports.db, "get_all_room_type_counts",
+                        lambda: {"standard": 9, "short-time": 2})
+    monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {"short-time": 1})
+    monkeypatch.setattr(reports.db, "get_setting",
+                        lambda k, d="": "11" if k == "total_rooms" else d)
+
+
+def test_report_and_roomstats_agree_on_the_denominator(monkeypatch):
+    """The regression this pins: /report was on 390 while /roomstats used 330.
+
+    /report passed hours_by_type but not rooms_by_type, so nightly_rooms()
+    could not see which rooms were hourly and fell back to the full count.
+    RevPAR read ₦5,138 against ₦6,073 for the same month.
+    """
+    _mixed_hotel(monkeypatch)
+    full = reports.generate_full_report(for_month=(2026, 6))
+    stats = reports.generate_room_stats_report(for_month=(2026, 6))
+
+    # 9 overnight rooms, not 11 — the 2 short-time rooms are not overnight capacity
+    assert "On 9 overnight rooms" in full
+    assert "9 overnight rooms ×" in stats
+
+    def _occ(text):
+        import re
+        return re.search(r"Occupancy: (\d+\.\d)%", text).group(1)
+
+    assert _occ(full) == _occ(stats)
+
+
+def test_report_shows_the_denominator_it_used(monkeypatch):
+    """It was invisible in /report, which is why the mismatch survived a deploy."""
+    _mixed_hotel(monkeypatch)
+    out = reports.generate_full_report(for_month=(2026, 6))
+    assert "room-nights._" in out

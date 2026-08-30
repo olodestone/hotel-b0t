@@ -315,8 +315,11 @@ def dashboard_view(period_arg: str | None, staff: str | None = None) -> dict:
         "trend_granularity": trend_granularity,
         "position": cash_position(),  # 'as of now', not period-filtered
         # Performance for the selected period …
+        # Counts as well as hours — without both, nightly_rooms() cannot tell
+        # which rooms are hourly and quietly uses the full count.
         "rooms_metrics": metrics.compute_room_metrics(
             rooms, _total_rooms(), period_days,
+            rooms_by_type=db.get_all_room_type_counts(),
             hours_by_type=db.get_all_room_type_hours()),
         # `expenses` already carries this period's accrual (see above).
         "break_even": metrics.compute_break_even(sales, expenses, cost_map),

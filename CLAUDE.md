@@ -387,6 +387,19 @@ the split cannot be worked out (no per-type counts, no hourly types, or hourly
 counts that would leave nothing). A wrong denominator is worse than an
 unrefined one.
 
+**Every caller must pass BOTH maps.** `hours_by_type` says which types are
+hourly; `rooms_by_type` says how many rooms each holds. With only one, the
+fallback fires and the full count is used. `/report` passed hours but not
+counts, so it ran on 390 room-nights while `/roomstats` used 330 for the same
+month — RevPAR ₦5,138 against ₦6,073. The fallback made it silent, and nothing
+on the `/report` screen showed which denominator it had used.
+
+Two guards now: `/report` prints the basis it used (`On 11 overnight rooms × 30
+days = 330 room-nights`), and a test asserts `/report` and `/roomstats` report
+the same occupancy for the same data. A wrong denominator propagates into
+RevPAR, GOPPAR and every pricing comparison built on them, so it is worth
+pinning across surfaces rather than per function.
+
 **RevPAR by room type** needs a per-type denominator, stored as `roomtype_rooms:<type>` in `settings` (`db.get_all_room_type_counts()`), set with `/setrooms <type> <n>` or from **⚙️ Manage → ⚙️ Settings → 🏨 Room Counts** (the `src` ConversationHandler). That screen lists the hotel total and every type the hotel has priced, counted or actually booked (`_known_room_types()` unions the three sources), shows which are still unset, and warns when the per-type counts don't sum to the total. Types are picked **by index** — they are free text and can contain spaces (`short time`), so they can't ride in `callback_data`. Because this is a setting you enter three or four times in a row, the confirmation carries a *Set another* button straight back into the flow. Its neighbour `sset:roomtype` sets room **prices**, and is labelled "🛏 Room Prices" so the two aren't confused. Each type divides by *its own* room count — borrowing `total_rooms` would credit every room in the building to one category — so a type with no count recorded shows `RevPAR n/a` and a prompt, never a wrong number. By-type ADR needs no denominator and is always populated. If `total_rooms` is unset but per-type counts exist, their sum becomes the hotel-wide denominator; if both are set and disagree, `/setrooms` warns (legitimate when rooms are out of service).
 
 **GOPPAR — the bottom-line twin.** RevPAR is a revenue metric: it cannot see fuel, wages, restocking or maintenance, so a hotel can post a rising RevPAR straight through a month it lost money on. `metrics.compute_goppar()` divides *profit* by the same denominator and prints directly beneath it, so the gap between the two lines **is** the cost base.
