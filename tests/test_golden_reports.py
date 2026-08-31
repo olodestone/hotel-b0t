@@ -711,3 +711,44 @@ def test_count_sheet_names_a_button_path_that_exists():
     out = reports.generate_count_sheet()
     assert "Month-End Verification" in out
     assert "📦 Stocktake." not in out       # no such button
+
+
+def test_position_summary_describes_every_line_above_it(monkeypatch):
+    """It said "stock bought, expenses & draws" while showing five deductions."""
+    exp = [{"id": 1, "timestamp": "2026-06-05 12:00:00", "account": "rooms",
+            "category": "maintenance", "amount": 460000, "description": "fencing",
+            "expense_class": "capital", "deleted_at": None}]
+    real = reports.db.read_all
+    monkeypatch.setattr(reports.db, "read_all",
+                        lambda t: [dict(r) for r in exp] if t == "expenses" else real(t))
+    out = reports.generate_position_report()
+    assert "− Asset purchases:" in out
+    assert "minus everything that left the account" in out
+    assert "minus stock bought, expenses & draws" not in out
+
+
+def test_cash_report_says_when_the_money_has_never_been_counted(monkeypatch):
+    monkeypatch.setattr(reports.db, "get_cash_counts", lambda limit=24: [])
+    out = reports.generate_cash_count_report()
+    assert "never been checked against real money" in out
+    assert "books agreeing with themselves" in out
+
+
+def test_cash_report_names_the_gap_and_its_direction(monkeypatch):
+    rows = [{"timestamp": "2026-08-31 09:00:00", "expected": 853_723,
+             "till": 240_000, "bank": 600_000, "counted": 840_000,
+             "variance": -13_723}]
+    monkeypatch.setattr(reports.db, "get_cash_counts", lambda limit=24: rows)
+    out = reports.generate_cash_count_report()
+    assert "Books expected:  ₦853,723" in out
+    assert "*Counted:        ₦840,000*" in out
+    assert "Short by ₦13,723" in out
+
+
+def test_cash_report_calls_a_run_of_shortfalls_a_leak(monkeypatch):
+    rows = [{"timestamp": f"2026-0{m}-28 09:00:00", "expected": 100_000,
+             "till": 90_000 - m, "bank": 0, "counted": 90_000 - m,
+             "variance": -(10_000 + m)} for m in (6, 7, 8)]
+    monkeypatch.setattr(reports.db, "get_cash_counts", lambda limit=24: rows[::-1])
+    out = reports.generate_cash_count_report()
+    assert "Short every time — this is a leak, not an error" in out

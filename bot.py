@@ -1596,7 +1596,8 @@ async def cmd_stocktake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         update, reports.generate_count_sheet(),
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📦 Enter the counts", callback_data="stk:start")],
-            [InlineKeyboardButton("📊 Variance report", callback_data="vfy:variance")],
+            [InlineKeyboardButton("📊 Variance report", callback_data="vfy:variance"),
+             InlineKeyboardButton("💰 Cash history",   callback_data="vfy:cash")],
         ]),
     )
 
@@ -2507,6 +2508,7 @@ _POB_NAME, _POB_AMT, _POB_MONTHS, _POB_ACCT = range(96, 100)   # register a peri
 _STK_ITEM, _STK_BAR, _STK_STORE = range(102, 105)              # month-end stocktake
 _BOOK_DAYPART = 109                    # when in the day an hourly let happened
 _PCAP_PICK, _PCAP_TEXT = range(110, 112)   # stock purchase cap
+_CSH_TILL, _CSH_BANK = range(112, 114)     # cash count
 _RAU_ACTUAL, _RAU_ACTUAL_TEXT, _RAU_RATE, _RAU_RATE_TEXT = range(105, 109)  # room audit
 _PPY_PICK, _PPY_AMT = range(100, 102)                          # pay one from the reserve
 
@@ -3210,6 +3212,7 @@ async def _cb_verify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             [InlineKeyboardButton("📋 Print count sheet", callback_data="vfy:sheet")],
             [InlineKeyboardButton("📦 Enter stocktake", callback_data="stk:start")],
             [InlineKeyboardButton("🔎 Room audit", callback_data="rau:start")],
+            [InlineKeyboardButton("💰 Count the cash", callback_data="csh:start")],
             [InlineKeyboardButton("📊 Variance report", callback_data="vfy:variance")],
         ]),
     )
@@ -3224,9 +3227,59 @@ async def _cb_verify_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     now = clock.now()
     if q.data == "vfy:sheet":
         await _reply_long_cb(q, reports.generate_count_sheet())
+    elif q.data == "vfy:cash":
+        await _reply_long_cb(q, reports.generate_cash_count_report())
     else:
         await _reply_long_cb(q, reports.generate_variance_report(
             for_month=(now.year, now.month)))
+
+
+# ── Cash count: the stocktake, for money ──────────────────────────────
+
+async def _csh_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if not _is_admin(q.from_user.id):
+        await q.edit_message_text("🔒 Admin only.")
+        return ConversationHandler.END
+    await q.edit_message_text(
+        "💰 *Count the cash*\n"
+        "_Count it before you look at what the bot expects — the same rule as_\n"
+        "_the stock sheet. Knowing the figure first turns a count into a tick._\n\n"
+        "*How much cash is physically here?* (₦)",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    return _CSH_TILL
+
+
+async def _csh_till(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    amt, err = _to_float(update.message.text.strip().replace(",", ""), "cash")
+    if err:
+        await update.message.reply_text("❌ Enter the amount in figures (0 if none):")
+        return _CSH_TILL
+    ctx.user_data["csh_till"] = amt
+    await update.message.reply_text(
+        "🏦 *And the bank balance?* (₦)\n_From the statement or the app._",
+        parse_mode=ParseMode.MARKDOWN_V2)
+    return _CSH_BANK
+
+
+async def _csh_bank(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    amt, err = _to_float(update.message.text.strip().replace(",", ""), "bank balance")
+    if err:
+        await update.message.reply_text("❌ Enter the amount in figures (0 if none):")
+        return _CSH_BANK
+
+    till = ctx.user_data.pop("csh_till", 0.0)
+    ctx.user_data.clear()
+    # The expectation is read only now, after both figures are in — the count
+    # cannot be nudged toward a number nobody had seen yet.
+    expected = reports.cash_estimate()
+    ok, msg = logic.process_cash_count(expected, till, amt, recorded_by=_actor(update))
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_get_keyboard(update.effective_user.id))
+    return ConversationHandler.END
 
 
 # ── Stocktake entry: every item, bar then store ───────────────────────
@@ -6859,6 +6912,15 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
         fallbacks=[CommandHandler("cancel", _cancel_conv)],
         allow_reentry=True,
     )
+    csh_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_csh_start, pattern="^csh:start$")],
+        states={
+            _CSH_TILL: [MessageHandler(filters.TEXT & ~filters.COMMAND, _csh_till)],
+            _CSH_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, _csh_bank)],
+        },
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+    )
     stk_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_stk_start, pattern="^stk:start$")],
         states={
@@ -7072,7 +7134,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
                  rnm_conv, smn_conv, dsf_conv, sst_conv, scs_conv, ddr_conv,
                  sup_conv, spy_conv, src_conv, ssl_conv, ta_conv, rcl_conv,
-                 pob_conv, ppy_conv, stk_conv, rau_conv, pcap_conv):
+                 pob_conv, ppy_conv, stk_conv, rau_conv, pcap_conv, csh_conv):
         app.add_handler(conv)
 
     app.add_handler(MessageHandler(filters.Text(["⚙️ Manage"]) & ~filters.COMMAND, _btn_manage))
@@ -7092,7 +7154,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_review, pattern="^mgr:review$"))
     app.add_handler(CallbackQueryHandler(_cb_periodic_menu, pattern="^mgr:periodic$"))
     app.add_handler(CallbackQueryHandler(_cb_verify_menu, pattern="^mgr:verify$"))
-    app.add_handler(CallbackQueryHandler(_cb_verify_action, pattern="^vfy:(sheet|variance)$"))
+    app.add_handler(CallbackQueryHandler(_cb_verify_action, pattern="^vfy:(sheet|cash|variance)$"))
     app.add_handler(CallbackQueryHandler(_cb_reserve_detail, pattern="^mgr:reserve$"))
     app.add_handler(CallbackQueryHandler(_cb_insights_menu, pattern="^ins:(cashcycle|menu|roomstats|dow|variance|payables)$"))
     app.add_handler(CallbackQueryHandler(_cb_dow_period, pattern="^dow:(week|lastweek|month|all)$"))

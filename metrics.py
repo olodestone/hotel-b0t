@@ -2732,6 +2732,80 @@ def variance_trend(count_rows, cost_map, cogs_by_month, now, months=3):
     return out
 
 
+# ── Cash count: the stocktake, for money ──────────────────────────────
+#
+# The cash figure is every recorded inflow minus every recorded outflow. It
+# reconciles perfectly and proves nothing — it is the books agreeing with
+# themselves, exactly as stock levels were before anyone counted a bottle.
+#
+# What it cannot see is money that moved without a row: a spend nobody entered
+# is still sitting in the estimate. Counting the money is the only independent
+# observation, and the difference is the finding.
+#
+# A surplus is a finding too. More cash than the books expect means income was
+# not recorded — the same leak seen from the other side, and it must never read
+# as a clean count.
+
+
+@dataclass(frozen=True)
+class CashCount:
+    expected: float
+    till: float
+    bank: float
+    note: str = ""
+
+    @property
+    def counted(self):
+        return round(self.till + self.bank, 2)
+
+    @property
+    def variance(self):
+        """Counted minus expected. Negative means money is missing."""
+        return round(self.counted - self.expected, 2)
+
+    @property
+    def variance_pct(self):
+        return pct_of(self.variance, self.expected) if self.expected else 0.0
+
+    @property
+    def status(self):
+        return variance_status(self.variance_pct)[0]
+
+    @property
+    def matched(self):
+        return abs(self.variance) < 1
+
+
+def cash_verdict(cc):
+    """What the difference means, in the direction it points.
+
+    Deliberately about the process, never about a person: the count says an
+    amount is unaccounted for, not who accounted for it.
+    """
+    if cc.matched:
+        return "🎯", "The books and the money agree."
+    if cc.variance < 0:
+        return (cc.status,
+                "Less money than the books expect. Something went out without "
+                "being recorded — an unentered expense, a purchase paid in "
+                "cash, or a payment nobody logged.")
+    return (cc.status,
+            "More money than the books expect. Not good news: it usually means "
+            "income was never recorded, which is the same gap seen from the "
+            "other side. Investigate it like a shortage.")
+
+
+def cash_count_trend(count_rows, limit=6):
+    """Variance per count, oldest first — one count is a number, several a trend."""
+    out = []
+    for r in sorted(count_rows, key=lambda r: str(r.get("timestamp", "")))[-limit:]:
+        try:
+            out.append((str(r.get("timestamp", ""))[:10], float(r.get("variance") or 0)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 # ── Room audit: was every night logged, at the rate charged? ──────────
 #
 # Occupancy can only ever report what was keyed in. A night nobody recorded is

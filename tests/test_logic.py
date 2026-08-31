@@ -435,3 +435,35 @@ def test_purchase_cap_rejects_nonsense(monkeypatch):
         ok, _ = logic.process_set_purchase_cap(bad)
         assert ok is False
     assert calls["n"] == 0
+
+
+# ── Cash count ────────────────────────────────────────────────────────
+
+def test_cash_count_logs_and_reanchors(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(logic.db, "record_cash_count",
+                        lambda *a, **k: seen.update(args=a, **k) or
+                        {"expected": a[0], "counted": a[1] + a[2],
+                         "variance": a[1] + a[2] - a[0], "date": "2026-08-31"})
+    ok, msg = logic.process_cash_count(853_723, 240_000, 600_000)
+    assert ok is True
+    assert seen["args"] == (853_723, 240_000, 600_000)
+    assert "Short by ₦13,723.00" in msg
+    assert "anchored to ₦840,000.00" in msg     # the difference stops here
+
+
+def test_cash_count_reports_an_exact_match_plainly(monkeypatch):
+    monkeypatch.setattr(logic.db, "record_cash_count",
+                        lambda *a, **k: {"expected": a[0], "counted": a[1] + a[2],
+                                         "variance": 0, "date": "2026-08-31"})
+    ok, msg = logic.process_cash_count(100_000, 40_000, 60_000)
+    assert ok is True and "Exact match" in msg
+
+
+def test_cash_count_rejects_negative_amounts(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(logic.db, "record_cash_count",
+                        lambda *a, **k: calls.update(n=calls["n"] + 1) or {})
+    ok, msg = logic.process_cash_count(100_000, -5, 60_000)
+    assert ok is False and "negative" in msg
+    assert calls["n"] == 0

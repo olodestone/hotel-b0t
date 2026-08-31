@@ -923,6 +923,39 @@ output — the figure is about the process, and naming whoever held the sheet
 turns a control into an accusation. `recorded_by` is stored but never rendered;
 there is a test for it.
 
+### Cash count — the stocktake, for money
+
+The cash figure is every recorded inflow minus every recorded outflow. It
+reconciles perfectly and proves nothing: it is the books agreeing with
+themselves, exactly as stock levels were before anyone counted a bottle. What
+it cannot see is money that moved without a row — an unentered expense is still
+sitting inside the estimate.
+
+**⚙️ Manage → 🧾 Month-End Verification → 💰 Count the cash** asks for the cash
+physically present, then the bank balance, and compares the total with what
+`/position` claims. `reports.cash_estimate()` is that exact figure, extracted so
+the count is checked against what the report actually says — a count measured
+against a differently-built number would compare two things and call the gap a
+finding. **The expectation is read only after both figures are entered**, so the
+count cannot be nudged toward a number the counter has already seen. Same
+principle as the blank count sheet.
+
+`db.record_cash_count()` does both halves in one transaction, mirroring
+`record_stock_count()`: it **logs** the difference (re-anchoring alone would
+erase the evidence) and **re-anchors** `cash_opening` / `cash_opening_date` to
+the counted figure, so a known error stops compounding into every later report.
+
+Bands come from `variance_status()`, shared with the stocktake, which means the
+asymmetry carries over: −1.6% is 🟡 *watch*, but +1.3% is 🔴 because **any
+surplus is a flag**. More money than the books expect means income was never
+recorded — the same gap seen from the other side. The verdict is about the
+process and never about a person: it says an amount is unaccounted for, not
+that anyone took it.
+
+`cash_count_trend()` shows the difference at each count, because one count is a
+number and several are a direction. A run of shortfalls is reported as a leak
+rather than as a series of unrelated errors.
+
 ### `/roomaudit`
 
 Confirms every room-night was logged, at the rate charged.
@@ -1077,6 +1110,7 @@ survives, and drink sales restore bar stock on the way out.
 | `inventory` | `drink_name`, `current_stock`, `store_stock`, `total_purchased`, `total_sold`, `cost_price`, `low_stock_threshold` |
 | `users` | `user_id`, `username`, `role`, `added_at` |
 | `stock_counts` | `id`, `timestamp`, `drink_name`, `expected`, `counted`, `variance`, `cost_price`, `note`, `recorded_by`, `location` (bar/store — counted separately), `period` — one physical stocktake; the only independent check on the books |
+| `cash_counts` | `id`, `timestamp`, `period`, `expected`, `till`, `bank`, `counted`, `variance`, `note`, `recorded_by` — the only independent check on the cash figure |
 | `room_audits` | `id`, `timestamp`, `audit_date`, `period`, `rooms_total`, `nights_logged`, `nights_actual`, `rate_variance`, `variance_count`, `note`, `recorded_by` — capture rate as a trend, not a one-off |
 | `turnaways` | `id`, `timestamp`, `created_at`, `room_type`, `quantity`, `reason`, `recorded_by` — guests refused for want of a room. Touches no money; the only record of demand that never became a transaction |
 | `payables` | `id`, `timestamp`, `supplier`, `drink_name`, `quantity`, `amount`, `amount_paid`, `due_date`, `status`, `paid_at`, `recorded_by` — supplier credit; makes DPO computable |

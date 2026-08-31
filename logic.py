@@ -504,6 +504,40 @@ def process_stock_count(drink: str, counted: int, note: str = "", recorded_by: s
     )
 
 
+# ── Cash count ────────────────────────────────────────────────────────
+
+def process_cash_count(expected: float, till: float, bank: float,
+                       note: str = "", recorded_by: str = "",
+                       count_date: str | None = None) -> tuple[bool, str]:
+    """Record what money is actually there, against what the books expect.
+
+    Reports the difference and never who is responsible for it: the count says
+    an amount is unaccounted for, not that anyone took it.
+    """
+    if till < 0 or bank < 0:
+        return False, "❌ Amounts cannot be negative."
+
+    result = db.record_cash_count(expected, till, bank, note=note,
+                                  recorded_by=recorded_by, count_date=count_date)
+    cc = metrics.CashCount(expected=expected, till=till, bank=bank)
+    icon, verdict = metrics.cash_verdict(cc)
+
+    head = (f"{icon} *Cash counted: {_naira(cc.counted)}*\n"
+            f"_Till {_naira(till)} · Bank {_naira(bank)}_\n"
+            f"Books expected {_naira(expected)}.")
+    if cc.matched:
+        return True, (f"{head}\n🎯 *Exact match.*\n"
+                      "_The estimate is re-anchored to this figure._")
+    direction = "Short by" if cc.variance < 0 else "Over by"
+    return True, (
+        f"{head}\n"
+        f"*{direction} {_naira(abs(cc.variance))}* ({cc.variance_pct:+.1f}%)\n"
+        f"_{verdict}_\n\n"
+        f"_Cash is now anchored to {_naira(cc.counted)} on {result['date']}, so "
+        "the difference does not carry into next month._"
+    )
+
+
 # ── Room audit ────────────────────────────────────────────────────────
 
 def process_room_audit(audit_date: str, rooms_total: int, nights_logged: int,

@@ -1273,7 +1273,10 @@ def generate_position_report() -> str:
         *([f"  − Periodic bills:   {_fmt(pos.periodic_cash)}"] if pos.periodic_cash else []),
         f"  − Owner draws:      {_fmt(pos.draws_cash)}",
         f"  = *💰 {_fmt(pos.cash)}*",
-        "  _Money in, minus stock bought, expenses & draws._",
+        # Named after the lines actually shown, which now include assets and
+        # periodic bills — a summary that lists three of five reads as an
+        # omission rather than a summary.
+        "  _Money collected, minus everything that left the account._",
         _SEP,
         "📦 *STOCK VALUE ON HAND* _(asset)_",
         f"  Bar + store @ cost:  {_fmt(pos.stock_value)}",
@@ -1749,6 +1752,88 @@ def _shrinkage_trend_block(all_counts: list[dict], cost_map: dict) -> list[str]:
     if any(p is None for _l, p, _v in trend):
         out.append("  _A dash is a month with no count — unverified, not clean._")
     return out
+
+
+def cash_estimate() -> float:
+    """The cash figure /position shows, on its own.
+
+    Extracted so the cash count can be checked against exactly what the report
+    claims — a count measured against a differently-built number would compare
+    two things and call the gap a finding.
+    """
+    return _cash_position().cash
+
+
+def _cash_position():
+    """The shared build of the cash position, used by /position and the count."""
+    try:
+        opening = float(db.get_setting(CASH_OPENING_KEY, "0") or 0)
+    except (TypeError, ValueError):
+        opening = 0.0
+    return metrics.compute_cash_position(
+        _active(db.read_all("sales")), _active(db.read_all("rooms")),
+        _active(db.read_all("expenses")), _active(db.read_all("owner_draws")),
+        db.read_all("debtors"),
+        stock_value=round(sum(i["stock_value"] for i in inv.get_inventory_summary()), 2),
+        opening=opening,
+        anchor_dt=_parse_ts(db.get_setting(CASH_OPENING_DATE_KEY, "") or ""),
+        cost_map=_cost_price_map(), now=clock.now(), obligations=_obligations(),
+    )
+
+
+def generate_cash_count_report() -> str:
+    """Counted money against the books, and how the gap has moved."""
+    rows = db.get_cash_counts()
+    if not rows:
+        return (
+            "💰 *Cash Count*\n\n"
+            "⚠️ _The cash figure has never been checked against real money._\n"
+            "It is every recorded inflow minus every recorded outflow — the books "
+            "agreeing with themselves, exactly as your stock levels were before "
+            "you started counting bottles.\n\n"
+            "Count it from ⚙️ Manage → 🧾 Month-End Verification → 💰 Count the cash."
+        )
+
+    latest = rows[0]
+    cc = metrics.CashCount(expected=float(latest.get("expected") or 0),
+                           till=float(latest.get("till") or 0),
+                           bank=float(latest.get("bank") or 0))
+    icon, verdict = metrics.cash_verdict(cc)
+
+    lines = [
+        f"💰 *{HOTEL_NAME} — Cash Count*",
+        f"📅 Last counted {str(latest.get('timestamp', ''))[:10]}",
+        _SEP,
+        f"  Books expected:  {_fmt(cc.expected)}",
+        f"  Till:            {_fmt(cc.till)}",
+        f"  Bank:            {_fmt(cc.bank)}",
+        f"  *Counted:        {_fmt(cc.counted)}*",
+        _SEP,
+    ]
+    if cc.matched:
+        lines.append("  🎯 *Exact match — the books and the money agree.*")
+    else:
+        word = "Short" if cc.variance < 0 else "Over"
+        lines += [
+            f"  {icon} *{word} by {_fmt(abs(cc.variance))}*  ({cc.variance_pct:+.1f}%)",
+            f"  _{_esc(verdict)}_",
+        ]
+
+    trend = metrics.cash_count_trend(rows)
+    if len(trend) >= 2:
+        lines += [_SEP, "*TREND* _(difference at each count)_",
+                  "  " + "  ·  ".join(f"{d[-5:]} {v:+,.0f}" for d, v in trend)]
+        drifting = [v for _d, v in trend if v < 0]
+        if len(drifting) == len(trend):
+            lines.append("  🔻 _Short every time — this is a leak, not an error._")
+
+    lines += [
+        _SEP,
+        "_Counting is the only independent check on the cash figure. Everything_",
+        "_else in the report is the books confirming their own arithmetic._",
+        f"_Generated {clock.now().strftime('%d %b %Y %H:%M')}_",
+    ]
+    return "\n".join(lines)
 
 
 # ── Room audit ────────────────────────────────────────────────────────

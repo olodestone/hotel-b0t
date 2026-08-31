@@ -8,7 +8,7 @@
   − Stock purchases:  ₦30,000
   − Owner draws:      ₦40,000
   = *💰 ₦-60,999*
-  _Money in, minus stock bought, expenses & draws._
+  _Money collected, minus everything that left the account._
 ──────────────────────────────
 📦 *STOCK VALUE ON HAND* _(asset)_
   Bar + store @ cost:  ₦11,160

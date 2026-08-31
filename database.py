@@ -434,6 +434,23 @@ def init_db(schema: str | None = None, token: str | None = None) -> None:
         # Which month this count verifies. A month with no count is reported
         # UNVERIFIED rather than silently treated as clean.
         conn.execute(text("ALTER TABLE stock_counts ADD COLUMN IF NOT EXISTS period TEXT DEFAULT ''"))
+        # Cash counts — the stocktake, for money. The cash figure is the books
+        # agreeing with themselves; counting the money is the only independent
+        # observation, and the difference is the finding.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS cash_counts (
+                id          SERIAL PRIMARY KEY,
+                timestamp   TEXT,
+                period      TEXT DEFAULT '',
+                expected    FLOAT NOT NULL DEFAULT 0,
+                till        FLOAT NOT NULL DEFAULT 0,
+                bank        FLOAT NOT NULL DEFAULT 0,
+                counted     FLOAT NOT NULL DEFAULT 0,
+                variance    FLOAT NOT NULL DEFAULT 0,
+                note        TEXT DEFAULT '',
+                recorded_by TEXT DEFAULT ''
+            )
+        """))
         # Room audits — was every room-night actually logged, at the rate charged?
         # The days are chosen by the bot, never by the operator: a person picks
         # days they remember clearly, and those are the days most likely correct.
@@ -1741,6 +1758,45 @@ def get_all_room_type_hours() -> dict[str, float]:
         if rtype and hours > 0:
             out[rtype] = hours
     return out
+
+
+# ── Cash counts ───────────────────────────────────────────────────────
+
+def record_cash_count(expected: float, till: float, bank: float, note: str = "",
+                      recorded_by: str = "", count_date: str | None = None) -> dict[str, Any]:
+    """Log a physical cash count and re-anchor the estimate to what was counted.
+
+    Both halves in one transaction, exactly as record_stock_count() does: the
+    log preserves the difference (re-anchoring alone would erase the evidence),
+    and the re-anchor stops a known error compounding into every later figure.
+    """
+    counted = round(float(till) + float(bank), 2)
+    variance = round(counted - float(expected), 2)
+    day = count_date or now_str()[:10]
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO cash_counts
+                (timestamp, period, expected, till, bank, counted, variance, note, recorded_by)
+            VALUES (:ts, :period, :expected, :till, :bank, :counted, :variance, :note, :by)
+        """), {
+            "ts": _ts(count_date), "period": day[:7],
+            "expected": round(float(expected), 2), "till": round(float(till), 2),
+            "bank": round(float(bank), 2), "counted": counted, "variance": variance,
+            "note": note, "by": recorded_by,
+        })
+        conn.commit()
+    # Re-anchor: the counted figure becomes the opening balance on the count
+    # date, so tomorrow's estimate starts from money someone actually held.
+    set_setting("cash_opening", str(counted))
+    set_setting("cash_opening_date", day)
+    return {"expected": round(float(expected), 2), "counted": counted,
+            "variance": variance, "date": day}
+
+
+def get_cash_counts(limit: int = 24) -> list[dict[str, Any]]:
+    return _rows("SELECT * FROM cash_counts ORDER BY timestamp DESC LIMIT :n",
+                 {"n": int(limit)})
 
 
 # ── Room audits ───────────────────────────────────────────────────────

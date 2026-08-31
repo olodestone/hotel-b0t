@@ -1939,3 +1939,102 @@ def test_hours_without_counts_cannot_identify_the_hourly_rooms():
     withboth = metrics.compute_room_metrics(rows, 13, 30, rooms_by_type=counts,
                                             hours_by_type=hours)
     assert withboth.nightly_rooms == 11 and withboth.revpar == 6_072.73
+
+
+# ── A debtor paying is not a second sale ──────────────────────────────
+
+def _tab(paid, status):
+    return [{"timestamp": "2026-08-10 20:00:00", "account": "bar", "name": "john",
+             "amount": 10_000, "amount_paid": paid, "status": status}]
+
+
+_TAB_SALE = [{"timestamp": "2026-08-10 20:00:00", "drink_name": "beer",
+              "quantity": 10, "total_revenue": 10_000, "cost_price": 500}]
+
+
+def _tab_pos(debtors):
+    from datetime import datetime as _dt
+    return metrics.compute_cash_position(
+        _TAB_SALE, [], [], [], debtors, stock_value=0, opening=0, anchor_dt=None,
+        cost_map={"beer": 500}, now=_dt(2026, 8, 31, 12, 0))
+
+
+def test_collecting_a_debt_never_adds_revenue_a_second_time():
+    """Revenue is recognised when the drink leaves the shelf, once."""
+    for paid, status in ((0, "outstanding"), (4_000, "outstanding"), (10_000, "paid")):
+        pnl = metrics.compute_pnl(_TAB_SALE, [], [], {"beer": 500})
+        assert pnl.total_revenue == 10_000
+        assert pnl.net_profit == 5_000
+
+
+def test_cash_rises_only_as_the_debt_is_settled():
+    assert _tab_pos(_tab(0, "outstanding")).cash == 0
+    assert _tab_pos(_tab(4_000, "outstanding")).cash == 4_000
+    assert _tab_pos(_tab(10_000, "paid")).cash == 10_000
+
+
+def test_cash_and_the_amount_owed_move_together():
+    """They are two sides of one figure — ₦4,000 collected is ₦4,000 less owed."""
+    for paid in (0, 4_000, 7_500):
+        pos = _tab_pos(_tab(paid, "outstanding"))
+        assert pos.cash + pos.receivables == 10_000
+
+
+def test_a_payment_recorded_as_a_sale_would_double_the_revenue():
+    """What the separation prevents, stated as the failure it avoids."""
+    doubled = _TAB_SALE + [{"timestamp": "2026-08-20 12:00:00", "drink_name": "beer",
+                            "quantity": 10, "total_revenue": 10_000, "cost_price": 500}]
+    assert metrics.compute_pnl(doubled, [], [], {"beer": 500}).total_revenue == 20_000
+
+
+# ── Cash count: the stocktake, for money ──────────────────────────────
+
+def test_a_matching_count_says_the_books_and_the_money_agree():
+    cc = metrics.CashCount(expected=853_723, till=253_723, bank=600_000)
+    assert cc.counted == 853_723 and cc.variance == 0 and cc.matched is True
+    assert metrics.cash_verdict(cc)[0] == "🎯"
+
+
+def test_short_cash_points_at_money_that_left_without_a_row():
+    cc = metrics.CashCount(expected=853_723, till=240_000, bank=600_000)
+    assert cc.variance == -13_723
+    assert cc.variance_pct == -1.6
+    icon, note = metrics.cash_verdict(cc)
+    assert icon == "🟡"                      # -1.6% is watch, not yet a flag
+    assert "without being recorded" in note
+
+
+def test_more_cash_than_expected_is_flagged_not_celebrated():
+    """The same rule as a stock surplus — income that was never recorded."""
+    cc = metrics.CashCount(expected=853_723, till=265_000, bank=600_000)
+    assert cc.variance > 0
+    icon, note = metrics.cash_verdict(cc)
+    assert icon == "🔴"                      # any surplus flags, whatever its size
+    assert "Not good news" in note
+    assert "Investigate it like a shortage" in note
+
+
+def test_the_surplus_rule_is_harsher_than_the_shortage_rule():
+    """+1.3% flags where -1.6% only warns — a surplus is never a clean count."""
+    short = metrics.CashCount(expected=853_723, till=240_000, bank=600_000)
+    over = metrics.CashCount(expected=853_723, till=265_000, bank=600_000)
+    assert abs(over.variance_pct) < abs(short.variance_pct)
+    assert over.status == "🔴" and short.status == "🟡"
+
+
+def test_till_and_bank_are_counted_together_but_asked_apart():
+    cc = metrics.CashCount(expected=100_000, till=40_000, bank=60_000)
+    assert cc.counted == 100_000 and cc.matched is True
+
+
+def test_a_count_against_zero_expected_does_not_divide_by_zero():
+    cc = metrics.CashCount(expected=0, till=5_000, bank=0)
+    assert cc.variance == 5_000 and cc.variance_pct == 0.0
+
+
+def test_persistent_shortfalls_are_a_trend_not_a_series_of_errors():
+    rows = [{"timestamp": f"2026-0{m}-28 09:00:00", "variance": v}
+            for m, v in ((6, -4_000), (7, -9_000), (8, -13_723))]
+    trend = metrics.cash_count_trend(rows)
+    assert [v for _d, v in trend] == [-4_000, -9_000, -13_723]
+    assert all(v < 0 for _d, v in trend)
