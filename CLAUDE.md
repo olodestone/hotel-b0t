@@ -217,6 +217,18 @@ All date-filtered reports accept the same arguments:
 Three figures are tracked separately and must never be conflated:
 
 1. **Profit (performance)** — `revenue − cost-of-stock-sold (COGS) − operating expenses`. **Owner draws and inventory purchases (`restock`) are excluded.** Buying stock converts cash into a stock asset; its cost only hits the P&L as COGS when the drink is *sold*. Counting the restock purchase as an expense too would double-count it. `reports._operating_expenses()` strips `restock` (the `NON_PNL_CATEGORIES` set) from every profit calc (`generate_full_report`, `generate_daily_summary`, `generate_expense_report`, `generate_allocation_report`).
+**Old debts settled later.** A tab raised in July and paid in August is cash
+arriving with no revenue behind it in the window — its revenue was July's. It is
+also not part of an anchored opening balance, because that balance was the bank
+on the anchor day and the money had not come in yet. So `collected` cannot see
+it from either side, and without `old_debt_cash` the estimate silently lost
+every naira collected against a previous month's tabs. `compute_cash_position()`
+takes `payment_rows` (the `debtor_payments` table) and adds payments made inside
+the window against debts **created before the anchor** — only those, since a
+debt raised and settled inside the window is already covered by `collected` and
+counting it again would double it. With no anchor set, nothing is "old": the
+all-time window already contains the original sale.
+
 2. **Cash in bank (estimate)** — running balance: `opening + collected sales − operating expenses − stock purchases − owner draws`. Draws and restock **do** reduce cash. The `opening` anchor works two ways: with an **anchor date** (`/position set <amount> <YYYY-MM-DD>`, stored in `cash_opening_date`) only flows on/after that day are counted — `opening` is your real balance on that day, earlier months are ignored, and you can re-anchor each period without double-counting. Without a date, `opening` is the all-time starting balance before the first entry and every flow is added on top (set once; never to a current balance). Assumes sales are cash unless an outstanding debtor exists.
 3. **Stock value on hand (asset)** — `Σ (store + bar units) × cost_price`. Shown as `TOTAL VALUE` in `/stock` and line ③ of `/position`.
 

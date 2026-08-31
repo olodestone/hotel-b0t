@@ -1248,6 +1248,7 @@ def generate_position_report() -> str:
         sales_all, rooms_all, expense_all, draws_all, debtor_rows,
         stock_value=stock_value, opening=opening, anchor_dt=anchor_dt,
         cost_map=_cost_price_map(), now=now, obligations=_obligations(),
+        payment_rows=db.read_all("debtor_payments"),
     )
 
     if anchor_dt:
@@ -1265,6 +1266,9 @@ def generate_position_report() -> str:
         *since_note,
         open_label,
         f"  + Collected sales:  {_fmt(pos.collected)}",
+        # Old tabs settled this period. Their revenue was an earlier month's, so
+        # "collected sales" cannot include them, but the money did arrive.
+        *([f"  + Old debts paid:   {_fmt(pos.old_debt_cash)}"] if pos.old_debt_cash else []),
         f"  − Expenses:         {_fmt(pos.opex_cash)}",
         f"  − Stock purchases:  {_fmt(pos.restock_cash)}",
         # Capital never reduced profit, but it certainly reduced the bank.
@@ -1778,6 +1782,7 @@ def _cash_position():
         opening=opening,
         anchor_dt=_parse_ts(db.get_setting(CASH_OPENING_DATE_KEY, "") or ""),
         cost_map=_cost_price_map(), now=clock.now(), obligations=_obligations(),
+        payment_rows=db.read_all("debtor_payments"),
     )
 
 

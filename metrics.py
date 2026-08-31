@@ -948,11 +948,12 @@ class CashPosition:
     capital_cash: float = 0.0    # asset purchases: out of the P&L, out of the bank
     periodic_cash: float = 0.0   # periodic bills paid: drawn from the reserve
     unmatched_receivables: float = 0.0   # debts exceeding the revenue they came from
+    old_debt_cash: float = 0.0           # pre-anchor tabs settled inside the window
 
 
 def compute_cash_position(sales_all, rooms_all, expense_all, draws_all, debtor_rows,
                           stock_value, opening, anchor_dt, cost_map, now,
-                          obligations=()):
+                          obligations=(), payment_rows=()):
     """Cash-at-hand estimate + asset snapshot + profit footnote.
 
     Mirrors generate_position_report exactly. ``stock_value``, ``opening`` and
@@ -991,7 +992,33 @@ def compute_cash_position(sales_all, rooms_all, expense_all, draws_all, debtor_r
     # `unmatched_debts` is what explains the shortfall rather than hiding it.
     collected = round(max(rev_cash - recv_cash, 0.0), 2)
     uncollectable = round(max(recv_cash - rev_cash, 0.0), 2)
-    cash = round(opening + collected - opex_cash - restock_cash
+
+    # Old debts settled inside the window. Their revenue belongs to an earlier
+    # period, so `collected` cannot see them, and they were never part of an
+    # anchored opening balance either — that balance was the bank on the day,
+    # and this money had not arrived yet. Without this the cash estimate simply
+    # loses every naira collected against last month's tabs.
+    old_debt_cash = 0.0
+    if anchor_dt:
+        pre_anchor = {int(r["id"]): float(r.get("amount") or 0) for r in debtor_rows
+                      if r.get("id") is not None
+                      and (parse_ts(r.get("timestamp")) or datetime.max) < anchor_dt}
+        before, during = {}, {}
+        for p in payment_rows:
+            did = int(p.get("debtor_id") or 0)
+            dt = parse_ts(p.get("timestamp"))
+            if did not in pre_anchor or not dt:
+                continue
+            bucket = during if dt >= anchor_dt else before
+            bucket[did] = bucket.get(did, 0.0) + float(p.get("amount") or 0)
+        for did, paid_in_window in during.items():
+            # You cannot collect more than was still owed when the window
+            # opened. Without this ceiling a payment logged twice reads as
+            # twice the money — ₦100,000 collected on a ₦50,000 tab.
+            still_owed = max(pre_anchor[did] - before.get(did, 0.0), 0.0)
+            old_debt_cash += min(paid_in_window, still_owed)
+    old_debt_cash = round(old_debt_cash, 2)
+    cash = round(opening + collected + old_debt_cash - opex_cash - restock_cash
                  - capital_cash - periodic_cash - draws_cash, 2)
 
     # The profit footnote must agree with /report, which means it accrues too.
@@ -1014,7 +1041,7 @@ def compute_cash_position(sales_all, rooms_all, expense_all, draws_all, debtor_r
         opening=opening, anchor_dt=anchor_dt, collected=collected,
         opex_cash=opex_cash, restock_cash=restock_cash, draws_cash=draws_cash, cash=cash,
         capital_cash=capital_cash, periodic_cash=periodic_cash,
-        unmatched_receivables=uncollectable,
+        unmatched_receivables=uncollectable, old_debt_cash=old_debt_cash,
         stock_value=stock_value, receivables=receivables, outstanding_count=len(outstanding),
         month_profit=month_profit, profit_all=profit_all,
     )

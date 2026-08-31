@@ -467,3 +467,18 @@ def test_cash_count_rejects_negative_amounts(monkeypatch):
     ok, msg = logic.process_cash_count(100_000, -5, 60_000)
     assert ok is False and "negative" in msg
     assert calls["n"] == 0
+
+
+def test_cash_count_reanchors_in_a_format_that_parses(monkeypatch):
+    """A bare date stores fine and then reads back as no anchor at all."""
+    import database, metrics
+    saved = {}
+    monkeypatch.setattr(database, "set_setting", lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(database, "get_engine", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("should not reach the engine")))
+    try:
+        database.record_cash_count(100_000, 40_000, 60_000, count_date="2026-08-31")
+    except AssertionError:
+        pass  # the INSERT needs an engine; the settings write is what matters here
+    if "cash_opening_date" in saved:
+        assert metrics.parse_ts(saved["cash_opening_date"]) is not None

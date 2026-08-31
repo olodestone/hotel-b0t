@@ -136,6 +136,7 @@ def cash_position() -> metrics.CashPosition:
         stock_value=stock_value, opening=opening, anchor_dt=anchor_dt,
         cost_map=_cost_price_map(), now=clock.now(),
         obligations=_obligations(),
+        payment_rows=db.read_all("debtor_payments"),
     )
 
 

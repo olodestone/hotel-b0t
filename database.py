@@ -1789,7 +1789,10 @@ def record_cash_count(expected: float, till: float, bank: float, note: str = "",
     # Re-anchor: the counted figure becomes the opening balance on the count
     # date, so tomorrow's estimate starts from money someone actually held.
     set_setting("cash_opening", str(counted))
-    set_setting("cash_opening_date", day)
+    # Same format /position set writes. A bare date does not parse, and an
+    # unparseable anchor silently becomes "no anchor" — which would quietly
+    # revert the whole estimate to all-time after every count.
+    set_setting("cash_opening_date", f"{day} 00:00:00")
     return {"expected": round(float(expected), 2), "counted": counted,
             "variance": variance, "date": day}
 

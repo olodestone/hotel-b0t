@@ -2038,3 +2038,150 @@ def test_persistent_shortfalls_are_a_trend_not_a_series_of_errors():
     trend = metrics.cash_count_trend(rows)
     assert [v for _d, v in trend] == [-4_000, -9_000, -13_723]
     assert all(v < 0 for _d, v in trend)
+
+
+# ── Old debts settled in a later month ────────────────────────────────
+
+_ANCHOR = __import__("datetime").datetime(2026, 8, 1, 0, 0)
+_AUG_END = __import__("datetime").datetime(2026, 8, 31, 12, 0)
+_JULY_TAB = [{"id": 7, "timestamp": "2026-07-15 20:00:00", "account": "bar",
+              "name": "john", "amount": 50_000, "amount_paid": 50_000,
+              "status": "paid"}]
+
+
+def _old_pos(debtors, payments):
+    return metrics.compute_cash_position(
+        [], [], [], [], debtors, stock_value=0, opening=500_000,
+        anchor_dt=_ANCHOR, cost_map={}, now=_AUG_END, payment_rows=payments)
+
+
+def test_settling_last_months_tab_reaches_cash():
+    """Its revenue was July's, so `collected` cannot see it — but it arrived."""
+    pays = [{"debtor_id": 7, "timestamp": "2026-08-10 12:00:00", "amount": 50_000}]
+    assert _old_pos(_JULY_TAB, pays).cash == 550_000
+    assert _old_pos(_JULY_TAB, pays).old_debt_cash == 50_000
+
+
+def test_a_part_payment_of_an_old_tab_counts_only_what_was_paid():
+    partial = [{"id": 7, "timestamp": "2026-07-15 20:00:00", "account": "bar",
+                "name": "john", "amount": 50_000, "amount_paid": 20_000,
+                "status": "outstanding"}]
+    pays = [{"debtor_id": 7, "timestamp": "2026-08-10 12:00:00", "amount": 20_000}]
+    pos = _old_pos(partial, pays)
+    assert pos.cash == 520_000
+    assert pos.receivables == 30_000
+
+
+def test_a_debt_raised_and_paid_inside_the_window_is_not_counted_twice():
+    """That one is already handled by `collected`; adding it again doubles it."""
+    sale = [{"timestamp": "2026-08-10 20:00:00", "drink_name": "beer",
+             "quantity": 10, "total_revenue": 10_000, "cost_price": 500}]
+    debt = [{"id": 9, "timestamp": "2026-08-10 20:00:00", "account": "bar",
+             "name": "sam", "amount": 10_000, "amount_paid": 10_000, "status": "paid"}]
+    pays = [{"debtor_id": 9, "timestamp": "2026-08-20 12:00:00", "amount": 10_000}]
+    pos = metrics.compute_cash_position(
+        sale, [], [], [], debt, stock_value=0, opening=0, anchor_dt=_ANCHOR,
+        cost_map={"beer": 500}, now=_AUG_END, payment_rows=pays)
+    assert pos.old_debt_cash == 0
+    assert pos.cash == 10_000          # the sale, once
+
+
+def test_payments_before_the_anchor_do_not_count():
+    pays = [{"debtor_id": 7, "timestamp": "2026-07-20 12:00:00", "amount": 50_000}]
+    assert _old_pos(_JULY_TAB, pays).old_debt_cash == 0
+
+
+def test_with_no_anchor_there_is_no_such_thing_as_an_old_debt():
+    """All-time counting already includes the original sale."""
+    pays = [{"debtor_id": 7, "timestamp": "2026-08-10 12:00:00", "amount": 50_000}]
+    pos = metrics.compute_cash_position(
+        [], [], [], [], _JULY_TAB, stock_value=0, opening=0, anchor_dt=None,
+        cost_map={}, now=_AUG_END, payment_rows=pays)
+    assert pos.old_debt_cash == 0
+
+
+def test_an_unparseable_anchor_silently_disables_itself():
+    """Why record_cash_count must write the same format /position set does.
+
+    A bare 'YYYY-MM-DD' returns None from parse_ts, and a None anchor means
+    all-time — so a mis-formatted anchor does not error, it quietly changes
+    what every cash figure means.
+    """
+    assert metrics.parse_ts("2026-08-01") is None
+    assert metrics.parse_ts("2026-08-01 00:00:00") is not None
+
+
+# ── A paid debt must never inflate the position ───────────────────────
+#
+# old_debt_cash ADDS money to the cash estimate, so every path into it is a
+# chance to count the same naira twice. These pin each one.
+
+_JULY = [{"id": 7, "timestamp": "2026-07-15 20:00:00", "account": "bar",
+          "name": "john", "amount": 50_000, "amount_paid": 50_000, "status": "paid"}]
+_AUG_SALE = [{"timestamp": "2026-08-10 20:00:00", "drink_name": "beer",
+              "quantity": 10, "total_revenue": 10_000, "cost_price": 500}]
+
+
+def _cash(debtors, pays, sales=()):
+    return metrics.compute_cash_position(
+        list(sales), [], [], [], debtors, stock_value=0, opening=0,
+        anchor_dt=_ANCHOR, cost_map={"beer": 500}, now=_AUG_END,
+        payment_rows=pays).cash
+
+
+def _pay(amount, day, debtor_id=7):
+    return {"debtor_id": debtor_id, "timestamp": f"2026-{day} 12:00:00",
+            "amount": amount}
+
+
+def test_an_old_tab_pays_once_however_the_payments_are_split():
+    assert _cash(_JULY, [_pay(50_000, "08-10")]) == 50_000
+    assert _cash(_JULY, [_pay(20_000, "08-05"), _pay(30_000, "08-20")]) == 50_000
+
+
+def test_a_duplicate_payment_row_cannot_double_the_cash():
+    """Logged twice by mistake: you still only collected what was owed."""
+    assert _cash(_JULY, [_pay(50_000, "08-10"), _pay(50_000, "08-11")]) == 50_000
+
+
+def test_collection_is_capped_at_what_was_still_owed_when_the_window_opened():
+    """₦20,000 was already paid in July, so August can only bring ₦30,000."""
+    assert _cash(_JULY, [_pay(20_000, "07-25"), _pay(50_000, "08-10")]) == 30_000
+    assert _cash(_JULY, [_pay(20_000, "07-25"), _pay(30_000, "08-10")]) == 30_000
+
+
+def test_payments_made_before_the_window_bring_in_nothing():
+    assert _cash(_JULY, [_pay(50_000, "07-25")]) == 0
+
+
+def test_a_payment_against_an_unknown_debt_is_ignored():
+    assert _cash(_JULY, [_pay(50_000, "08-10", debtor_id=99)]) == 0
+
+
+def test_a_debt_raised_inside_the_window_is_never_treated_as_an_old_one():
+    """Its sale is already in revenue; adding the payment would double it."""
+    aug = [{"id": 9, "timestamp": "2026-08-10 20:00:00", "account": "bar",
+            "name": "sam", "amount": 10_000, "amount_paid": 10_000, "status": "paid"}]
+    assert _cash(aug, [_pay(10_000, "08-20", debtor_id=9)], _AUG_SALE) == 10_000
+
+
+def test_a_debt_stamped_exactly_at_the_anchor_counts_through_revenue_only():
+    """The boundary: `< anchor` is old, `>= anchor` is in-window. No overlap, no gap."""
+    edge = [{"id": 1, "timestamp": "2026-08-01 00:00:00", "account": "bar",
+             "name": "e", "amount": 10_000, "amount_paid": 10_000, "status": "paid"}]
+    sale = [{"timestamp": "2026-08-01 00:00:00", "drink_name": "beer",
+             "quantity": 10, "total_revenue": 10_000, "cost_price": 500}]
+    assert _cash(edge, [_pay(10_000, "08-05", debtor_id=1)], sale) == 10_000
+
+
+def test_cash_plus_owed_is_conserved_as_a_tab_is_paid_off():
+    """The strongest statement of no-double-count: the total never grows."""
+    for paid in (0, 4_000, 10_000):
+        status = "paid" if paid == 10_000 else "outstanding"
+        d = [{"id": 9, "timestamp": "2026-08-10 20:00:00", "account": "bar",
+              "name": "s", "amount": 10_000, "amount_paid": paid, "status": status}]
+        p = [_pay(paid, "08-20", debtor_id=9)] if paid else []
+        pos = metrics.compute_cash_position(
+            _AUG_SALE, [], [], [], d, stock_value=0, opening=0, anchor_dt=_ANCHOR,
+            cost_map={"beer": 500}, now=_AUG_END, payment_rows=p)
+        assert pos.cash + pos.receivables == 10_000
