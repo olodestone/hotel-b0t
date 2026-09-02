@@ -2630,16 +2630,158 @@ async def _cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Stepping back through a guided flow ───────────────────────────────
+#
+# Every guided flow is a straight line of prompts, and until now the only exit
+# from a wrong turn was to type /cancel and start the whole thing again. The
+# front desk makes that wrong turn constantly — the wrong drink tapped, the
+# wrong account, a figure typed with a digit missing — so the cost of a slip
+# was the entire entry.
+#
+# `_step()` renders one prompt *and remembers it*: its text, its keyboard, and
+# a copy of what the flow knew at the moment it was shown. ⬅️ Back pops that
+# stack and puts the previous prompt back on screen, restoring the snapshot
+# with it. Restoring the snapshot — rather than just re-showing the prompt —
+# is what makes a branch safe to walk backwards out of: a booking that went
+# down the hourly path and asked for a time of day must not keep that answer
+# when the type is changed to a nightly room on the way back.
+#
+# A re-prompt after a validation error is the *same* step, not a new one, so it
+# overwrites the top of the stack instead of pushing. Otherwise three fumbled
+# attempts at an amount would need three taps of Back to escape.
+
+_NAV = "_nav"   # ctx.user_data: [(state, text, reply_markup, parse_mode, snapshot)]
+
+
+def _nav_row(can_go_back: bool) -> list[InlineKeyboardButton]:
+    """The escape row. There is always a way out that is not typing /cancel."""
+    row = [InlineKeyboardButton("✖️ Cancel", callback_data="nav:cancel")]
+    if can_go_back:
+        row.insert(0, InlineKeyboardButton("⬅️ Back", callback_data="nav:back"))
+    return row
+
+
+def _with_nav(kb: InlineKeyboardMarkup | None, can_go_back: bool) -> InlineKeyboardMarkup:
+    rows = [list(r) for r in kb.inline_keyboard] if kb else []
+    rows.append(_nav_row(can_go_back))
+    return InlineKeyboardMarkup(rows)
+
+
+def _flow_state(ctx: ContextTypes.DEFAULT_TYPE) -> dict:
+    """What the flow knows, minus the navigation stack itself."""
+    return {k: v for k, v in ctx.user_data.items() if k != _NAV}
+
+
+async def _step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str, *,
+                state: int,
+                reply_markup: InlineKeyboardMarkup | None = None,
+                parse_mode: str | None = None,
+                root: bool = False,
+                reply: bool = False) -> int:
+    """Show one prompt of a guided flow and record it, so ⬅️ Back can return here.
+
+    `root=True` starts a fresh stack — used by a flow's opening prompt, and by
+    any step that has already committed something to the database, since there
+    is nothing safe to go back to past a write.
+    """
+    if root:
+        ctx.user_data[_NAV] = []
+    stack = ctx.user_data.setdefault(_NAV, [])
+    repeat = bool(stack) and stack[-1][0] == state
+    depth = len(stack) - 1 if repeat else len(stack)
+
+    q = update.callback_query if update else None
+    markup = _with_nav(reply_markup, depth > 0)
+    if q is not None and not reply:
+        await q.edit_message_text(text, parse_mode=parse_mode, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
+
+    entry = (state, text, reply_markup, parse_mode, _flow_state(ctx))
+    if repeat:
+        stack[-1] = entry
+    else:
+        stack.append(entry)
+    return state
+
+
+async def _say(update: Update, text: str, *, reply: bool = False, **kw) -> None:
+    """Send a message the way `_step` would, but without recording a step —
+    for the line that ends a flow rather than asking the next question."""
+    q = update.callback_query
+    if q is not None and not reply:
+        await q.edit_message_text(text, **kw)
+    else:
+        await update.effective_message.reply_text(text, **kw)
+
+
+async def _nav_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Put the previous prompt back on screen, with the flow as it was then."""
+    q = update.callback_query
+    await q.answer()
+    stack = ctx.user_data.get(_NAV) or []
+    if len(stack) < 2:
+        return await _nav_cancel(update, ctx)
+
+    stack.pop()
+    state, text, kb, parse_mode, snapshot = stack[-1]
+    # The snapshot is the flow as it stood when this prompt was first shown, so
+    # anything answered after it is dropped rather than left behind stale.
+    for k in list(ctx.user_data):
+        if k != _NAV:
+            del ctx.user_data[k]
+    ctx.user_data.update(snapshot)
+    await q.edit_message_text(text, parse_mode=parse_mode,
+                              reply_markup=_with_nav(kb, len(stack) > 1))
+    return state
+
+
+async def _nav_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.clear()
+    await q.edit_message_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+async def _nav_stale(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """A Back tapped on a prompt whose flow has already finished or timed out."""
+    q = update.callback_query
+    await q.answer("That entry is already finished — start again.", show_alert=True)
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+def _conv(entry_points, states, **kwargs) -> ConversationHandler:
+    """A ConversationHandler with ⬅️ Back and ✖️ Cancel wired into every state.
+
+    Doing it here rather than per flow is the point: a screen that quietly
+    lacked an escape would be exactly the screen someone gets stuck on.
+    """
+    nav = [CallbackQueryHandler(_nav_back, pattern="^nav:back$"),
+           CallbackQueryHandler(_nav_cancel, pattern="^nav:cancel$")]
+    return ConversationHandler(
+        entry_points=entry_points,
+        states={s: [*nav, *hs] for s, hs in states.items()},
+        fallbacks=[CommandHandler("cancel", _cancel_conv)],
+        allow_reentry=True,
+        **kwargs,
+    )
+
+
 # ── /sell guided flow ─────────────────────────────────────────────────
 
 @_require_auth
 async def cmd_sell_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.effective_message.reply_text(
+    return await _step(
+        update, ctx,
         "🍺 *Which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_drink_keyboard(),
+        state=_SELL_DRINK, root=True, reply=True,
     )
-    return _SELL_DRINK
 
 
 async def _sell_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2647,26 +2789,27 @@ async def _sell_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     await q.answer()
     drink = q.data[3:]
     if drink == "__other__":
-        await q.edit_message_text("Type the drink name:")
-        return _SELL_DRINK_TEXT
+        return await _step(update, ctx, "Type the drink name:", state=_SELL_DRINK_TEXT)
     ctx.user_data["sell_drink"] = drink
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🍺 *{reports._esc(drink.title())}* — how many?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_qty_keyboard("sq"),
+        state=_SELL_QTY,
     )
-    return _SELL_QTY
 
 
 async def _sell_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     drink = update.message.text.strip().lower()
     ctx.user_data["sell_drink"] = drink
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🍺 *{reports._esc(drink.title())}* — how many?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_qty_keyboard("sq"),
+        state=_SELL_QTY, reply=True,
     )
-    return _SELL_QTY
 
 
 async def _sell_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2674,33 +2817,33 @@ async def _sell_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[3:]
     if val == "__other__":
-        await q.edit_message_text("How many? (type a number)")
-        return _SELL_QTY_TEXT
+        return await _step(update, ctx, "How many? (type a number)", state=_SELL_QTY_TEXT)
     ctx.user_data["sell_qty"] = int(val)
     uid = update.effective_user.id
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🍺 {val}× {ctx.user_data.get('sell_drink', '').title()} — when?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_date_keyboard_for("sdd", uid),
+        state=_SELL_DATE,
     )
-    return _SELL_DATE
 
 
 async def _sell_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         qty = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number:")
-        return _SELL_QTY_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number:", state=_SELL_QTY_TEXT, reply=True)
     ctx.user_data["sell_qty"] = qty
     drink = ctx.user_data.get("sell_drink", "")
     uid = update.effective_user.id
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🍺 {qty}× {drink.title()} — when?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_date_keyboard_for("sdd", uid),
+        state=_SELL_DATE, reply=True,
     )
-    return _SELL_DATE
 
 
 async def _sell_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2717,12 +2860,13 @@ async def _sell_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         year, month = int(ym[:4]), int(ym[5:7])
         drink = ctx.user_data.get("sell_drink", "")
         qty = ctx.user_data.get("sell_qty", 1)
-        await q.edit_message_text(
+        return await _step(
+            update, ctx,
             f"🍺 {qty}× {drink.title()} — when?",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_calendar_keyboard("sdd", year, month),
+            state=_SELL_DATE,
         )
-        return _SELL_DATE
 
     if val == "cal_x":
         return _SELL_DATE
@@ -2787,12 +2931,13 @@ async def cmd_book_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=_get_keyboard(update.effective_user.id),
         )
         return ConversationHandler.END
-    await update.effective_message.reply_text(
+    return await _step(
+        update, ctx,
         "🛏 *Room type?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_room_type_keyboard(),
+        state=_BOOK_TYPE, root=True, reply=True,
     )
-    return _BOOK_TYPE
 
 
 async def _book_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2800,26 +2945,27 @@ async def _book_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     rtype = q.data[3:]
     if rtype == "__other__":
-        await q.edit_message_text("Type the room type:")
-        return _BOOK_TYPE_TEXT
+        return await _step(update, ctx, "Type the room type:", state=_BOOK_TYPE_TEXT)
     ctx.user_data["book_type"] = rtype
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🛏 *{reports._esc(rtype.title())}* — how many rooms?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_qty_keyboard("bq"),
+        state=_BOOK_QTY,
     )
-    return _BOOK_QTY
 
 
 async def _book_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     rtype = update.message.text.strip().lower()
     ctx.user_data["book_type"] = rtype
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🛏 *{reports._esc(rtype.title())}* — how many rooms?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_qty_keyboard("bq"),
+        state=_BOOK_QTY, reply=True,
     )
-    return _BOOK_QTY
 
 
 async def _book_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2827,32 +2973,32 @@ async def _book_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[3:]
     if val == "__other__":
-        await q.edit_message_text("How many rooms? (type a number)")
-        return _BOOK_QTY_TEXT
+        return await _step(update, ctx, "How many rooms? (type a number)", state=_BOOK_QTY_TEXT)
     ctx.user_data["book_qty"] = int(val)
     rtype = ctx.user_data.get("book_type", "room")
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🛏 {val}× *{reports._esc(rtype.title())}* — how many nights?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_nights_keyboard(),
+        state=_BOOK_NIGHTS,
     )
-    return _BOOK_NIGHTS
 
 
 async def _book_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         qty = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number:")
-        return _BOOK_QTY_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number:", state=_BOOK_QTY_TEXT, reply=True)
     ctx.user_data["book_qty"] = qty
     rtype = ctx.user_data.get("book_type", "room")
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🛏 {qty}× *{reports._esc(rtype.title())}* — how many nights?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_nights_keyboard(),
+        state=_BOOK_NIGHTS, reply=True,
     )
-    return _BOOK_NIGHTS
 
 
 def _is_hourly_type(room_type: str) -> bool:
@@ -2869,21 +3015,23 @@ def _daypart_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _book_after_nights(send, ctx, uid: int) -> int:
+async def _book_after_nights(update, ctx, uid: int, *, reply: bool = False) -> int:
     """Hourly lets are asked what part of the day. Nightly stays skip it —
     an overnight booking has no time of day worth recording."""
     rtype = ctx.user_data.get("book_type", "")
     units = ctx.user_data.get("book_nights", 1)
     if _is_hourly_type(rtype):
-        await send(
+        return await _step(
+            update, ctx,
             f"🕐 *{reports._esc(rtype.title())} — what part of the day?*\n"
             "_From the book, not from now — you are keying this in later._",
-            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_daypart_keyboard())
-        return _BOOK_DAYPART
-    await send(
+            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_daypart_keyboard(),
+            state=_BOOK_DAYPART, reply=reply)
+    return await _step(
+        update, ctx,
         f"🛏 {ctx.user_data.get('book_qty', 1)}× {rtype.title()}, {units} nights — when?",
-        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard_for("bdd", uid))
-    return _BOOK_DATE
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard_for("bdd", uid),
+        state=_BOOK_DATE, reply=reply)
 
 
 async def _book_pick_daypart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2891,13 +3039,14 @@ async def _book_pick_daypart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await q.answer()
     val = q.data[4:]
     ctx.user_data["book_daypart"] = "" if val == "__skip__" else val
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🛏 {ctx.user_data.get('book_qty', 1)}× "
         f"{ctx.user_data.get('book_type', '').title()} — which day?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_date_keyboard_for("bdd", update.effective_user.id),
+        state=_BOOK_DATE,
     )
-    return _BOOK_DATE
 
 
 async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2905,21 +3054,18 @@ async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     await q.answer()
     val = q.data[3:]
     if val == "__other__":
-        await q.edit_message_text("How many nights? (type a number)")
-        return _BOOK_NIGHTS_TEXT
+        return await _step(update, ctx, "How many nights? (type a number)", state=_BOOK_NIGHTS_TEXT)
     ctx.user_data["book_nights"] = int(val)
-    return await _book_after_nights(q.edit_message_text, ctx, update.effective_user.id)
+    return await _book_after_nights(update, ctx, update.effective_user.id)
 
 
 async def _book_nights_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         nights = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number:")
-        return _BOOK_NIGHTS_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number:", state=_BOOK_NIGHTS_TEXT, reply=True)
     ctx.user_data["book_nights"] = nights
-    return await _book_after_nights(update.message.reply_text, ctx,
-                                    update.effective_user.id)
+    return await _book_after_nights(update, ctx, update.effective_user.id, reply=True)
 
 
 async def _book_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2937,12 +3083,13 @@ async def _book_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         rtype = ctx.user_data.get("book_type", "")
         qty = ctx.user_data.get("book_qty", 1)
         nights = ctx.user_data.get("book_nights", 1)
-        await q.edit_message_text(
+        return await _step(
+            update, ctx,
             f"🛏 {qty}× {rtype.title()}, {nights} nights — when?",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_calendar_keyboard("bdd", year, month),
+            state=_BOOK_DATE,
         )
-        return _BOOK_DATE
 
     if val == "cal_x":
         return _BOOK_DATE
@@ -3242,33 +3389,32 @@ async def _csh_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not _is_admin(q.from_user.id):
         await q.edit_message_text("🔒 Admin only.")
         return ConversationHandler.END
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "💰 *Count the cash*\n"
         "_Count it before you look at what the bot expects — the same rule as_\n"
         "_the stock sheet. Knowing the figure first turns a count into a tick._\n\n"
         "*How much cash is physically here?* (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_CSH_TILL, root=True,
     )
-    return _CSH_TILL
 
 
 async def _csh_till(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     amt, err = _to_float(update.message.text.strip().replace(",", ""), "cash")
     if err:
-        await update.message.reply_text("❌ Enter the amount in figures (0 if none):")
-        return _CSH_TILL
+        return await _step(update, ctx, "❌ Enter the amount in figures (0 if none):", state=_CSH_TILL, reply=True)
     ctx.user_data["csh_till"] = amt
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "🏦 *And the bank balance?* (₦)\n_From the statement or the app._",
-        parse_mode=ParseMode.MARKDOWN_V2)
-    return _CSH_BANK
+        parse_mode=ParseMode.MARKDOWN_V2, state=_CSH_BANK, reply=True)
 
 
 async def _csh_bank(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     amt, err = _to_float(update.message.text.strip().replace(",", ""), "bank balance")
     if err:
-        await update.message.reply_text("❌ Enter the amount in figures (0 if none):")
-        return _CSH_BANK
+        return await _step(update, ctx, "❌ Enter the amount in figures (0 if none):", state=_CSH_BANK, reply=True)
 
     till = ctx.user_data.pop("csh_till", 0.0)
     ctx.user_data.clear()
@@ -3288,29 +3434,37 @@ def _stk_items():
     return sorted(inv.get_inventory_summary(), key=lambda r: r["drink"])
 
 
-async def _stk_prompt(send, ctx) -> int:
-    """Ask for the next item, or finish and show the variance report."""
+async def _stk_prompt(update, ctx, *, reply: bool = False) -> int:
+    """Ask for the next item, or finish and show the variance report.
+
+    Each item opens a fresh back-stack (`root=True`): the previous item's two
+    counts are already written to the database by the time this is reached, and
+    there is nothing safe to step back into past a write. Within an item, the
+    store prompt can still go back to the bar prompt — neither is committed
+    until both are answered.
+    """
     items = ctx.user_data.get("stk_items", [])
     i = ctx.user_data.get("stk_i", 0)
     if i >= len(items):
         now = clock.now()
         done = ctx.user_data.get("stk_done", 0)
         ctx.user_data.clear()
-        await send(f"✅ Stocktake entered — {_plural_items(done)} counted.\n"
+        await _say(update, f"✅ Stocktake entered — {_plural_items(done)} counted.\n"
                    "_This month is now verified._",
-                   parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None)
+                   parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None, reply=reply)
         return ConversationHandler.END
 
     it = items[i]
-    await send(
+    return await _step(
+        update, ctx,
         f"📦 *{reports._esc(it['drink'].title())}*  ({i + 1} of {len(items)})\n"
         f"_Books say: bar {it['bar_stock']} · store {it['store_stock']}_\n\n"
         "*How many in the BAR?*  _(or ⏭ to skip)_",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("⏭ Skip this item", callback_data="stk_sk:1")]]),
+        state=_STK_BAR, root=True, reply=reply,
     )
-    return _STK_BAR
 
 
 def _plural_items(n):
@@ -3328,38 +3482,36 @@ async def _stk_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await q.edit_message_text("No stock items yet — add one with `/restock`.")
         return ConversationHandler.END
     ctx.user_data.update(stk_items=items, stk_i=0, stk_done=0)
-    return await _stk_prompt(q.edit_message_text, ctx)
+    return await _stk_prompt(update, ctx)
 
 
 async def _stk_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     ctx.user_data["stk_i"] = ctx.user_data.get("stk_i", 0) + 1
-    return await _stk_prompt(q.edit_message_text, ctx)
+    return await _stk_prompt(update, ctx)
 
 
 async def _stk_bar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     counted, err = _to_count(update.message.text.strip(), "bar count")
     if err:
-        await update.message.reply_text("❌ Enter a whole number of units:")
-        return _STK_BAR
+        return await _step(update, ctx, "❌ Enter a whole number of units:", state=_STK_BAR, reply=True)
     ctx.user_data["stk_bar"] = counted
     items = ctx.user_data["stk_items"]
     it = items[ctx.user_data["stk_i"]]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🏪 *{reports._esc(it['drink'].title())}* — *how many in the STORE?*\n"
         f"_Books say {it['store_stock']}._",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⏭ Skip this item", callback_data="stk_sk:1")]]))
-    return _STK_STORE
+            [[InlineKeyboardButton("⏭ Skip this item", callback_data="stk_sk:1")]]), state=_STK_STORE, reply=True)
 
 
 async def _stk_store(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     counted, err = _to_count(update.message.text.strip(), "store count")
     if err:
-        await update.message.reply_text("❌ Enter a whole number of units:")
-        return _STK_STORE
+        return await _step(update, ctx, "❌ Enter a whole number of units:", state=_STK_STORE, reply=True)
 
     items = ctx.user_data["stk_items"]
     it = items[ctx.user_data["stk_i"]]
@@ -3375,7 +3527,7 @@ async def _stk_store(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     ctx.user_data["stk_i"] += 1
     ctx.user_data["stk_done"] = ctx.user_data.get("stk_done", 0) + 1
-    return await _stk_prompt(update.message.reply_text, ctx)
+    return await _stk_prompt(update, ctx, reply=True)
 
 
 # ── Room audit: the bot draws the days ────────────────────────────────
@@ -3402,13 +3554,13 @@ async def _rau_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         metrics.build_audit_day(all_rooms, d, _audit_rooms(), reports._room_type_hours()
                                 ).nights_logged for d in days)
     await _reply_long_cb(q, reports.audit_sheet(days, now.year, now.month))
-    await q.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🔎 *The system logged {_plural_nights(logged)} across those days.*\n"
         "_Checking the register: how many did it MISS?_\n"
         "_Count the rooms marked VACANT that were actually occupied._",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_rau_missing_keyboard())
-    return _RAU_ACTUAL
+        reply_markup=_rau_missing_keyboard(), state=_RAU_ACTUAL, root=True, reply=True)
 
 
 def _plural_nights(n: int) -> str:
@@ -3441,12 +3593,13 @@ def _rau_rate_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def _rau_ask_rate(send) -> int:
-    await send(
+async def _rau_ask_rate(update, ctx, *, reply: bool = False) -> int:
+    return await _step(
+        update, ctx,
         "💰 *Did the rates match?*\n"
         "_What the register shows charged, against what the system logged._",
-        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_rau_rate_keyboard())
-    return _RAU_RATE
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_rau_rate_keyboard(),
+        state=_RAU_RATE, reply=reply)
 
 
 async def _rau_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3454,28 +3607,26 @@ async def _rau_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[6:]
     if val == "__other__":
-        await q.edit_message_text("Type how many nights the system missed:")
-        return _RAU_ACTUAL_TEXT
+        return await _step(update, ctx, "Type how many nights the system missed:", state=_RAU_ACTUAL_TEXT)
     ctx.user_data["rau_actual"] = ctx.user_data.get("rau_logged", 0) + int(val)
-    return await _rau_ask_rate(q.edit_message_text)
+    return await _rau_ask_rate(update, ctx)
 
 
 async def _rau_missing_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     missing, err = _to_count(update.message.text.strip(), "nights missed")
     if err:
-        await update.message.reply_text("❌ Enter a whole number (0 if none):")
-        return _RAU_ACTUAL_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number (0 if none):", state=_RAU_ACTUAL_TEXT, reply=True)
     ctx.user_data["rau_actual"] = ctx.user_data.get("rau_logged", 0) + missing
-    return await _rau_ask_rate(update.message.reply_text)
+    return await _rau_ask_rate(update, ctx, reply=True)
 
 
 async def _rau_rate_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     if q.data[6:] == "__other__":
-        await q.edit_message_text(
-            "Type the difference in ₦ (negative if you charged less than logged):")
-        return _RAU_RATE_TEXT
+        return await _step(
+            update, ctx,
+            "Type the difference in ₦ (negative if you charged less than logged):", state=_RAU_RATE_TEXT)
     return await _rau_finish(q.message.reply_text, ctx, 0.0, _actor(update))
 
 
@@ -3484,8 +3635,7 @@ async def _rau_rate_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         variance = float(raw)
     except ValueError:
-        await update.message.reply_text("❌ Enter an amount (0 if rates all matched):")
-        return _RAU_RATE_TEXT
+        return await _step(update, ctx, "❌ Enter an amount (0 if rates all matched):", state=_RAU_RATE_TEXT, reply=True)
     return await _rau_finish(update.message.reply_text, ctx, variance, _actor(update))
 
 
@@ -3582,33 +3732,33 @@ async def _pob_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not _is_admin(q.from_user.id):
         await q.edit_message_text("🔒 Admin only.")
         return ConversationHandler.END
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🔁 *What is the bill?*\n"
         "_e.g. soakaway evacuation, generator major service, permit renewal_",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_POB_NAME, root=True,
     )
-    return _POB_NAME
 
 
 async def _pob_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("❌ Give it a name:")
-        return _POB_NAME
+        return await _step(update, ctx, "❌ Give it a name:", state=_POB_NAME, reply=True)
     ctx.user_data["pob_name"] = name
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"💰 *What does {reports._esc(name.title())} cost each time?* (₦)",
-        parse_mode=ParseMode.MARKDOWN_V2)
-    return _POB_AMT
+        parse_mode=ParseMode.MARKDOWN_V2, state=_POB_AMT, reply=True)
 
 
 async def _pob_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     amt, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter the amount in figures (e.g. 90000):")
-        return _POB_AMT
+        return await _step(update, ctx, "❌ Enter the amount in figures (e.g. 90000):", state=_POB_AMT, reply=True)
     ctx.user_data["pob_amt"] = amt
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "📅 *How often does it come round?*", parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton(f"{lbl} — {reports._fmt(amt / n)}/mo",
@@ -3616,14 +3766,15 @@ async def _pob_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
              for lbl, n in _POB_MONTH_PRESETS]
             + [[InlineKeyboardButton("✏️ Other", callback_data="pob_m:__other__")]]
         ),
+        state=_POB_MONTHS, reply=True,
     )
-    return _POB_MONTHS
 
 
-async def _pob_ask_account(send) -> int:
-    await send("📂 *Whose cost is it?*", parse_mode=ParseMode.MARKDOWN_V2,
-               reply_markup=_expense_account_keyboard("pob_ac"))
-    return _POB_ACCT
+async def _pob_ask_account(update, ctx, *, reply: bool = False) -> int:
+    return await _step(update, ctx, "📂 *Whose cost is it?*",
+                       parse_mode=ParseMode.MARKDOWN_V2,
+                       reply_markup=_expense_account_keyboard("pob_ac"),
+                       state=_POB_ACCT, reply=reply)
 
 
 async def _pob_months(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3631,19 +3782,17 @@ async def _pob_months(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[6:]
     if val == "__other__":
-        await q.edit_message_text("Type how many months between bills (e.g. 6):")
-        return _POB_MONTHS
+        return await _step(update, ctx, "Type how many months between bills (e.g. 6):", state=_POB_MONTHS)
     ctx.user_data["pob_months"] = int(val)
-    return await _pob_ask_account(q.edit_message_text)
+    return await _pob_ask_account(update, ctx)
 
 
 async def _pob_months_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     months, err = _to_int(update.message.text.strip(), "months")
     if err:
-        await update.message.reply_text("❌ Enter a whole number of months:")
-        return _POB_MONTHS
+        return await _step(update, ctx, "❌ Enter a whole number of months:", state=_POB_MONTHS, reply=True)
     ctx.user_data["pob_months"] = months
-    return await _pob_ask_account(update.message.reply_text)
+    return await _pob_ask_account(update, ctx, reply=True)
 
 
 async def _pob_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3685,11 +3834,12 @@ async def _ppy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     rows = [[InlineKeyboardButton(
         f"{l.obligation.name} — set aside {reports._fmt(l.balance)}",
         callback_data=f"ppy_id:{i}")] for i, l in enumerate(reserve.lines)]
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "💸 *Which bill are you paying?*", parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_PPY_PICK, root=True,
     )
-    return _PPY_PICK
 
 
 async def _ppy_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3703,19 +3853,19 @@ async def _ppy_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     ob = obs[idx]
     ctx.user_data["ppy_ob"] = ob
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💸 *How much did {reports._esc(ob.name.title())} come to?* (₦)\n"
         f"_Expected {reports._fmt(ob.expected_amount)}._",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_PPY_AMT,
     )
-    return _PPY_AMT
 
 
 async def _ppy_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     amt, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter the amount in figures:")
-        return _PPY_AMT
+        return await _step(update, ctx, "❌ Enter the amount in figures:", state=_PPY_AMT, reply=True)
     ob = ctx.user_data.pop("ppy_ob", None)
     ctx.user_data.clear()
     if ob is None:
@@ -3786,11 +3936,12 @@ async def _rcl_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         f"[{r['id']}] ₦{float(r['amount']):,.0f} · {str(r['account']).title()}/"
         f"{str(r['category']).title()} · {metrics.expense_class(r).title()}",
         callback_data=f"rcl_id:{i}")] for i, r in enumerate(candidates)]
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "✏️ *Which entry?*", parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows_kb),
+        state=_RCL_PICK, root=True,
     )
-    return _RCL_PICK
 
 
 async def _rcl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3804,7 +3955,8 @@ async def _rcl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     row = rows[idx]
     ctx.user_data["rcl_id"] = int(row["id"])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"✏️ *Entry {row['id']}* — ₦{float(row['amount']):,.0f}\n"
         f"_{reports._esc(str(row['account']).title())}/"
         f"{reports._esc(str(row['category']).title())} · "
@@ -3816,8 +3968,8 @@ async def _rcl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
              InlineKeyboardButton("📂 Account", callback_data="rcl_f:account")],
             [InlineKeyboardButton("✅ Reviewed — clear the flag", callback_data="rcl_f:clear")],
         ]),
+        state=_RCL_FIELD,
     )
-    return _RCL_FIELD
 
 
 async def _rcl_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3845,9 +3997,8 @@ async def _rcl_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                InlineKeyboardButton("🛏 Rooms", callback_data="rcl_v:rooms")],
               [InlineKeyboardButton("🏢 Overhead", callback_data="rcl_v:overhead")]]
         prompt = "📂 *Which account?*"
-    await q.edit_message_text(prompt, parse_mode=ParseMode.MARKDOWN_V2,
-                              reply_markup=InlineKeyboardMarkup(kb))
-    return _RCL_VALUE
+    return await _step(update, ctx, prompt, parse_mode=ParseMode.MARKDOWN_V2,
+                              reply_markup=InlineKeyboardMarkup(kb), state=_RCL_VALUE)
 
 
 async def _rcl_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3887,7 +4038,8 @@ _TA_REASONS = [
 async def _ta_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🚪 *How many did you turn away?*\n"
         "_People you had no room for. No money moves — this is the demand a_\n"
         "_full night hides._",
@@ -3897,19 +4049,21 @@ async def _ta_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             [InlineKeyboardButton(str(n), callback_data=f"taq:{n}") for n in (4, 5, 10)],
             [InlineKeyboardButton("✏️ Other", callback_data="taq:__other__")],
         ]),
+        state=_TA_QTY, root=True,
     )
-    return _TA_QTY
 
 
-async def _ta_type_prompt(send, ctx) -> int:
+async def _ta_type_prompt(update, ctx, *, reply: bool = False) -> int:
     types = _known_room_types()
     ctx.user_data["ta_types"] = types
     rows = [[InlineKeyboardButton(t.title(), callback_data=f"tat:{i}")]
             for i, t in enumerate(types)]
     rows.append([InlineKeyboardButton("🤷 Didn't say / any room",
                                       callback_data="tat:__skip__")])
-    await send("🛏 *What were they looking for?*", reply_markup=InlineKeyboardMarkup(rows))
-    return _TA_TYPE
+    return await _step(update, ctx, "🛏 *What were they looking for?*",
+                       parse_mode=ParseMode.MARKDOWN_V2,
+                       reply_markup=InlineKeyboardMarkup(rows),
+                       state=_TA_TYPE, reply=reply)
 
 
 async def _ta_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3917,27 +4071,17 @@ async def _ta_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[4:]
     if val == "__other__":
-        await q.edit_message_text("Type how many you turned away:")
-        return _TA_QTY_TEXT
+        return await _step(update, ctx, "Type how many you turned away:", state=_TA_QTY_TEXT)
     ctx.user_data["ta_qty"] = int(val)
-
-    async def send(text, reply_markup):
-        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2,
-                                  reply_markup=reply_markup)
-    return await _ta_type_prompt(send, ctx)
+    return await _ta_type_prompt(update, ctx)
 
 
 async def _ta_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     qty, err = _to_int(update.message.text.strip(), "how many")
     if err:
-        await update.message.reply_text("❌ Enter a whole number (e.g. 3):")
-        return _TA_QTY_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number (e.g. 3):", state=_TA_QTY_TEXT, reply=True)
     ctx.user_data["ta_qty"] = qty
-
-    async def send(text, reply_markup):
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
-                                        reply_markup=reply_markup)
-    return await _ta_type_prompt(send, ctx)
+    return await _ta_type_prompt(update, ctx, reply=True)
 
 
 async def _ta_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3959,12 +4103,13 @@ async def _ta_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             for i, (label, _) in enumerate(_TA_REASONS)]
     rows.append([InlineKeyboardButton("✏️ Other reason", callback_data="tar:__other__")])
     rows.append([InlineKeyboardButton("⏭ Skip", callback_data="tar:__skip__")])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "❓ *Why couldn't you take them?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_TA_REASON,
     )
-    return _TA_REASON
 
 
 async def _ta_save(send, ctx, actor: str, reason: str) -> int:
@@ -3983,8 +4128,7 @@ async def _ta_pick_reason(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     val = q.data[4:]
     if val == "__other__":
-        await q.edit_message_text("Type the reason:")
-        return _TA_REASON_TEXT
+        return await _step(update, ctx, "Type the reason:", state=_TA_REASON_TEXT)
     reason = "" if val == "__skip__" else _TA_REASONS[int(val)][1]
 
     async def send(text, kb):
@@ -4298,12 +4442,13 @@ async def _btn_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "💸 *Record Expense — which account?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_expense_account_keyboard("exp_ac"),
+        state=_EXP_ACCT, root=True,
     )
-    return _EXP_ACCT
 
 
 async def _exp_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4311,12 +4456,13 @@ async def _exp_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     acct = q.data.split(":")[1]
     ctx.user_data["exp_acct"] = acct
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💸 *{acct.title()} — category?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_expense_cat_keyboard(acct),
+        state=_EXP_CAT,
     )
-    return _EXP_CAT
 
 
 async def _exp_pick_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4324,38 +4470,38 @@ async def _exp_pick_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[8:]
     if val == "__other__":
-        await q.edit_message_text("Type the expense category:")
-        return _EXP_CAT_TEXT
+        return await _step(update, ctx, "Type the expense category:", state=_EXP_CAT_TEXT)
     ctx.user_data["exp_cat"] = val
     acct = ctx.user_data.get("exp_acct", "")
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💸 {acct.title()} / {val.title()} — *amount?* (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_EXP_AMT,
     )
-    return _EXP_AMT
 
 
 async def _exp_cat_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["exp_cat"] = update.message.text.strip().lower()
     acct = ctx.user_data.get("exp_acct", "")
     cat = ctx.user_data["exp_cat"]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"💸 {acct.title()} / {cat.title()} — *amount?* (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_EXP_AMT, reply=True,
     )
-    return _EXP_AMT
 
 
 async def _exp_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter a valid amount (e.g. 5000):")
-        return _EXP_AMT
+        return await _step(update, ctx, "❌ Enter a valid amount (e.g. 5000):", state=_EXP_AMT, reply=True)
     ctx.user_data["exp_amt"] = val
-    return await _exp_ask_class(update.message.reply_text, ctx, val)
+    return await _exp_ask_class(update, ctx, val, reply=True)
 
 
-async def _exp_ask_class(send, ctx, amount: float) -> int:
+async def _exp_ask_class(update, ctx, amount: float, *, reply: bool = False) -> int:
     """Axis 2 — asked after the amount, because the capital test needs it.
 
     At or above the threshold the repair-vs-replace question is put directly:
@@ -4370,9 +4516,9 @@ async def _exp_ask_class(send, ctx, amount: float) -> int:
             "*Do you now own something you did not own before?*\n"
             "_No — a repair. Yes — capital._"
         )
-    await send(prompt, parse_mode=ParseMode.MARKDOWN_V2,
-               reply_markup=_expense_class_keyboard(amount, threshold))
-    return _EXP_CLASS
+    return await _step(update, ctx, prompt, parse_mode=ParseMode.MARKDOWN_V2,
+                       reply_markup=_expense_class_keyboard(amount, threshold),
+                       state=_EXP_CLASS, reply=reply)
 
 
 async def _exp_pick_class(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4383,27 +4529,28 @@ async def _exp_pick_class(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     # understates profit, which is the safe way to be wrong.
     ctx.user_data["exp_class"] = "operating" if val == "review" else val
     ctx.user_data["exp_review"] = val == "review"
-    await q.edit_message_text("📝 Any note? (optional)",
-                              reply_markup=_skip_keyboard("exp_note:skip"))
-    return _EXP_NOTE
+    return await _step(update, ctx, "📝 Any note? (optional)",
+                              reply_markup=_skip_keyboard("exp_note:skip"), state=_EXP_NOTE)
 
 
 async def _exp_note_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     ctx.user_data["exp_note"] = ""
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard("exp_d"),
+        state=_EXP_DATE,
     )
-    return _EXP_DATE
 
 
 async def _exp_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["exp_note"] = update.message.text.strip()
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard("exp_d"),
+        state=_EXP_DATE, reply=True,
     )
-    return _EXP_DATE
 
 
 async def _exp_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4413,11 +4560,12 @@ async def _exp_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if val.startswith("cal_p:") or val.startswith("cal_n:"):
         ym = val[6:]
         y, m = int(ym[:4]), int(ym[5:7])
-        await q.edit_message_text(
+        return await _step(
+            update, ctx,
             "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_calendar_keyboard("exp_d", y, m),
+            state=_EXP_DATE,
         )
-        return _EXP_DATE
     if val == "cal_x":
         return _EXP_DATE
     ts = None if val == "today" else val
@@ -4442,22 +4590,21 @@ async def _exp_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _drw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "💵 *Owner Draw — how much?* (₦)\n"
         "_Money you're taking out of the business. It reduces cash, not profit._",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_DRW_AMT, root=True,
     )
-    return _DRW_AMT
 
 
 async def _drw_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter a valid amount (e.g. 50000):")
-        return _DRW_AMT
+        return await _step(update, ctx, "❌ Enter a valid amount (e.g. 50000):", state=_DRW_AMT, reply=True)
     ctx.user_data["drw_amt"] = val
-    await update.message.reply_text("📝 Any note? (optional)", reply_markup=_skip_keyboard("drw_note:skip"))
-    return _DRW_NOTE
+    return await _step(update, ctx, "📝 Any note? (optional)", reply_markup=_skip_keyboard("drw_note:skip"), state=_DRW_NOTE, reply=True)
 
 
 async def _drw_finalize(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str) -> int:
@@ -4485,12 +4632,13 @@ async def _drw_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _rst_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📦 *Restock — which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_all_drink_keyboard("rst_dr"),
+        state=_RST_DRINK, root=True,
     )
-    return _RST_DRINK
 
 
 async def _rst_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4498,26 +4646,27 @@ async def _rst_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     drink = q.data[7:]
     if drink == "__other__":
-        await q.edit_message_text("Type the drink name:")
-        return _RST_DRINK_TEXT
+        return await _step(update, ctx, "Type the drink name:", state=_RST_DRINK_TEXT)
     ctx.user_data["rst_drink"] = drink
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"📦 *{reports._esc(drink.title())}* — how many units?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_restock_qty_keyboard(),
+        state=_RST_QTY,
     )
-    return _RST_QTY
 
 
 async def _rst_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["rst_drink"] = update.message.text.strip().lower()
     drink = ctx.user_data["rst_drink"]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"📦 *{reports._esc(drink.title())}* — how many units?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_restock_qty_keyboard(),
+        state=_RST_QTY, reply=True,
     )
-    return _RST_QTY
 
 
 async def _rst_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4525,15 +4674,15 @@ async def _rst_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[6:]
     if val == "__other__":
-        await q.edit_message_text("How many units? (type a number)")
-        return _RST_QTY_TEXT
+        return await _step(update, ctx, "How many units? (type a number)", state=_RST_QTY_TEXT)
     ctx.user_data["rst_qty"] = int(val)
     drink = ctx.user_data.get("rst_drink", "")
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"📦 {val}× {drink.title()} — *cost per unit?* (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_RST_COST,
     )
-    return _RST_COST
 
 
 async def _rst_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4542,22 +4691,21 @@ async def _rst_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if qty <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number:")
-        return _RST_QTY_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number:", state=_RST_QTY_TEXT, reply=True)
     ctx.user_data["rst_qty"] = qty
     drink = ctx.user_data.get("rst_drink", "")
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"📦 {qty}× {drink.title()} — *cost per unit?* (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_RST_COST, reply=True,
     )
-    return _RST_COST
 
 
 async def _rst_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cost, err = _to_float(update.message.text.strip(), "cost")
     if err:
-        await update.message.reply_text("❌ Enter a valid cost (e.g. 300):")
-        return _RST_COST
+        return await _step(update, ctx, "❌ Enter a valid cost (e.g. 300):", state=_RST_COST, reply=True)
     drink = ctx.user_data.pop("rst_drink", "")
     qty   = ctx.user_data.pop("rst_qty", 0)
     user  = update.effective_user
@@ -4576,22 +4724,24 @@ async def _rst_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _sup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📥 *Stock on credit — which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_all_drink_keyboard("sup_dr"),
+        state=_SUP_DRINK, root=True,
     )
-    return _SUP_DRINK
 
 
-async def _sup_ask_qty(target, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def _sup_ask_qty(update, ctx: ContextTypes.DEFAULT_TYPE, *, reply: bool = False) -> int:
     drink = ctx.user_data.get("sup_drink", "")
-    await target(
+    return await _step(
+        update, ctx,
         f"📥 *{reports._esc(drink.title())}* — how many units?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_credit_qty_keyboard(),
+        state=_SUP_QTY, reply=reply,
     )
-    return _SUP_QTY
 
 
 async def _sup_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4599,25 +4749,25 @@ async def _sup_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     drink = q.data[7:]
     if drink == "__other__":
-        await q.edit_message_text("Type the drink name:")
-        return _SUP_DRINK_TEXT
+        return await _step(update, ctx, "Type the drink name:", state=_SUP_DRINK_TEXT)
     ctx.user_data["sup_drink"] = drink
-    return await _sup_ask_qty(q.edit_message_text, ctx)
+    return await _sup_ask_qty(update, ctx)
 
 
 async def _sup_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["sup_drink"] = update.message.text.strip().lower()
-    return await _sup_ask_qty(update.message.reply_text, ctx)
+    return await _sup_ask_qty(update, ctx, reply=True)
 
 
-async def _sup_ask_cost(target, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def _sup_ask_cost(update, ctx: ContextTypes.DEFAULT_TYPE, *, reply: bool = False) -> int:
     qty   = ctx.user_data.get("sup_qty", 0)
     drink = ctx.user_data.get("sup_drink", "")
-    await target(
+    return await _step(
+        update, ctx,
         f"📥 {qty}× {reports._esc(drink.title())} — *cost per unit?* \\(₦\\)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SUP_COST, reply=reply,
     )
-    return _SUP_COST
 
 
 async def _sup_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4625,10 +4775,9 @@ async def _sup_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[6:]
     if val == "__other__":
-        await q.edit_message_text("How many units? (type a number)")
-        return _SUP_QTY_TEXT
+        return await _step(update, ctx, "How many units? (type a number)", state=_SUP_QTY_TEXT)
     ctx.user_data["sup_qty"] = int(val)
-    return await _sup_ask_cost(q.edit_message_text, ctx)
+    return await _sup_ask_cost(update, ctx)
 
 
 async def _sup_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4637,40 +4786,39 @@ async def _sup_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if qty <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number:")
-        return _SUP_QTY_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number:", state=_SUP_QTY_TEXT, reply=True)
     ctx.user_data["sup_qty"] = qty
-    return await _sup_ask_cost(update.message.reply_text, ctx)
+    return await _sup_ask_cost(update, ctx, reply=True)
 
 
 async def _sup_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cost, err = _to_float(update.message.text.strip(), "cost")
     if err:
-        await update.message.reply_text("❌ Enter a valid cost (e.g. 300):")
-        return _SUP_COST
+        return await _step(update, ctx, "❌ Enter a valid cost (e.g. 300):", state=_SUP_COST, reply=True)
     ctx.user_data["sup_cost"] = cost
     names = _known_suppliers()
     ctx.user_data["sup_names"] = names
     total = round(cost * ctx.user_data.get("sup_qty", 0), 2)
     if names:
-        await update.message.reply_text(
+        return await _step(
+            update, ctx,
             f"🧾 ₦{total:,.0f} owed — *which supplier?*",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_supplier_name_kb(names),
+            state=_SUP_WHO, reply=True,
         )
-        return _SUP_WHO
-    await update.message.reply_text(f"🧾 ₦{total:,.0f} owed — supplier name?")
-    return _SUP_WHO_TEXT
+    return await _step(update, ctx, f"🧾 ₦{total:,.0f} owed — supplier name?", state=_SUP_WHO_TEXT, reply=True)
 
 
-async def _sup_ask_due(target, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+async def _sup_ask_due(update, ctx: ContextTypes.DEFAULT_TYPE, *, reply: bool = False) -> int:
     who = ctx.user_data.get("sup_who", "")
-    await target(
+    return await _step(
+        update, ctx,
         f"📅 *When is {reports._esc(who.title())} due to be paid?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_due_date_keyboard(),
+        state=_SUP_DUE, reply=reply,
     )
-    return _SUP_DUE
 
 
 async def _sup_pick_who(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4678,8 +4826,7 @@ async def _sup_pick_who(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     raw = q.data.split(":", 1)[1]
     if raw == "__other__":
-        await q.edit_message_text("Type the supplier name:")
-        return _SUP_WHO_TEXT
+        return await _step(update, ctx, "Type the supplier name:", state=_SUP_WHO_TEXT)
     names = ctx.user_data.get("sup_names", [])
     idx = int(raw)
     if idx >= len(names):
@@ -4687,16 +4834,15 @@ async def _sup_pick_who(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data.clear()
         return ConversationHandler.END
     ctx.user_data["sup_who"] = names[idx]
-    return await _sup_ask_due(q.edit_message_text, ctx)
+    return await _sup_ask_due(update, ctx)
 
 
 async def _sup_who_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("❌ Supplier name can't be blank:")
-        return _SUP_WHO_TEXT
+        return await _step(update, ctx, "❌ Supplier name can't be blank:", state=_SUP_WHO_TEXT, reply=True)
     ctx.user_data["sup_who"] = name
-    return await _sup_ask_due(update.message.reply_text, ctx)
+    return await _sup_ask_due(update, ctx, reply=True)
 
 
 async def _sup_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE, due: str | None,
@@ -4720,8 +4866,7 @@ async def _sup_pick_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data.split(":", 1)[1]
     if val == "__other__":
-        await q.edit_message_text("Type the due date (YYYY-MM-DD):")
-        return _SUP_DUE_TEXT
+        return await _step(update, ctx, "Type the due date (YYYY-MM-DD):", state=_SUP_DUE_TEXT)
     due = None if val == "__none__" else str(clock.today() + timedelta(days=int(val)))
     return await _sup_finish(update, ctx, due, update.effective_chat.send_message)
 
@@ -4729,8 +4874,7 @@ async def _sup_pick_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _sup_due_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     due = update.message.text.strip()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
-        await update.message.reply_text("❌ Use YYYY-MM-DD (e.g. 2026-08-15):")
-        return _SUP_DUE_TEXT
+        return await _step(update, ctx, "❌ Use YYYY-MM-DD (e.g. 2026-08-15):", state=_SUP_DUE_TEXT, reply=True)
     return await _sup_finish(update, ctx, due, update.message.reply_text)
 
 
@@ -4760,12 +4904,13 @@ async def _spy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             f"#{r['id']} {str(r['supplier']).title()} — ₦{rem:,.0f}{tag}",
             callback_data=f"spy_inv:{r['id']}",
         )])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "✅ *Which invoice are you settling?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(buttons),
+        state=_SPY_INV, root=True,
     )
-    return _SPY_INV
 
 
 async def _spy_pick_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4779,7 +4924,8 @@ async def _spy_pick_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         ctx.user_data.clear()
         return ConversationHandler.END
     rem = round(float(row["amount"]) - float(row.get("amount_paid") or 0), 2)
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💵 Invoice \\#{payable_id} — *{reports._esc(str(row['supplier']).title())}* "
         f"is owed *₦{rem:,.0f}*\nHow much are you paying?",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -4787,8 +4933,8 @@ async def _spy_pick_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
             InlineKeyboardButton(f"✅ Full — ₦{rem:,.0f}", callback_data="spy_am:full"),
             InlineKeyboardButton("✏️ Partial amount",      callback_data="spy_am:partial"),
         ]]),
+        state=_SPY_AMT,
     )
-    return _SPY_AMT
 
 
 async def _spy_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -4806,15 +4952,13 @@ async def _spy_pick_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     if q.data == "spy_am:full":
         return await _spy_settle(update, ctx, None, update.effective_chat.send_message)
-    await q.edit_message_text("Type the partial amount paid (₦):")
-    return _SPY_AMT
+    return await _step(update, ctx, "Type the partial amount paid (₦):", state=_SPY_AMT)
 
 
 async def _spy_amt_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter a valid amount:")
-        return _SPY_AMT
+        return await _step(update, ctx, "❌ Enter a valid amount:", state=_SPY_AMT, reply=True)
     return await _spy_settle(update, ctx, val, update.message.reply_text)
 
 
@@ -4828,12 +4972,13 @@ async def _tfr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not in_store:
         await q.edit_message_text("📦 Store is empty — nothing to transfer. Use *Restock* first.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🔄 *Transfer store → bar — which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_store_drink_keyboard("tfr_dr"),
+        state=_TFR_DRINK, root=True,
     )
-    return _TFR_DRINK
 
 
 async def _tfr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4841,26 +4986,27 @@ async def _tfr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     drink = q.data[7:]
     if drink == "__other__":
-        await q.edit_message_text("Type the drink name:")
-        return _TFR_DRINK_TEXT
+        return await _step(update, ctx, "Type the drink name:", state=_TFR_DRINK_TEXT)
     ctx.user_data["tfr_drink"] = drink
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🔄 *{reports._esc(drink.title())}* — how many to move to bar?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_transfer_qty_keyboard(),
+        state=_TFR_QTY,
     )
-    return _TFR_QTY
 
 
 async def _tfr_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["tfr_drink"] = update.message.text.strip().lower()
     drink = ctx.user_data["tfr_drink"]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🔄 *{reports._esc(drink.title())}* — how many to move to bar?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_transfer_qty_keyboard(),
+        state=_TFR_QTY, reply=True,
     )
-    return _TFR_QTY
 
 
 async def _tfr_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4868,8 +5014,7 @@ async def _tfr_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[6:]
     if val == "__other__":
-        await q.edit_message_text("How many to transfer? (type a number)")
-        return _TFR_QTY_TEXT
+        return await _step(update, ctx, "How many to transfer? (type a number)", state=_TFR_QTY_TEXT)
     drink = ctx.user_data.pop("tfr_drink", "")
     user  = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
@@ -4884,8 +5029,7 @@ async def _tfr_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if qty <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number:")
-        return _TFR_QTY_TEXT
+        return await _step(update, ctx, "❌ Enter a whole number:", state=_TFR_QTY_TEXT, reply=True)
     drink = ctx.user_data.pop("tfr_drink", "")
     user  = update.effective_user
     recorded_by = user.username or user.first_name or str(user.id)
@@ -4900,65 +5044,68 @@ async def _tfr_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _deb_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "➕ *Add Debtor — which account?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_account_keyboard("deb_ac"),
+        state=_DEB_ACCT, root=True,
     )
-    return _DEB_ACCT
 
 
 async def _deb_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     ctx.user_data["deb_acct"] = q.data.split(":")[1]
-    await q.edit_message_text("👤 Debtor's name?")
-    return _DEB_NAME
+    return await _step(update, ctx, "👤 Debtor's name?", state=_DEB_NAME)
 
 
 async def _deb_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["deb_name"] = update.message.text.strip()
     name = ctx.user_data["deb_name"]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"💰 *{reports._esc(name.title())}* — how much do they owe? (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_DEB_AMT, reply=True,
     )
-    return _DEB_AMT
 
 
 async def _deb_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter a valid amount:")
-        return _DEB_AMT
+        return await _step(update, ctx, "❌ Enter a valid amount:", state=_DEB_AMT, reply=True)
     ctx.user_data["deb_amt"] = val
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "📝 Any note? (optional — e.g. 'tab from Friday')",
         reply_markup=_skip_keyboard("deb_note:skip"),
+        state=_DEB_NOTE, reply=True,
     )
-    return _DEB_NOTE
 
 
 async def _deb_note_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     ctx.user_data["deb_note"] = ""
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🧑‍💼 *Who served them?* (optional)",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_staff_keyboard("deb_st"),
+        state=_DEB_STAFF,
     )
-    return _DEB_STAFF
 
 
 async def _deb_note_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["deb_note"] = update.message.text.strip()
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "🧑‍💼 *Who served them?* (optional)",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_staff_keyboard("deb_st"),
+        state=_DEB_STAFF, reply=True,
     )
-    return _DEB_STAFF
 
 
 async def _deb_pick_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4966,21 +5113,22 @@ async def _deb_pick_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     val = q.data.split(":", 1)[1]
     if val == "__other__":
-        await q.edit_message_text("🧑‍💼 Type the staff member's name:")
-        return _DEB_STAFF
+        return await _step(update, ctx, "🧑‍💼 Type the staff member's name:", state=_DEB_STAFF)
     ctx.user_data["deb_staff"] = "" if val == "__skip__" else val
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard("deb_d"),
+        state=_DEB_DATE,
     )
-    return _DEB_DATE
 
 
 async def _deb_staff_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["deb_staff"] = update.message.text.strip()
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard("deb_d"),
+        state=_DEB_DATE, reply=True,
     )
-    return _DEB_DATE
 
 
 async def _deb_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4990,11 +5138,12 @@ async def _deb_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if val.startswith("cal_p:") or val.startswith("cal_n:"):
         ym = val[6:]
         y, m = int(ym[:4]), int(ym[5:7])
-        await q.edit_message_text(
+        return await _step(
+            update, ctx,
             "📅 *When?*", parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_calendar_keyboard("deb_d", y, m),
+            state=_DEB_DATE,
         )
-        return _DEB_DATE
     if val == "cal_x":
         return _DEB_DATE
     ts = None if val == "today" else val
@@ -5016,12 +5165,13 @@ async def _deb_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _pay_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "✅ *Pay Debtor — which account?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_account_keyboard("pay_ac"),
+        state=_PAY_ACCT, root=True,
     )
-    return _PAY_ACCT
 
 
 def _pay_debt_label(d: dict, remaining: float) -> str:
@@ -5057,12 +5207,13 @@ async def _pay_pick_acct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             _pay_debt_label(d, rem),
             callback_data=f"pay_db:{int(d['id'])}",
         )])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "✅ *Which debt was paid?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_PAY_DEBT,
     )
-    return _PAY_DEBT
 
 
 async def _pay_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5081,7 +5232,8 @@ async def _pay_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ts   = str(debtor.get("timestamp", ""))[:10]
     note = str(debtor.get("description") or "").strip()
     note_line = f"\n_{reports._esc(note)}_" if note else ""
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💳 Debt `#{debt_id}` — *{reports._esc(name)}* ({ts})\n"
         f"Outstanding on this debt: *₦{rem:,.0f}*{note_line}\n"
         "How much are they paying?",
@@ -5090,8 +5242,8 @@ async def _pay_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             InlineKeyboardButton(f"✅ Full — ₦{rem:,.0f}", callback_data="pay_am:full"),
             InlineKeyboardButton("✏️ Partial amount",      callback_data="pay_am:partial"),
         ]]),
+        state=_PAY_AMT,
     )
-    return _PAY_AMT
 
 
 async def _pay_pick_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5105,15 +5257,13 @@ async def _pay_pick_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ok, msg = logic.process_pay_debt_by_id(debt_id, paid_by=paid_by, amount=None)
         await update.effective_chat.send_message(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(user.id))
         return ConversationHandler.END
-    await q.edit_message_text("Type the partial amount paid (₦):")
-    return _PAY_AMT
+    return await _step(update, ctx, "Type the partial amount paid (₦):", state=_PAY_AMT)
 
 
 async def _pay_amt_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val, err = _to_float(update.message.text.strip(), "amount")
     if err:
-        await update.message.reply_text("❌ Enter a valid amount:")
-        return _PAY_AMT
+        return await _step(update, ctx, "❌ Enter a valid amount:", state=_PAY_AMT, reply=True)
     ctx.user_data.pop("pay_acct", None)
     debt_id = ctx.user_data.pop("pay_debt_id", 0)
     user = update.effective_user
@@ -5146,7 +5296,8 @@ def _del_entry_label(entry_type: str, r: dict) -> str:
 async def _del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🗑 *Delete Entry — what type?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -5154,8 +5305,8 @@ async def _del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             InlineKeyboardButton("🛏 Room",    callback_data="del_tp:room"),
             InlineKeyboardButton("💸 Expense", callback_data="del_tp:expense"),
         ]]),
+        state=_DEL_TYPE, root=True,
     )
-    return _DEL_TYPE
 
 
 async def _del_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5171,12 +5322,13 @@ async def _del_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     btns = [[InlineKeyboardButton(
         _del_entry_label(entry_type, r), callback_data=f"del_en:{r['id']}"
     )] for r in rows]
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🗑 *Select {entry_type} to delete:*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(btns),
+        state=_DEL_ENTRY,
     )
-    return _DEL_ENTRY
 
 
 async def _del_pick_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5188,15 +5340,16 @@ async def _del_pick_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     table = {"sale": "sales", "room": "rooms", "expense": "expenses"}.get(entry_type, "sales")
     row = next((r for r in _recent_active(table, 50) if r["id"] == entry_id), None)
     label = _del_entry_label(entry_type, row) if row else f"#{entry_id}"
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"⚠️ *Confirm delete?*\n\n`{label}`",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Yes, delete", callback_data="del_cf:yes"),
             InlineKeyboardButton("❌ Cancel",       callback_data="del_cf:no"),
         ]]),
+        state=_DEL_CONFIRM,
     )
-    return _DEL_CONFIRM
 
 
 async def _del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5221,12 +5374,13 @@ async def _del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _act_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📋 *Activity Log — which day?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_date_keyboard("act_d"),
+        state=_ACT_DATE, root=True,
     )
-    return _ACT_DATE
 
 
 async def _act_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5236,12 +5390,13 @@ async def _act_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if val.startswith("cal_p:") or val.startswith("cal_n:"):
         ym = val[6:]
         y, m = int(ym[:4]), int(ym[5:7])
-        await q.edit_message_text(
+        return await _step(
+            update, ctx,
             "📋 *Activity Log — which day?*",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_calendar_keyboard("act_d", y, m),
+            state=_ACT_DATE,
         )
-        return _ACT_DATE
     if val == "cal_x":
         return _ACT_DATE
     date_str = clock.today().strftime("%Y-%m-%d") if val == "today" else val
@@ -5268,12 +5423,13 @@ async def _spr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton("✏️ New drink", callback_data="spr_dr:__other__")])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "💰 *Set Drink Price — which drink?*\n_(current prices shown)_",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_SSET_PRICE_DRINK, root=True,
     )
-    return _SSET_PRICE_DRINK
 
 
 async def _spr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5281,31 +5437,31 @@ async def _spr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     drink = q.data[7:]
     if drink == "__other__":
-        await q.edit_message_text("Type the drink name:")
-        return _SSET_PRICE_DRINK
+        return await _step(update, ctx, "Type the drink name:", state=_SSET_PRICE_DRINK)
     ctx.user_data["spr_drink"] = drink
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💰 *{reports._esc(drink.title())}* — new selling price per unit? (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SSET_PRICE_AMT,
     )
-    return _SSET_PRICE_AMT
 
 
 async def _spr_drink_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["spr_drink"] = update.message.text.strip().lower()
     drink = ctx.user_data["spr_drink"]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"💰 *{reports._esc(drink.title())}* — new selling price per unit? (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SSET_PRICE_AMT, reply=True,
     )
-    return _SSET_PRICE_AMT
 
 
 async def _spr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     price, err = _to_float(update.message.text.strip(), "price")
     if err:
-        await update.message.reply_text("❌ Enter a valid price (e.g. 500):")
-        return _SSET_PRICE_AMT
+        return await _step(update, ctx, "❌ Enter a valid price (e.g. 500):", state=_SSET_PRICE_AMT, reply=True)
     drink = ctx.user_data.pop("spr_drink", "")
     ok, msg = logic.process_set_price(drink, price)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
@@ -5324,12 +5480,13 @@ async def _srt_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         callback_data=f"srt_tp:{p['room_type'].lower()}",
     )] for p in presets]
     rows.append([InlineKeyboardButton("➕ New room type", callback_data="srt_tp:__new__")])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🛏 *Room Type Prices — tap to update or add new:*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_SSET_ROOM_TYPE, root=True,
     )
-    return _SSET_ROOM_TYPE
 
 
 async def _srt_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5337,31 +5494,31 @@ async def _srt_pick_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[7:]
     if val == "__new__":
-        await q.edit_message_text("Type the new room type name (e.g. standard, executive, suite):")
-        return _SSET_ROOM_TYPE_TEXT
+        return await _step(update, ctx, "Type the new room type name (e.g. standard, executive, suite):", state=_SSET_ROOM_TYPE_TEXT)
     ctx.user_data["srt_type"] = val
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🛏 *{reports._esc(val.title())}* — new price per night? (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SSET_ROOM_AMT,
     )
-    return _SSET_ROOM_AMT
 
 
 async def _srt_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["srt_type"] = update.message.text.strip().lower()
     rtype = ctx.user_data["srt_type"]
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🛏 *{reports._esc(rtype.title())}* — price per night? (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SSET_ROOM_AMT, reply=True,
     )
-    return _SSET_ROOM_AMT
 
 
 async def _srt_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     price, err = _to_float(update.message.text.strip(), "price")
     if err:
-        await update.message.reply_text("❌ Enter a valid price (e.g. 15000):")
-        return _SSET_ROOM_AMT
+        return await _step(update, ctx, "❌ Enter a valid price (e.g. 15000):", state=_SSET_ROOM_AMT, reply=True)
     rtype = ctx.user_data.pop("srt_type", "")
     db.set_room_type_price(rtype, price)
     await update.message.reply_text(
@@ -5397,7 +5554,8 @@ async def _pcap_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await q.edit_message_text("🔒 Admin only.")
         return ConversationHandler.END
     current = reports._purchase_cap()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📉 *Stock Purchase Cap*\n"
         f"_Now: {current:g}% of bar revenue._\n\n"
         "_The most you want to spend on stock in a month, as a share of what_\n"
@@ -5410,8 +5568,8 @@ async def _pcap_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
              for n in (45, 50, 60)],
             [InlineKeyboardButton("✏️ Other", callback_data="pcap:__other__")],
         ]),
+        state=_PCAP_PICK, root=True,
     )
-    return _PCAP_PICK
 
 
 async def _pcap_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5419,8 +5577,7 @@ async def _pcap_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[5:]
     if val == "__other__":
-        await q.edit_message_text("Type the cap as a percentage (e.g. 40):")
-        return _PCAP_TEXT
+        return await _step(update, ctx, "Type the cap as a percentage (e.g. 40):", state=_PCAP_TEXT)
     ok, msg = logic.process_set_purchase_cap(float(val))
     await q.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
     return ConversationHandler.END
@@ -5430,8 +5587,7 @@ async def _pcap_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         pct = float(update.message.text.strip().rstrip("%"))
     except ValueError:
-        await update.message.reply_text("❌ Enter a number, e.g. 40:")
-        return _PCAP_TEXT
+        return await _step(update, ctx, "❌ Enter a number, e.g. 40:", state=_PCAP_TEXT, reply=True)
     ok, msg = logic.process_set_purchase_cap(pct)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
     return ConversationHandler.END if ok else _PCAP_TEXT
@@ -5468,9 +5624,8 @@ async def _ssl_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         callback_data=f"ssl_tp:{i}")] for i, t in enumerate(types)]
     rows.append([InlineKeyboardButton("➕ Other room type", callback_data="ssl_tp:__new__")])
 
-    await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
-                              reply_markup=InlineKeyboardMarkup(rows))
-    return _SSL_PICK
+    return await _step(update, ctx, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
+                              reply_markup=InlineKeyboardMarkup(rows), state=_SSL_PICK, root=True)
 
 
 def _ssl_hours_keyboard() -> InlineKeyboardMarkup:
@@ -5481,13 +5636,15 @@ def _ssl_hours_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _ssl_ask_hours(send, name: str) -> int:
-    await send(
+async def _ssl_ask_hours(update, ctx, name: str, *, reply: bool = False) -> int:
+    return await _step(
+        update, ctx,
         f"🕐 *How long is one {reports._esc(name.title())} let?*\n"
         "_Pick 🌙 to put it back to a normal overnight room._",
-        _ssl_hours_keyboard(),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=_ssl_hours_keyboard(),
+        state=_SSL_HOURS, reply=reply,
     )
-    return _SSL_HOURS
 
 
 async def _ssl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5495,8 +5652,7 @@ async def _ssl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     val = q.data[7:]
     if val == "__new__":
-        await q.edit_message_text("Type the room type name (e.g. short time):")
-        return _SSL_TYPE_TEXT
+        return await _step(update, ctx, "Type the room type name (e.g. short time):", state=_SSL_TYPE_TEXT)
 
     types = ctx.user_data.get("ssl_types", [])
     idx = int(val)
@@ -5506,22 +5662,16 @@ async def _ssl_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     ctx.user_data["ssl_target"] = types[idx]
 
-    async def send(text, kb):
-        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-    return await _ssl_ask_hours(send, types[idx])
+    return await _ssl_ask_hours(update, ctx, types[idx])
 
 
 async def _ssl_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip().lower()
     if not name:
-        await update.message.reply_text("❌ Room type can't be blank:")
-        return _SSL_TYPE_TEXT
+        return await _step(update, ctx, "❌ Room type can't be blank:", state=_SSL_TYPE_TEXT, reply=True)
     ctx.user_data["ssl_target"] = name
 
-    async def send(text, kb):
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
-                                        reply_markup=kb)
-    return await _ssl_ask_hours(send, name)
+    return await _ssl_ask_hours(update, ctx, name, reply=True)
 
 
 async def _ssl_finish(send, ctx, hours: float) -> int:
@@ -5537,8 +5687,7 @@ async def _ssl_pick_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     val = q.data[7:]
     if val == "__other__":
-        await q.edit_message_text("Type the number of hours (1–24):")
-        return _SSL_HOURS_TEXT
+        return await _step(update, ctx, "Type the number of hours (1–24):", state=_SSL_HOURS_TEXT)
 
     async def send(text, kb):
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
@@ -5548,8 +5697,7 @@ async def _ssl_pick_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
 async def _ssl_hours_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     hours, err = _to_float(update.message.text.strip(), "hours")
     if err:
-        await update.message.reply_text("❌ Enter a number of hours (e.g. 2):")
-        return _SSL_HOURS_TEXT
+        return await _step(update, ctx, "❌ Enter a number of hours (e.g. 2):", state=_SSL_HOURS_TEXT, reply=True)
 
     async def send(text, kb):
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
@@ -5602,12 +5750,13 @@ async def _src_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     rows.append([InlineKeyboardButton("➕ Other room type", callback_data="src_tp:__new__")])
 
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_SRC_PICK, root=True,
     )
-    return _SRC_PICK
 
 
 async def _src_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5617,15 +5766,15 @@ async def _src_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if val == "__total__":
         ctx.user_data["src_target"] = None      # None = the hotel-wide total
-        await q.edit_message_text(
+        return await _step(
+            update, ctx,
             "🏨 *How many lettable rooms does the hotel have in total?*",
             parse_mode=ParseMode.MARKDOWN_V2,
+            state=_SRC_COUNT,
         )
-        return _SRC_COUNT
 
     if val == "__new__":
-        await q.edit_message_text("Type the room type name (e.g. executive, short time):")
-        return _SRC_TYPE_TEXT
+        return await _step(update, ctx, "Type the room type name (e.g. executive, short time):", state=_SRC_TYPE_TEXT)
 
     types = ctx.user_data.get("src_types", [])
     idx = int(val)
@@ -5634,31 +5783,31 @@ async def _src_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         ctx.user_data.clear()
         return ConversationHandler.END
     ctx.user_data["src_target"] = types[idx]
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🏨 *How many {reports._esc(types[idx].title())} rooms do you have?*",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SRC_COUNT,
     )
-    return _SRC_COUNT
 
 
 async def _src_type_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip().lower()
     if not name:
-        await update.message.reply_text("❌ Room type can't be blank:")
-        return _SRC_TYPE_TEXT
+        return await _step(update, ctx, "❌ Room type can't be blank:", state=_SRC_TYPE_TEXT, reply=True)
     ctx.user_data["src_target"] = name
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"🏨 *How many {reports._esc(name.title())} rooms do you have?*",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SRC_COUNT, reply=True,
     )
-    return _SRC_COUNT
 
 
 async def _src_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     count, err = _to_int(update.message.text.strip(), "room count")
     if err:
-        await update.message.reply_text("❌ Enter a whole number (e.g. 5):")
-        return _SRC_COUNT
+        return await _step(update, ctx, "❌ Enter a whole number (e.g. 5):", state=_SRC_COUNT, reply=True)
 
     target = ctx.user_data.pop("src_target", None)
     ctx.user_data.pop("src_types", None)
@@ -5690,12 +5839,13 @@ async def _sthr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             rows.append(row); row = []
     if row:
         rows.append(row)
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🔔 *Low Stock Alert — which drink?*\n_(current threshold in brackets)_",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_SSET_THRESH_DRINK, root=True,
     )
-    return _SSET_THRESH_DRINK
 
 
 async def _sthr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5703,18 +5853,18 @@ async def _sthr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     await q.answer()
     drink = q.data[8:]
     ctx.user_data["sthr_drink"] = drink
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🔔 *{reports._esc(drink.title())}* — alert when bar stock falls to or below? (units)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SSET_THRESH_AMT,
     )
-    return _SSET_THRESH_AMT
 
 
 async def _sthr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     val, err = _to_int(update.message.text.strip(), "threshold")
     if err:
-        await update.message.reply_text("❌ Enter a whole number (e.g. 6):")
-        return _SSET_THRESH_AMT
+        return await _step(update, ctx, "❌ Enter a whole number (e.g. 6):", state=_SSET_THRESH_AMT, reply=True)
     drink = ctx.user_data.pop("sthr_drink", "")
     result = inv.set_threshold(drink, val)
     await update.message.reply_text(result.message, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
@@ -5726,12 +5876,13 @@ async def _sthr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _rnm_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🔀 *Rename / Merge — which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_existing_drink_kb("rnm_old"),
+        state=_RNM_OLD, root=True,
     )
-    return _RNM_OLD
 
 
 async def _rnm_pick_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5739,13 +5890,14 @@ async def _rnm_pick_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     old = q.data.split(":", 1)[1]
     ctx.user_data["rnm_old"] = old
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🔀 Changing *{reports._esc(old.title())}*\n\n"
         "Type the *new name*, or tap an existing drink to *merge* into it:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_existing_drink_kb("rnm_new"),
+        state=_RNM_NEW,
     )
-    return _RNM_NEW
 
 
 async def _rnm_pick_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5789,12 +5941,13 @@ async def _smn_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await q.edit_message_text("Need at least two recorded names to reconcile.")
         return ConversationHandler.END
     ctx.user_data["smn_names"] = names
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🔀 *Reconcile Staff Names*\n\nTap the *duplicate* name to merge away:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_staff_name_kb(names, "smn_old"),
+        state=_SMN_OLD, root=True,
     )
-    return _SMN_OLD
 
 
 async def _smn_pick_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5807,12 +5960,13 @@ async def _smn_pick_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     old = names[idx]
     ctx.user_data["smn_old"] = old
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🔀 Merging *{reports._esc(old)}* into…\n\nTap the name to *keep*, or type a new name:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_staff_name_kb(names, "smn_new", skip=old),
+        state=_SMN_NEW,
     )
-    return _SMN_NEW
 
 
 async def _smn_pick_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5860,12 +6014,13 @@ async def _dsf_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         label = f"{str(d['name']).title()} · {d['account']} ₦{rem:,.0f} · 👤{cur}"
         rows.append([InlineKeyboardButton(label, callback_data=f"dsf:debt:{d['id']}")])
     note = "" if len(debts) <= _DSF_MAX else f"\n\n_Showing the {_DSF_MAX} most recent of {len(debts)} — use /set\\_debt\\_staff for older ones_"
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "✏️ *Edit debt's staff*\n\nPick the debt to fix \\(shows current staff\\):" + note,
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_DSF_DEBT, root=True,
     )
-    return _DSF_DEBT
 
 
 async def _dsf_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5873,13 +6028,14 @@ async def _dsf_pick_debt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     debt_id = int(q.data.rsplit(":", 1)[1])
     ctx.user_data["dsf_debt_id"] = debt_id
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"✏️ Debt `#{debt_id}` — who is *actually* responsible?\n\n"
         "Tap the correct staff member, or ✏️ Other to type a name:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_staff_keyboard("dsf_st"),
+        state=_DSF_STAFF,
     )
-    return _DSF_STAFF
 
 
 async def _dsf_pick_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5887,8 +6043,7 @@ async def _dsf_pick_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     await q.answer()
     val = q.data.split(":", 1)[1]
     if val == "__other__":
-        await q.edit_message_text("✏️ Type the correct staff member's name:")
-        return _DSF_STAFF
+        return await _step(update, ctx, "✏️ Type the correct staff member's name:", state=_DSF_STAFF)
     if val == "__skip__":
         ctx.user_data.pop("dsf_debt_id", None)
         await q.edit_message_text("Cancelled — no change made.")
@@ -5920,12 +6075,13 @@ async def _dsf_staff_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
 async def _sst_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🔢 *Set Count — which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_existing_drink_kb("sst_dr"),
+        state=_SST_DRINK, root=True,
     )
-    return _SST_DRINK
 
 
 async def _sst_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5935,29 +6091,27 @@ async def _sst_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     ctx.user_data["sst_drink"] = drink
     row = db.get_drink(drink) or {}
     store, bar = int(row.get("store_stock", 0)), int(row.get("current_stock", 0))
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🔢 *{reports._esc(drink.title())}* — now {store} store · {bar} bar\n\n"
         "New *STORE* count? (whole number)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SST_STORE,
     )
-    return _SST_STORE
 
 
 async def _sst_store(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     txt = update.message.text.strip()
     if not txt.isdigit():
-        await update.message.reply_text("❌ Enter a whole number ≥ 0 for STORE:")
-        return _SST_STORE
+        return await _step(update, ctx, "❌ Enter a whole number ≥ 0 for STORE:", state=_SST_STORE, reply=True)
     ctx.user_data["sst_store"] = int(txt)
-    await update.message.reply_text("New *BAR* count? (whole number)", parse_mode=ParseMode.MARKDOWN_V2)
-    return _SST_BAR
+    return await _step(update, ctx, "New *BAR* count? (whole number)", parse_mode=ParseMode.MARKDOWN_V2, state=_SST_BAR, reply=True)
 
 
 async def _sst_bar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     txt = update.message.text.strip()
     if not txt.isdigit():
-        await update.message.reply_text("❌ Enter a whole number ≥ 0 for BAR:")
-        return _SST_BAR
+        return await _step(update, ctx, "❌ Enter a whole number ≥ 0 for BAR:", state=_SST_BAR, reply=True)
     drink = ctx.user_data.pop("sst_drink", "")
     store = ctx.user_data.pop("sst_store", 0)
     _ok, msg = logic.process_set_stock(drink, store, int(txt))
@@ -5968,12 +6122,13 @@ async def _sst_bar(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _scs_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "💰 *Set Cost Price — which drink?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_existing_drink_kb("scs_dr"),
+        state=_SCS_DRINK, root=True,
     )
-    return _SCS_DRINK
 
 
 async def _scs_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5983,19 +6138,19 @@ async def _scs_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     ctx.user_data["scs_drink"] = drink
     row = db.get_drink(drink) or {}
     cost = float(row.get("cost_price", 0) or 0)
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"💰 *{reports._esc(drink.title())}* — cost now ₦{cost:,.2f}/unit\n\n"
         "New *cost price* per unit? (₦)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SCS_COST,
     )
-    return _SCS_COST
 
 
 async def _scs_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     cost, err = _to_float(update.message.text.strip(), "cost")
     if err:
-        await update.message.reply_text("❌ Enter a valid cost (e.g. 300):")
-        return _SCS_COST
+        return await _step(update, ctx, "❌ Enter a valid cost (e.g. 300):", state=_SCS_COST, reply=True)
     drink = ctx.user_data.pop("scs_drink", "")
     _ok, msg = logic.process_set_cost(drink, cost)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_get_keyboard(update.effective_user.id))
@@ -6005,12 +6160,13 @@ async def _scs_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def _ddr_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "🗑 *Delete Drink — which one?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=_existing_drink_kb("ddr_dr"),
+        state=_DDR_DRINK, root=True,
     )
-    return _DDR_DRINK
 
 
 async def _ddr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6025,12 +6181,13 @@ async def _ddr_pick_drink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         InlineKeyboardButton("✅ Delete", callback_data="ddrc:yes"),
         InlineKeyboardButton("❌ Cancel", callback_data="ddrc:no"),
     ]])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"🗑 Delete *{reports._esc(drink.title())}*?{warn}",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=kb,
+        state=_DDR_CONFIRM,
     )
-    return _DDR_CONFIRM
 
 
 async def _ddr_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6070,12 +6227,13 @@ async def _sall_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     for k, label in _ALLOC_LABELS.items():
         current = int(db.get_setting(f"alloc_{k}", str(defs[k])))
         rows.append([InlineKeyboardButton(f"{label} [{current}%]", callback_data=f"sall_k:{k}")])
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         "📊 *Allocation % — tap a key to change:*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup(rows),
+        state=_SSET_ALLOC_KEY, root=True,
     )
-    return _SSET_ALLOC_KEY
 
 
 async def _sall_pick_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6084,11 +6242,12 @@ async def _sall_pick_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     key = q.data[7:]
     ctx.user_data["sall_key"] = key
     label = _ALLOC_LABELS.get(key, key)
-    await q.edit_message_text(
+    return await _step(
+        update, ctx,
         f"📊 *{label}*\nNew percentage? (0–100)",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SSET_ALLOC_VAL,
     )
-    return _SSET_ALLOC_VAL
 
 
 async def _sall_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6097,8 +6256,7 @@ async def _sall_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not (0 <= pct <= 100):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Enter a whole number between 0 and 100:")
-        return _SSET_ALLOC_VAL
+        return await _step(update, ctx, "❌ Enter a whole number between 0 and 100:", state=_SSET_ALLOC_VAL, reply=True)
     key = ctx.user_data.pop("sall_key", "")
     db.set_setting(f"alloc_{key}", str(pct))
     # Show updated summary using same logic as cmd_setallocation
@@ -6601,20 +6759,20 @@ async def _cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     ctx.user_data["setup_username"] = update.effective_user.username or str(uid)
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         "👋 *Welcome to Hotel Bot Setup!*\n\n"
         "Let's configure your hotel in a few steps.\n\n"
         "What is your hotel's name?",
         parse_mode=ParseMode.MARKDOWN_V2,
+        state=_SETUP_NAME, root=True, reply=True,
     )
-    return _SETUP_NAME
 
 
 async def _setup_receive_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     if len(name) < 2:
-        await update.message.reply_text("Please enter a valid hotel name (at least 2 characters).")
-        return _SETUP_NAME
+        return await _step(update, ctx, "Please enter a valid hotel name (at least 2 characters).", state=_SETUP_NAME, reply=True)
 
     ctx.user_data["setup_name"] = name
     keyboard = InlineKeyboardMarkup([
@@ -6628,12 +6786,13 @@ async def _setup_receive_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         ],
         [InlineKeyboardButton("✏️ Enter manually",          callback_data="stz:manual")],
     ])
-    await update.message.reply_text(
+    return await _step(
+        update, ctx,
         f"*{reports._esc(name)}* ✓\n\nSelect your timezone:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=keyboard,
+        state=_SETUP_TZ, reply=True,
     )
-    return _SETUP_TZ
 
 
 async def _setup_tz_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6642,15 +6801,15 @@ async def _setup_tz_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     choice = q.data[len("stz:"):]
 
     if choice == "manual":
-        await q.message.reply_text(
+        return await _step(
+            update, ctx,
             "Type your timezone — e.g. `Europe/London`, `America/New_York`:",
             parse_mode=ParseMode.MARKDOWN_V2,
+            state=_SETUP_TZ, reply=True,
         )
-        return _SETUP_TZ
 
     ctx.user_data["setup_tz"] = choice
-    await _show_setup_confirm(q.message, ctx)
-    return _SETUP_CONFIRM
+    return await _show_setup_confirm(update, ctx)
 
 
 async def _setup_tz_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6658,18 +6817,18 @@ async def _setup_tz_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         pytz.timezone(tz_input)
     except pytz.exceptions.UnknownTimeZoneError:
-        await update.message.reply_text(
+        return await _step(
+            update, ctx,
             f"❌ Unknown timezone `{tz_input}`\\. Try again — e.g. `Africa/Lagos`:",
             parse_mode=ParseMode.MARKDOWN_V2,
+            state=_SETUP_TZ, reply=True,
         )
-        return _SETUP_TZ
 
     ctx.user_data["setup_tz"] = tz_input
-    await _show_setup_confirm(update.message, ctx)
-    return _SETUP_CONFIRM
+    return await _show_setup_confirm(update, ctx)
 
 
-async def _show_setup_confirm(message, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _show_setup_confirm(update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     name = ctx.user_data["setup_name"]
     tz   = ctx.user_data["setup_tz"]
     uname = ctx.user_data.get("setup_username", "you")
@@ -6677,7 +6836,8 @@ async def _show_setup_confirm(message, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         InlineKeyboardButton("✅ Confirm", callback_data="sconf:yes"),
         InlineKeyboardButton("❌ Cancel",  callback_data="sconf:no"),
     ]])
-    await message.reply_text(
+    return await _step(
+        update, ctx,
         f"*Ready to set up:*\n\n"
         f"🏨 Hotel: {reports._esc(name)}\n"
         f"🕐 Timezone: {reports._esc(tz)}\n"
@@ -6685,6 +6845,7 @@ async def _show_setup_confirm(message, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Confirm?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=keyboard,
+        state=_SETUP_CONFIRM, reply=True,
     )
 
 
@@ -6738,7 +6899,7 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(TypeHandler(Update, _set_context), group=-1)
 
     # Register handlers — ConversationHandlers FIRST so they capture their entry points
-    setup_conv = ConversationHandler(
+    setup_conv = _conv(
         entry_points=[CommandHandler("setup", _cmd_setup)],
         states={
             _SETUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, _setup_receive_name)],
@@ -6748,12 +6909,10 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             ],
             _SETUP_CONFIRM: [CallbackQueryHandler(_setup_confirm, pattern="^sconf:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
     app.add_handler(setup_conv)
 
-    sell_conv = ConversationHandler(
+    sell_conv = _conv(
         entry_points=[
             CommandHandler("sell", cmd_sell_start),
             MessageHandler(filters.Text(["🍺 Sell"]) & ~filters.COMMAND, cmd_sell_start),
@@ -6765,10 +6924,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _SELL_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sell_qty_text)],
             _SELL_DATE:       [CallbackQueryHandler(_sell_pick_date, pattern="^sdd:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    book_conv = ConversationHandler(
+    book_conv = _conv(
         entry_points=[
             CommandHandler("book", cmd_book_start),
             MessageHandler(filters.Text(["🛏 Book Room"]) & ~filters.COMMAND, cmd_book_start),
@@ -6783,14 +6940,12 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _BOOK_DAYPART:     [CallbackQueryHandler(_book_pick_daypart, pattern="^bdp:")],
             _BOOK_DATE:        [CallbackQueryHandler(_book_pick_date, pattern="^bdd:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
     app.add_handler(sell_conv)
     app.add_handler(book_conv)
 
     # ── Admin manage conversation flows (registered before simple callbacks) ──
-    exp_conv = ConversationHandler(
+    exp_conv = _conv(
         entry_points=[CallbackQueryHandler(_exp_start, pattern="^mgr:expense$")],
         states={
             _EXP_ACCT:     [CallbackQueryHandler(_exp_pick_acct, pattern="^exp_ac:")],
@@ -6804,10 +6959,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             ],
             _EXP_DATE:     [CallbackQueryHandler(_exp_pick_date, pattern="^exp_d:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    rst_conv = ConversationHandler(
+    rst_conv = _conv(
         entry_points=[CallbackQueryHandler(_rst_start, pattern="^mgr:restock$")],
         states={
             _RST_DRINK:      [CallbackQueryHandler(_rst_pick_drink, pattern="^rst_dr:")],
@@ -6816,10 +6969,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _RST_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _rst_qty_text)],
             _RST_COST:       [MessageHandler(filters.TEXT & ~filters.COMMAND, _rst_cost)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    tfr_conv = ConversationHandler(
+    tfr_conv = _conv(
         entry_points=[CallbackQueryHandler(_tfr_start, pattern="^mgr:transfer$")],
         states={
             _TFR_DRINK:      [CallbackQueryHandler(_tfr_pick_drink, pattern="^tfr_dr:")],
@@ -6827,10 +6978,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _TFR_QTY:        [CallbackQueryHandler(_tfr_pick_qty,   pattern="^tfr_q:")],
             _TFR_QTY_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _tfr_qty_text)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    deb_conv = ConversationHandler(
+    deb_conv = _conv(
         entry_points=[CallbackQueryHandler(_deb_start, pattern="^mgr:add_debtor$")],
         states={
             _DEB_ACCT:  [CallbackQueryHandler(_deb_pick_acct, pattern="^deb_ac:")],
@@ -6846,10 +6995,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             ],
             _DEB_DATE:  [CallbackQueryHandler(_deb_pick_date, pattern="^deb_d:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    pay_conv = ConversationHandler(
+    pay_conv = _conv(
         entry_points=[CallbackQueryHandler(_pay_start, pattern="^mgr:pay_debtor$")],
         states={
             _PAY_ACCT: [CallbackQueryHandler(_pay_pick_acct, pattern="^pay_ac:")],
@@ -6859,28 +7006,22 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _pay_amt_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    del_conv = ConversationHandler(
+    del_conv = _conv(
         entry_points=[CallbackQueryHandler(_del_start, pattern="^mgr:delete$")],
         states={
             _DEL_TYPE:    [CallbackQueryHandler(_del_pick_type,  pattern="^del_tp:")],
             _DEL_ENTRY:   [CallbackQueryHandler(_del_pick_entry, pattern="^del_en:")],
             _DEL_CONFIRM: [CallbackQueryHandler(_del_confirm,    pattern="^del_cf:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    act_conv = ConversationHandler(
+    act_conv = _conv(
         entry_points=[CallbackQueryHandler(_act_start, pattern="^mgr:activity$")],
         states={
             _ACT_DATE: [CallbackQueryHandler(_act_pick_date, pattern="^act_d:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    spr_conv = ConversationHandler(
+    spr_conv = _conv(
         entry_points=[CallbackQueryHandler(_spr_start, pattern="^sset:price$")],
         states={
             _SSET_PRICE_DRINK: [
@@ -6889,39 +7030,31 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             ],
             _SSET_PRICE_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _spr_amount)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    srt_conv = ConversationHandler(
+    srt_conv = _conv(
         entry_points=[CallbackQueryHandler(_srt_start, pattern="^sset:roomtype$")],
         states={
             _SSET_ROOM_TYPE:      [CallbackQueryHandler(_srt_pick_type, pattern="^srt_tp:")],
             _SSET_ROOM_TYPE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _srt_type_text)],
             _SSET_ROOM_AMT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, _srt_amount)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    src_conv = ConversationHandler(
+    src_conv = _conv(
         entry_points=[CallbackQueryHandler(_src_start, pattern="^sset:roomcount$")],
         states={
             _SRC_PICK:      [CallbackQueryHandler(_src_pick, pattern="^src_tp:")],
             _SRC_TYPE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _src_type_text)],
             _SRC_COUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _src_count)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    csh_conv = ConversationHandler(
+    csh_conv = _conv(
         entry_points=[CallbackQueryHandler(_csh_start, pattern="^csh:start$")],
         states={
             _CSH_TILL: [MessageHandler(filters.TEXT & ~filters.COMMAND, _csh_till)],
             _CSH_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, _csh_bank)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    stk_conv = ConversationHandler(
+    stk_conv = _conv(
         entry_points=[CallbackQueryHandler(_stk_start, pattern="^stk:start$")],
         states={
             _STK_BAR:   [CallbackQueryHandler(_stk_skip, pattern="^stk_sk:"),
@@ -6929,10 +7062,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _STK_STORE: [CallbackQueryHandler(_stk_skip, pattern="^stk_sk:"),
                          MessageHandler(filters.TEXT & ~filters.COMMAND, _stk_store)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    rau_conv = ConversationHandler(
+    rau_conv = _conv(
         entry_points=[CallbackQueryHandler(_rau_start, pattern="^rau:start$")],
         states={
             _RAU_ACTUAL:      [CallbackQueryHandler(_rau_missing, pattern="^rau_m:")],
@@ -6940,10 +7071,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _RAU_RATE:        [CallbackQueryHandler(_rau_rate_pick, pattern="^rau_r:")],
             _RAU_RATE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _rau_rate_text)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    pob_conv = ConversationHandler(
+    pob_conv = _conv(
         entry_points=[CallbackQueryHandler(_pob_start, pattern="^pob:start$")],
         states={
             _POB_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _pob_name)],
@@ -6952,38 +7081,30 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                           MessageHandler(filters.TEXT & ~filters.COMMAND, _pob_months_text)],
             _POB_ACCT:   [CallbackQueryHandler(_pob_account, pattern="^pob_ac:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    ppy_conv = ConversationHandler(
+    ppy_conv = _conv(
         entry_points=[CallbackQueryHandler(_ppy_start, pattern="^ppy:start$")],
         states={
             _PPY_PICK: [CallbackQueryHandler(_ppy_pick, pattern="^ppy_id:")],
             _PPY_AMT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _ppy_amount)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    rcl_conv = ConversationHandler(
+    rcl_conv = _conv(
         entry_points=[CallbackQueryHandler(_rcl_start, pattern="^rcl:start$")],
         states={
             _RCL_PICK:  [CallbackQueryHandler(_rcl_pick,  pattern="^rcl_id:")],
             _RCL_FIELD: [CallbackQueryHandler(_rcl_field, pattern="^rcl_f:")],
             _RCL_VALUE: [CallbackQueryHandler(_rcl_value, pattern="^rcl_v:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    pcap_conv = ConversationHandler(
+    pcap_conv = _conv(
         entry_points=[CallbackQueryHandler(_pcap_start, pattern="^sset:pcap$")],
         states={
             _PCAP_PICK: [CallbackQueryHandler(_pcap_pick, pattern="^pcap:")],
             _PCAP_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _pcap_text)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    ssl_conv = ConversationHandler(
+    ssl_conv = _conv(
         entry_points=[CallbackQueryHandler(_ssl_start, pattern="^sset:stay$")],
         states={
             _SSL_PICK:       [CallbackQueryHandler(_ssl_pick, pattern="^ssl_tp:")],
@@ -6991,12 +7112,10 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _SSL_HOURS:      [CallbackQueryHandler(_ssl_pick_hours, pattern="^ssl_hr:")],
             _SSL_HOURS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _ssl_hours_text)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
     # Staff-reachable, so it is not gated behind ⚙️ Manage. Entered from the
     # room-type picker and from the foot of the night-by-night report.
-    ta_conv = ConversationHandler(
+    ta_conv = _conv(
         entry_points=[CallbackQueryHandler(_ta_start, pattern="^ta:start$")],
         states={
             _TA_QTY:         [CallbackQueryHandler(_ta_pick_qty, pattern="^taq:")],
@@ -7005,28 +7124,22 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _TA_REASON:      [CallbackQueryHandler(_ta_pick_reason, pattern="^tar:")],
             _TA_REASON_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _ta_reason_text)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    sthr_conv = ConversationHandler(
+    sthr_conv = _conv(
         entry_points=[CallbackQueryHandler(_sthr_start, pattern="^sset:threshold$")],
         states={
             _SSET_THRESH_DRINK: [CallbackQueryHandler(_sthr_pick_drink, pattern="^sthr_dr:")],
             _SSET_THRESH_AMT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sthr_amount)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    sall_conv = ConversationHandler(
+    sall_conv = _conv(
         entry_points=[CallbackQueryHandler(_sall_start, pattern="^sset:allocation$")],
         states={
             _SSET_ALLOC_KEY: [CallbackQueryHandler(_sall_pick_key, pattern="^sall_k:")],
             _SSET_ALLOC_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sall_value)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    rnm_conv = ConversationHandler(
+    rnm_conv = _conv(
         entry_points=[CallbackQueryHandler(_rnm_start, pattern="^fix:rename$")],
         states={
             _RNM_OLD: [CallbackQueryHandler(_rnm_pick_old, pattern="^rnm_old:")],
@@ -7035,10 +7148,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _rnm_new_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    smn_conv = ConversationHandler(
+    smn_conv = _conv(
         entry_points=[CallbackQueryHandler(_smn_start, pattern="^staff:merge$")],
         states={
             _SMN_OLD: [CallbackQueryHandler(_smn_pick_old, pattern="^smn_old:")],
@@ -7047,10 +7158,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _smn_new_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    dsf_conv = ConversationHandler(
+    dsf_conv = _conv(
         entry_points=[CallbackQueryHandler(_dsf_start, pattern="^dsf:start$")],
         states={
             _DSF_DEBT: [CallbackQueryHandler(_dsf_pick_debt, pattern="^dsf:debt:")],
@@ -7059,38 +7168,30 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _dsf_staff_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    sst_conv = ConversationHandler(
+    sst_conv = _conv(
         entry_points=[CallbackQueryHandler(_sst_start, pattern="^fix:setstock$")],
         states={
             _SST_DRINK: [CallbackQueryHandler(_sst_pick_drink, pattern="^sst_dr:")],
             _SST_STORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, _sst_store)],
             _SST_BAR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sst_bar)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    scs_conv = ConversationHandler(
+    scs_conv = _conv(
         entry_points=[CallbackQueryHandler(_scs_start, pattern="^fix:setcost$")],
         states={
             _SCS_DRINK: [CallbackQueryHandler(_scs_pick_drink, pattern="^scs_dr:")],
             _SCS_COST:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _scs_cost)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    ddr_conv = ConversationHandler(
+    ddr_conv = _conv(
         entry_points=[CallbackQueryHandler(_ddr_start, pattern="^fix:delete$")],
         states={
             _DDR_DRINK:   [CallbackQueryHandler(_ddr_pick_drink, pattern="^ddr_dr:")],
             _DDR_CONFIRM: [CallbackQueryHandler(_ddr_confirm, pattern="^ddrc:")],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    drw_conv = ConversationHandler(
+    drw_conv = _conv(
         entry_points=[CallbackQueryHandler(_drw_start, pattern="^mgr:draw$")],
         states={
             _DRW_AMT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _drw_amount)],
@@ -7099,10 +7200,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _drw_note_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    sup_conv = ConversationHandler(
+    sup_conv = _conv(
         entry_points=[CallbackQueryHandler(_sup_start, pattern="^sup:credit$")],
         states={
             _SUP_DRINK:      [CallbackQueryHandler(_sup_pick_drink, pattern="^sup_dr:")],
@@ -7115,10 +7214,8 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
             _SUP_DUE:        [CallbackQueryHandler(_sup_pick_due,   pattern="^sup_due:")],
             _SUP_DUE_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _sup_due_text)],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
-    spy_conv = ConversationHandler(
+    spy_conv = _conv(
         entry_points=[CallbackQueryHandler(_spy_start, pattern="^sup:pay$")],
         states={
             _SPY_INV: [CallbackQueryHandler(_spy_pick_invoice, pattern="^spy_inv:")],
@@ -7127,8 +7224,6 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _spy_amt_text),
             ],
         },
-        fallbacks=[CommandHandler("cancel", _cancel_conv)],
-        allow_reentry=True,
     )
     for conv in (exp_conv, drw_conv, rst_conv, tfr_conv, deb_conv, pay_conv,
                  del_conv, act_conv, spr_conv, srt_conv, sthr_conv, sall_conv,
@@ -7163,6 +7258,10 @@ def _register_handlers(app: Application, schema: str, admin_ids: list[int]) -> N
     app.add_handler(CallbackQueryHandler(_cb_manage_remove_staff, pattern="^mgr_rm:"))
     app.add_handler(CallbackQueryHandler(_cb_settings_menu, pattern="^sset:dailyreport$"))
     app.add_handler(CallbackQueryHandler(_cb_daily_report_toggle, pattern="^sdr:"))
+    # Last, so a live conversation always claims its own ⬅️ Back first. This
+    # only catches a Back tapped on a prompt scrolled back to after its flow
+    # already finished, which would otherwise spin forever.
+    app.add_handler(CallbackQueryHandler(_nav_stale, pattern="^nav:(back|cancel)$"))
 
     app.add_handler(CommandHandler("setup", _cmd_setup))
     app.add_handler(CommandHandler("start", cmd_start))

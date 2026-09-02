@@ -125,6 +125,46 @@ The analysis reports are also reachable from **⚙️ Manage → 📈 Insights**
 
 Staff cannot delete anything — audit trail is preserved. Mistakes are corrected by admin via `/delete` then re-entry.
 
+## Guided flows — every screen has a way out
+
+Every tap-through flow is a straight line of prompts, and the only exit from a
+wrong turn used to be typing `/cancel` and starting the entry again. The front
+desk makes that wrong turn constantly — the wrong drink tapped, the wrong
+account, a figure typed with a digit missing — so the cost of a slip was the
+whole entry.
+
+`bot._step()` renders one prompt **and remembers it**: its text, its keyboard,
+and a copy of what the flow knew at the moment it was shown. ⬅️ Back pops that
+stack and puts the previous prompt back, restoring the snapshot with it.
+
+**Restoring the snapshot is the load-bearing half**, not re-showing the prompt.
+A booking that went down the hourly path and was asked the time of day must not
+still be carrying that answer when the type is changed to a nightly room on the
+way back — the answer would be stamped on a stay it cannot describe. So Back
+drops everything answered *after* the step it returns to, and keeps everything
+answered before it.
+
+**A re-prompt after a rejected answer is the same step, not a new one**, so it
+overwrites the top of the stack instead of pushing. Otherwise three fumbled
+attempts at an amount would need three taps of Back to escape. On the *first*
+prompt a re-prompt grows no Back button at all: there is nothing behind it.
+
+`root=True` starts a fresh stack. A flow's opening prompt uses it, and so does
+any step taken after something has been written to the database — there is
+nothing safe to go back to past a write, so the escape row offers Cancel only.
+
+**`bot._conv()` wires ⬅️ Back and ✖️ Cancel into every state of every flow**,
+rather than each flow doing it for itself: a screen that quietly lacked an
+escape would be exactly the screen someone gets stuck on. All 33
+ConversationHandlers are built through it, and `tests/test_nav.py` asserts that
+against the real registration. A nav tap that outlives its flow is caught by
+`_nav_stale`, registered *behind* the conversations — PTB runs at most one
+handler per group, so a global nav handler placed ahead of them would swallow
+every live Back tap.
+
+`_say()` is the counterpart for the line that *ends* a flow rather than asking
+the next question: it sends the same way but records no step.
+
 ## Commands Reference
 
 ### Staff commands
