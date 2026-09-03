@@ -255,6 +255,27 @@ def test_room_sale_names_the_unit_it_was_sold_in(monkeypatch):
     assert "/night" not in msg
 
 
+def test_an_hourly_rate_is_priced_and_reported_per_hour(monkeypatch):
+    """A one-hour unit is a rate, not a fixed let. Three hours at ₦3,000/hour
+    is ₦9,000 and reads as hours — "3 let(s) of 1h" names a stay shape the
+    hotel does not sell."""
+    monkeypatch.setattr(logic.db, "record_room", lambda *a, **k: 1)
+    monkeypatch.setattr(logic.db, "get_room_type_hours", lambda t: 1.0)
+    ok, msg, _ = logic.process_room_sale("short time", 1, 3000, 3)
+    assert ok is True
+    assert "/hour × 3 hour(s)" in msg
+    assert "let(s)" not in msg
+    assert "₦9,000.00" in msg             # the rate multiplies with the hours
+
+
+def test_declaring_a_one_hour_unit_says_it_is_an_hourly_rate(monkeypatch):
+    monkeypatch.setattr(logic.db, "set_room_type_hours", lambda *a: None)
+    ok, msg = logic.process_set_room_duration("short time", 1)
+    assert ok is True
+    assert "by the hour" in msg
+    assert "per let" not in msg
+
+
 def test_room_sale_passes_a_negotiated_duration_through(monkeypatch):
     seen = {}
     monkeypatch.setattr(logic.db, "record_room",

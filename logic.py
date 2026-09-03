@@ -85,7 +85,11 @@ def process_room_sale(room_type: str, qty: int, price: float, nights: int, times
     # Name the unit the booking was actually sold in: calling a 3-hour let
     # "1 night at ₦5,000/night" is how the two trades got confused to begin with.
     hours = duration_hours if duration_hours is not None else db.get_room_type_hours(room_type)
-    if hours is not None and hours < 24:
+    if hours is not None and hours == 1:
+        # A one-hour unit is an hourly rate, not a fixed let: "3 let(s) of 1h"
+        # names a stay shape the hotel does not sell.
+        unit = f"₦{price:,.2f}/hour × {nights} hour(s)"
+    elif hours is not None and hours < 24:
         unit = f"₦{price:,.2f} × {nights} let(s) of {hours:g}h"
     else:
         unit = f"₦{price:,.2f}/night × {nights} night(s)"
@@ -127,6 +131,13 @@ def process_set_room_duration(room_type: str, hours: float) -> tuple[bool, str]:
         return True, (
             f"✅ *{name.title()}* set back to a full night.\n"
             "Its bookings count as room-nights and its rate as ADR again."
+        )
+    if hours == 1:
+        return True, (
+            f"✅ *{name.title()}* is charged *by the hour*.\n"
+            "A booking now records how many *hours* the guest took, and the "
+            "rate is reported per hour instead of as ADR.\n"
+            "_Applies to past bookings too — see_ `/roomstats`."
         )
     return True, (
         f"✅ *{name.title()}* is an hourly type — {hours:g} hours per let.\n"

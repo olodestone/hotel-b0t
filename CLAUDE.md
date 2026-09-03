@@ -201,7 +201,7 @@ the next question: it sends the same way but records no step.
 | `/roomstats [week\|lastweek\|period]` | Occupancy, ADR, RevPAR **and GOPPAR** read against the previous like-for-like period, with a raise/hold verdict, plus RevPAR split by room type |
 | `/setrooms <n>` | Record the lettable room count — the denominator for occupancy and RevPAR |
 | `/setrooms <type> <n>` | Rooms of one type — the denominator for **RevPAR per room type** |
-| `/setduration <type> <hours>` | Declare a room type **sold by the hour** — its units become lets, not nights. `24` puts it back to nightly. Applies retroactively |
+| `/setduration <type> <hours>` | Declare a room type **sold by the hour** — its units become lets, not nights. `1` means charged *per hour* (the count becomes hours); `24` puts it back to nightly. Applies retroactively |
 | `/review [period]` | Month-end check — entries at or above the capital threshold, plus anything flagged unsure. Also **⚙️ Manage → 🔎 Review** |
 | `/reclassify <id> <account\|class> <value>` | Correct one expense's classification in place. Amount, date and author untouched |
 | `/roomstats dow [period]` | Night-by-night split (occupancy/ADR/RevPAR per weekday) + turnaways, with a flat-rise vs weekend-premium verdict |
@@ -582,6 +582,27 @@ booking into. Anything below
 | its rate | `adr` (per night) | `arl` (per let) |
 | its fill | `occupancy_pct` (nights / room-days) | `utilization_pct` (hours / room-hours) |
 | spreads across days? | yes — a 3-night stay covers 3 days | **no** — 3 lets are 3 lets on one day |
+
+**A one-hour unit is a rate, not a let.** Hotel 85 charges short-time by the
+hour: 1h is the unit and a 2-hour guest pays double. That is already what the
+model does — `nights` counts the units, so `nights=3` at ₦3,000 is ₦9,000 — but
+every screen was *calling* them lets, which states a guest count the figure does
+not contain. So `hours == 1` is named separately throughout: the booking flow
+asks **"how many hours?"** and offers 1–6 rather than the nights run (4, 5 and 7
+are ordinary nights and odd hours), the type keyboard reads `₦3,000/hour`, the
+confirmation reads `₦3,000.00/hour × 3 hour(s)`, and `reports._short_unit()`
+turns `short_lets` / `arl` into *hours* / *per hour* on `/report`, `/roomstats`
+and `/roomstats dow`.
+
+`_short_unit()` returns "hour" only when **every** hourly type in play has a
+1-hour unit. A hotel running a per-hour type alongside a fixed 2h let has no
+single honest noun for the blended `short_lets` total, so those keep "let" —
+the aggregate really is a mix, and naming it after one half would be the same
+error again.
+
+**This is a labelling fix, not an arithmetic one.** Occupancy, ADR, RevPAR,
+GOPPAR and utilization were already right for a 1-hour unit; nothing about the
+maths changed, and the golden masters did not move.
 
 `metrics.stay_hours(row, hours_map)` resolves it: a duration stored on the row
 wins, otherwise the type's setting, otherwise 24. That ordering is what makes

@@ -416,6 +416,77 @@ def test_backing_out_of_the_hourly_branch_drops_the_time_of_day(hourly_hotel):
     assert _nav_row(upd) == ["nav:cancel"]
 
 
+def test_an_hourly_type_is_asked_for_lets_not_nights(hourly_hotel):
+    """The units step is where the answer gets written down, so it has to name
+    the unit it is written down in. `rooms.nights` counts lets for an hourly
+    type; a front desk asked "how many nights?" for a 2-hour let answers in
+    hours, and `2` then records two lets and doubles the revenue."""
+    ctx = _ctx()
+    _run(bot.cmd_book_start(_typed("/book"), ctx))
+    _run(bot._book_pick_type(_tap("bt:short time"), ctx))
+    upd = _tap("bq:1")
+    _run(bot._book_pick_qty(upd, ctx))
+    assert "2h lets" in _shown(upd)
+    assert "nights" not in _shown(upd)
+
+    # And the typed-in branch of the same step asks the same question.
+    other = _tap("bn:__other__")
+    _run(bot._book_pick_nights(other, ctx))
+    assert "2h lets" in _shown(other)
+
+
+@pytest.fixture
+def per_hour_hotel(monkeypatch):
+    """A hotel charging short-time by the hour — a one-hour stay unit."""
+    monkeypatch.setattr(bot, "_is_admin", lambda uid: True)
+    monkeypatch.setattr(bot, "_is_authorized", lambda uid: True)
+    monkeypatch.setattr(database, "get_all_room_type_prices",
+                        lambda: [{"room_type": "short time", "price": 3000},
+                                 {"room_type": "standard", "price": 15000}])
+    monkeypatch.setattr(database, "get_all_room_type_hours", lambda: {"short time": 1.0})
+
+
+def test_an_hourly_rate_is_asked_for_hours_not_lets(per_hour_hotel):
+    """A one-hour unit means the count in the front desk's hand *is* hours.
+    "How many 1h lets?" is technically true and useless."""
+    ctx = _ctx()
+    _run(bot.cmd_book_start(_typed("/book"), ctx))
+    _run(bot._book_pick_type(_tap("bt:short time"), ctx))
+    upd = _tap("bq:1")
+    _run(bot._book_pick_qty(upd, ctx))
+    assert "how many hours?" in _shown(upd)
+    assert "let" not in _shown(upd) and "night" not in _shown(upd)
+
+    # 4/5/7 are ordinary nights and odd hours; hours get the run 1-6.
+    presets = [b.callback_data for row in _keyboard(upd).inline_keyboard for b in row]
+    assert "bn:6" in presets and "bn:7" not in presets
+
+    # The date prompt echoes the same unit back.
+    when = _tap("bn:3")
+    _run(bot._book_pick_nights(when, ctx))
+    assert _run(bot._book_pick_daypart(_tap("bdp:Evening"), ctx)) == bot._BOOK_DATE
+
+
+def test_the_type_keyboard_says_which_trade_the_price_is_for(per_hour_hotel):
+    labels = [b.text for row in bot._room_type_keyboard().inline_keyboard for b in row]
+    assert "short time — ₦3,000/hour" in labels
+    assert "standard — ₦15,000/night" in labels
+
+
+def test_a_nightly_type_is_still_asked_for_nights(hourly_hotel):
+    ctx = _ctx()
+    _run(bot.cmd_book_start(_typed("/book"), ctx))
+    _run(bot._book_pick_type(_tap("bt:standard"), ctx))
+    upd = _tap("bq:1")
+    _run(bot._book_pick_qty(upd, ctx))
+    assert "how many nights?" in _shown(upd)
+
+    # …through to the date prompt, which echoes the unit back.
+    when = _tap("bn:2")
+    _run(bot._book_pick_nights(when, ctx))
+    assert "2 nights" in _shown(when)
+
+
 def test_a_nightly_booking_is_never_asked_the_time_of_day(hourly_hotel):
     ctx = _ctx()
     _run(bot.cmd_book_start(_typed("/book"), ctx))

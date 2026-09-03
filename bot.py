@@ -589,7 +589,8 @@ async def cmd_setduration(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         configured = db.get_all_room_type_hours()
         body = (
             "Usage: `/setduration <type> <hours>`\n"
-            "Example: `/setduration short time 2`  _(a 2-hour let)_\n"
+            "Example: `/setduration short time 1`  _(charged by the hour)_\n"
+            "Example: `/setduration short time 2`  _(a fixed 2-hour let)_\n"
             "Example: `/setduration standard 24`   _(back to a full night)_\n\n"
             "_Rooms sold by the hour are recorded as room types with_ `nights=1`_,_\n"
             "_so without this a room let 3× in a day reports 300% occupancy and_\n"
@@ -2538,10 +2539,17 @@ def _qty_keyboard(prefix: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _nights_keyboard() -> InlineKeyboardMarkup:
+def _nights_keyboard(room_type: str = "") -> InlineKeyboardMarkup:
+    """The stay-units keyboard, offering the counts that unit comes in.
+
+    4, 5 and 7 are ordinary numbers of nights and odd numbers of hours, so an
+    hourly type gets the run 1–6 instead: the presets are the second half of
+    asking the right question.
+    """
+    presets = ((1, 2, 3), (4, 5, 6)) if _stay_hours(room_type) == 1 else ((1, 2, 3), (4, 5, 7))
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(str(n), callback_data=f"bn:{n}") for n in (1, 2, 3)],
-        [InlineKeyboardButton(str(n), callback_data=f"bn:{n}") for n in (4, 5, 7)],
+        *([InlineKeyboardButton(str(n), callback_data=f"bn:{n}") for n in row]
+          for row in presets),
         [InlineKeyboardButton("✏️ Other", callback_data="bn:__other__")],
     ])
 
@@ -2554,7 +2562,12 @@ def _room_type_keyboard() -> InlineKeyboardMarkup:
         # An hourly type is not priced per night; saying so here is where the
         # front desk first sees which trade they are booking into.
         h = hours.get(str(p["room_type"]).strip().lower())
-        unit = f"/{h:g}h let" if h and h < metrics.NIGHT_HOURS else "/night"
+        if h == 1:
+            unit = "/hour"
+        elif h and h < metrics.NIGHT_HOURS:
+            unit = f"/{h:g}h let"
+        else:
+            unit = "/night"
         label = f"{p['room_type']} — ₦{int(p['price']):,}{unit}"
         rows.append([InlineKeyboardButton(label, callback_data=f"bt:{p['room_type'].lower()}")])
     rows.append([InlineKeyboardButton("✏️ Other type", callback_data="bt:__other__")])
@@ -2978,9 +2991,9 @@ async def _book_pick_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     rtype = ctx.user_data.get("book_type", "room")
     return await _step(
         update, ctx,
-        f"🛏 {val}× *{reports._esc(rtype.title())}* — how many nights?",
+        f"🛏 {val}× *{reports._esc(rtype.title())}* — {_stay_unit(rtype)[0]}",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_nights_keyboard(),
+        reply_markup=_nights_keyboard(rtype),
         state=_BOOK_NIGHTS,
     )
 
@@ -2994,16 +3007,41 @@ async def _book_qty_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     rtype = ctx.user_data.get("book_type", "room")
     return await _step(
         update, ctx,
-        f"🛏 {qty}× *{reports._esc(rtype.title())}* — how many nights?",
+        f"🛏 {qty}× *{reports._esc(rtype.title())}* — {_stay_unit(rtype)[0]}",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=_nights_keyboard(),
+        reply_markup=_nights_keyboard(rtype),
         state=_BOOK_NIGHTS, reply=True,
     )
 
 
-def _is_hourly_type(room_type: str) -> bool:
+def _stay_hours(room_type: str) -> float | None:
+    """How long one let of this type holds the room — None if sold by night."""
     hours = db.get_all_room_type_hours().get(str(room_type).strip().lower())
-    return bool(hours) and hours < metrics.NIGHT_HOURS
+    return hours if hours and hours < metrics.NIGHT_HOURS else None
+
+
+def _is_hourly_type(room_type: str) -> bool:
+    return _stay_hours(room_type) is not None
+
+
+def _stay_unit(room_type: str) -> tuple[str, str]:
+    """(question, plural noun) for the stay-units step.
+
+    `rooms.nights` counts *lets* for an hourly type, so "how many nights?" is
+    the wrong question in the one place the answer gets written down. A front
+    desk asked it for a 2-hour let answers in hours: `2` records two lets and
+    doubles the revenue. The declared stay length is what tells the two trades
+    apart everywhere else — it names the unit here too.
+    """
+    h = _stay_hours(room_type)
+    if h is None:
+        return "how many nights?", "nights"
+    if h == 1:
+        # A 1-hour unit is an hourly *rate*, not a fixed let: the count the
+        # front desk has in hand is the number of hours, so ask for that
+        # rather than dressing it up as "how many 1h lets?".
+        return "how many hours?", "hours"
+    return f"how many {h:g}h lets?", "lets"
 
 
 def _daypart_keyboard() -> InlineKeyboardMarkup:
@@ -3029,7 +3067,8 @@ async def _book_after_nights(update, ctx, uid: int, *, reply: bool = False) -> i
             state=_BOOK_DAYPART, reply=reply)
     return await _step(
         update, ctx,
-        f"🛏 {ctx.user_data.get('book_qty', 1)}× {rtype.title()}, {units} nights — when?",
+        f"🛏 {ctx.user_data.get('book_qty', 1)}× {rtype.title()}, "
+        f"{units} {_stay_unit(rtype)[1]} — when?",
         parse_mode=ParseMode.MARKDOWN_V2, reply_markup=_date_keyboard_for("bdd", uid),
         state=_BOOK_DATE, reply=reply)
 
@@ -3054,7 +3093,10 @@ async def _book_pick_nights(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     await q.answer()
     val = q.data[3:]
     if val == "__other__":
-        return await _step(update, ctx, "How many nights? (type a number)", state=_BOOK_NIGHTS_TEXT)
+        rtype = ctx.user_data.get("book_type", "room")
+        return await _step(update, ctx,
+                           f"{_stay_unit(rtype)[0].capitalize()} (type a number)",
+                           state=_BOOK_NIGHTS_TEXT)
     ctx.user_data["book_nights"] = int(val)
     return await _book_after_nights(update, ctx, update.effective_user.id)
 
@@ -3085,7 +3127,7 @@ async def _book_pick_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         nights = ctx.user_data.get("book_nights", 1)
         return await _step(
             update, ctx,
-            f"🛏 {qty}× {rtype.title()}, {nights} nights — when?",
+            f"🛏 {qty}× {rtype.title()}, {nights} {_stay_unit(rtype)[1]} — when?",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=_calendar_keyboard("bdd", year, month),
             state=_BOOK_DATE,
@@ -5614,18 +5656,26 @@ async def _ssl_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     for t in types:
         h = hours.get(t)
         lines.append(f"  {reports._esc(t.title())}: "
-                     + (f"*{h:g}h per let*" if h and h < 24 else "_full night_"))
+                     + ("*by the hour*" if h == 1 else
+                        f"*{h:g}h per let*" if h and h < 24 else "_full night_"))
     if not types:
         lines.append("  _No room types yet — price one first._")
     lines.append("\n_Tap a type to change it:_")
 
     rows = [[InlineKeyboardButton(
-        f"{t.title()} — {f'{hours[t]:g}h' if t in hours and hours[t] < 24 else 'night'}",
+        f"{t.title()} — {_ssl_label(hours.get(t))}",
         callback_data=f"ssl_tp:{i}")] for i, t in enumerate(types)]
     rows.append([InlineKeyboardButton("➕ Other room type", callback_data="ssl_tp:__new__")])
 
     return await _step(update, ctx, "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2,
                               reply_markup=InlineKeyboardMarkup(rows), state=_SSL_PICK, root=True)
+
+
+def _ssl_label(h: float | None) -> str:
+    """How a type's stay length reads on a button — one hour is a rate."""
+    if h == 1:
+        return "hourly"
+    return f"{h:g}h" if h and h < metrics.NIGHT_HOURS else "night"
 
 
 def _ssl_hours_keyboard() -> InlineKeyboardMarkup:
@@ -5706,11 +5756,21 @@ async def _ssl_hours_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
 
 
 def _known_room_types() -> list[str]:
-    """Every room type the hotel has priced, counted, or actually booked."""
+    """Every room type the hotel has priced, counted, given a stay length, or
+    actually booked.
+
+    The stay-length source is load-bearing: a length set on a name nothing is
+    priced or booked under matches no booking, so the type stays nightly
+    everywhere while the setting looks made. Listing it puts the orphan beside
+    the real type (`Short Time — 2h` next to `Short-Time — night`) on the very
+    screen where the mistake gets fixed.
+    """
     seen: dict[str, None] = {}
     for p in db.get_all_room_type_prices():
         seen.setdefault(str(p["room_type"]).strip().lower(), None)
     for t in db.get_all_room_type_counts():
+        seen.setdefault(str(t).strip().lower(), None)
+    for t in db.get_all_room_type_hours():
         seen.setdefault(str(t).strip().lower(), None)
     for r in db.read_all("rooms"):
         if not r.get("deleted_at"):

@@ -188,6 +188,20 @@ def _room_type_hours() -> dict[str, float]:
     return db.get_all_room_type_hours()
 
 
+def _short_unit(hours_map: dict[str, float] | None = None) -> str:
+    """What one hourly stay-unit is called on screen — "hour" or "let".
+
+    A type sold at an hourly *rate* has a one-hour unit, so its count is a
+    number of hours and not a number of guests: reporting 81 hours as "81
+    lets" states a transaction count the figure does not contain, the same
+    error in the other direction as reading lets as nights. Mixed lengths have
+    no single honest noun, so those keep "let".
+    """
+    lengths = {float(h) for h in (hours_map or _room_type_hours()).values()
+               if 0 < float(h) < metrics.NIGHT_HOURS}
+    return "hour" if lengths == {1.0} else "let"
+
+
 def _range_label(start: date, end: date) -> str:
     """Name a window the way an owner would say it out loud."""
     if start == end:
@@ -428,9 +442,10 @@ def generate_full_report(
     # unable to see which rooms are hourly, so it silently falls back to the
     # full count — which put /report on a 390 denominator while /roomstats
     # used 330 for the same month.
+    hours_by_type = _room_type_hours()
     rm = metrics.compute_room_metrics(
         room_rows, _total_rooms(), _period_days(for_date, for_month, all_time, room_rows),
-        rooms_by_type=_room_type_counts(), hours_by_type=_room_type_hours(),
+        rooms_by_type=_room_type_counts(), hours_by_type=hours_by_type,
     )
     if rm.room_nights_sold:
         lines.append(f"  Room-nights sold: {rm.room_nights_sold}  ·  ADR {_fmt(rm.adr)}")
@@ -442,7 +457,9 @@ def generate_full_report(
             lines.append("  _Set the room count with_ `/setrooms <n>` _for occupancy & RevPAR._")
     if rm.has_short_stay:
         # Kept on its own line: lets are not nights and their rate is not ADR.
-        lines.append(f"  Short-stay lets: {rm.short_lets}  ·  Avg per let {_fmt(rm.arl)}")
+        unit = _short_unit(hours_by_type)
+        lines.append(f"  Short stays: {_plural(rm.short_lets, unit)}  ·  "
+                     f"Avg per {unit} {_fmt(rm.arl)}")
 
     if rooms.other_breakdown:
         lines.append("  _Other breakdown:_")
@@ -2037,7 +2054,7 @@ def generate_room_stats_report(
     ]
     if not (trend and trend.comparable):
         lines[-1] += "  _(average rate per night sold)_"
-    lines += _short_stay_block(rm)
+    lines += _short_stay_block(rm, _short_unit(hours))
 
     if not total_rooms:
         lines += [
@@ -2083,13 +2100,14 @@ def generate_room_stats_report(
 
     if rm.by_type:
         lines += [_SEP, "*BY ROOM TYPE*"]
+        unit = _short_unit(hours)
         ranked = sorted(rm.by_type.items(), key=lambda kv: -kv[1]["revenue"])
         for rtype, d in ranked:
-            rate_label = "per let" if d["is_short"] else "ADR"
+            rate_label = f"per {unit}" if d["is_short"] else "ADR"
             head = f"  • *{_esc(rtype)}* — {rate_label} {_fmt(d['adr'])}"
             head += f" · RevPAR {_fmt(d['revpar'])}" if d["rooms"] else " · RevPAR _n/a_"
             lines.append(head)
-            units = (_plural(d["lets"], "let") if d["is_short"]
+            units = (_plural(d["lets"], unit) if d["is_short"]
                      else _plural(d["nights"], "night") + " sold")
             if d["rooms"]:
                 fill = (f"{_pct(d['utilization_pct'])} of its hours"
@@ -2115,7 +2133,7 @@ def generate_room_stats_report(
     return "\n".join(lines)
 
 
-def _short_stay_block(rm) -> list[str]:
+def _short_stay_block(rm, unit: str = "let") -> list[str]:
     """The hourly trade, reported in its own units.
 
     Kept apart from ADR and occupancy on purpose. A two-hour let is not a
@@ -2127,8 +2145,8 @@ def _short_stay_block(rm) -> list[str]:
     if not rm.has_short_stay:
         return []
     lines = [
-        f"  🕐 *Short stays: {_plural(rm.short_lets, 'let')}*  ·  "
-        f"avg {_fmt(rm.arl)} per let",
+        f"  🕐 *Short stays: {_plural(rm.short_lets, unit)}*  ·  "
+        f"avg {_fmt(rm.arl)} per {unit}",
     ]
     if rm.available_room_hours:
         lines.append(
@@ -2136,7 +2154,8 @@ def _short_stay_block(rm) -> list[str]:
             f"({rm.room_hours_sold:,.0f} of {rm.available_room_hours:,.0f} room-hours, both trades)_"
         )
     if rm.room_nights_sold:
-        lines.append("  _Occupancy and ADR above are overnight only — lets are counted here._")
+        lines.append(f"  _Occupancy and ADR above are overnight only — "
+                     f"{unit}s are counted here._")
     return lines
 
 
@@ -2278,8 +2297,10 @@ def generate_dow_split_report(
     # A hotel that also sells by the hour needs the lets column and the
     # time-based fill; one that doesn't must not be shown two empty columns.
     hourly = split.overall.lets > 0
+    unit = _short_unit()
     if hourly:
-        header = "```\nNight  Use    Nights Lets  ADR      RevPAR   Away\n"
+        col = f"{unit.capitalize()}s"
+        header = f"```\nNight  Use    Nights {col:<5} ADR      RevPAR   Away\n"
     else:
         header = "```\nNight  Occ    ADR      RevPAR   Away\n"
     body = ""
@@ -2312,13 +2333,13 @@ def generate_dow_split_report(
     for b in (split.weekday, split.weekend):
         head = f"  • *{b.label}* — ADR {_fmt(b.adr)}"
         if b.lets:
-            head += f" · {_fmt(b.arl)} per let"
+            head += f" · {_fmt(b.arl)} per {unit}"
         if split.has_rooms:
             head += f" · {_pct(b.occupancy_pct)} full · RevPAR {_fmt(b.revpar)}"
         lines.append(head)
         sold = _plural(b.nights_sold, "room-night") + " sold"
         if b.lets:
-            sold += f" · {_plural(b.lets, 'let')}"
+            sold += f" · {_plural(b.lets, unit)}"
         lines.append(f"      _{_plural(b.days, 'night')} · {sold} · {_fmt(b.revenue)}_")
     if split.has_rooms:
         gap = split.occupancy_gap_pt
@@ -2356,30 +2377,34 @@ def _daypart_block(room_rows: list[dict], start: date, end: date) -> list[str]:
     question; the half that sets the price is *when in the day*, because a room
     turned away at 8pm and idle at 10am has two problems and only one is a rate.
     """
-    split = metrics.daypart_split(room_rows, start, end, _room_type_hours())
+    hours_map = _room_type_hours()
+    split = metrics.daypart_split(room_rows, start, end, hours_map)
     if not split.total_lets:
         return []
 
-    out = [_SEP, "*BY TIME OF DAY* _(hourly lets only)_"]
+    unit = _short_unit(hours_map)
+    out = [_SEP, f"*BY TIME OF DAY* _(hourly {unit}s only)_"]
     width = max(len(b.label) for b in split.bands)
-    table = f"{'WHEN':<{width}}  {'LETS':>5}  {'PER LET':>9}  {'HOURS':>6}\n"
+    table = (f"{'WHEN':<{width}}  {unit.upper() + 'S':>5}  "
+             f"{'PER ' + unit.upper():>9}  {'HOURS':>6}\n")
     for b in split.bands:
         if not b.lets:
             continue
         table += (f"{b.label:<{width}}  {b.lets:>5}  {b.arl:>9,.0f}  {b.hours:>6,.0f}\n")
     out.append("```\n" + table + "```")
-    out.append(f"  _{split.lets_per_day} lets a day across {_plural(split.days, 'day')}_")
+    out.append(f"  _{split.lets_per_day} {unit}s a day across "
+               f"{_plural(split.days, 'day')}_")
 
     if split.untimed_lets:
         out.append(
-            f"  _{_plural(split.untimed_lets, 'let')} carry no time of day — "
+            f"  _{_plural(split.untimed_lets, unit)} carry no time of day — "
             "backdated entries are stamped midnight, so they cannot be placed._")
 
     verdict, detail = metrics.daypart_verdict(split)
     if verdict:
         out += ["", f"  🕐 *{_esc(verdict)}*", f"  _{_esc(detail)}_"]
     elif not split.readable:
-        out.append("  _Too few timed lets yet to read the shape of the day._")
+        out.append(f"  _Too few timed {unit}s yet to read the shape of the day._")
     return out
 
 

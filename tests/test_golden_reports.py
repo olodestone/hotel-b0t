@@ -420,6 +420,30 @@ def test_dow_split_gives_each_trade_its_own_verdict(monkeypatch):
     assert "Night  Use    Nights Lets" in out       # lets get their own column
 
 
+def test_a_per_hour_hotel_is_reported_in_hours_not_lets(monkeypatch):
+    """With a one-hour stay unit the count *is* hours, so calling 84 hours
+    "84 lets" states a guest count the figure does not contain — the same
+    misnamed unit as reading lets as nights, one step further in."""
+    _hourly_hotel(monkeypatch)
+    monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {"short time": 1})
+    out = reports.generate_room_stats_report()
+    assert "per hour" in out
+    assert "per let" not in out and "Lets" not in out
+    assert "• *Short Time* — per hour ₦3,000" in out
+
+    dow = reports.generate_dow_split_report()
+    assert "Night  Use    Nights Hours" in dow
+    assert "Lets" not in dow
+
+
+def test_a_fixed_length_let_is_still_reported_as_a_let(monkeypatch):
+    """The noun follows the configured length — a 2-hour let is not an hour."""
+    _hourly_hotel(monkeypatch)
+    out = reports.generate_room_stats_report()
+    assert "avg ₦3,000 per let" in out
+    assert "per hour" not in out
+
+
 def test_dow_split_keeps_the_plain_table_for_a_nightly_only_hotel(monkeypatch):
     _hourly_hotel(monkeypatch)
     monkeypatch.setattr(reports.db, "get_all_room_type_hours", lambda: {})
